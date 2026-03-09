@@ -7,3 +7,5 @@ Source/numerics.h
 *.ex
 __pycache__
 *.eg-info
+**/tmp_build_dir
+
