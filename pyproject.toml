@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zoomy_amrex"
+version = "0.1.0"
+description = "zoomy_amrex is a module of Zoomy: A simulation software for dimensionally-reduced free surface flows."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "GPL-3.0-only" }
+authors = [
+  { name = "Ingo Steldermann", email = "steldermann@mbd.rwth-aachen.de" }
+]
+keywords = ["simulation", "shallow flow", "free surface flow", "shallow moments", "shallow water", "VAM", "AMReX"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Physics"
+]
+
+dependencies = [
+  "attrs",
+  "sympy>=1.12",
+  "numpy",
+  "rasterio",
+]
+
+[project.urls]
+Homepage = "https://github.com/mbd-rwth/Zoomy"
+Documentation = "https://mbd-rwth.github.io/Zoomy"
+Source = "https://github.com/mbd-rwth/Zoomy"
+Issues = "https://github.com/mbd-rwth/Zoomy/issues"
+
+[tool.setuptools]
+# Ensure that non-python files (like .h or .cpp templates if you have them) are included
+include-package-data = true
+
+[tool.setuptools.packages.find]
+# This finds the python packages in the current directory
+where = ["."]
+include = ["zoomy_amrex*"]
+
+[project.scripts]
+# If you want to run your code generator from the command line:
+# zoomy-gen-amrex = "zoomy_amrex.main:main_function"

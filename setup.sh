@@ -3,4 +3,4 @@
 
 module purge
 module load foss
-micromamba activate sm-amrex
+module load Python/3.12.3

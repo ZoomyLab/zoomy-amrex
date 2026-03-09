@@ -1,33 +1,34 @@
-# ---------------- init ----------------
-init.dem_field      = 0
-init.release_field  = 1
+# # ---------------- init ----------------
+# init.dem_file      = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/data/ravaflow/ca_elev.raw"
+# init.release_file  = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/data/ravaflow/ca_debrisflow.raw"
+# init.dem_file      = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/adjusted_ca_elev.raw"
+# init.release_file  = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/adjusted_ca_debrisflow.raw"
+# init.dem_file      = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/ca_elev.raw"
+# init.release_file  = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/ca_debrisflow.raw"
+
+
 
 # ---------------- output --------------
-output.test_case        = 0
 output.identifier       = 0
 output.plot_dt_interval = 1.
 
 # ---------------- solver --------------
-solver.time_end  = 100.
-solver.dt        = 0.000001
-solver.adapt_dt  = true
-solver.cfl       = 0.45
-solver.dtmin    = 1.e-5
-solver.dtmax    = 0.1
-solver.warmup_steps =  5
-solver.max_velocity = 100.
-
+solver.time_end        = 30.
+solver.cfl             = 0.45
+solver.dtmin           = 1.e-7
+solver.dtmax           = 0.5
+solver.spatial_order   = 1      # 1 for 1st order, 2 for 2nd order
+solver.implicit_source = false   # true for implicit, false for explicit
 
 # ---------------- geometry ------------
+# Note: Ensure these match your .raw file dimensions
 geometry.n_cell_x = 1537
 geometry.n_cell_y = 887
 geometry.phy_bb_x0 = 0.0
 geometry.phy_bb_y0 = 0.0
 geometry.phy_bb_x1 = 7685.0
 geometry.phy_bb_y1 = 4435.0
-geometry.dem_file = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/data/ca_elev.raw"
-geometry.release_file = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/data/ca_debrisflow.raw"
 
 # ---------------- grid ----------------
-grid.max_grid_size_x = 16
-grid.max_grid_size_y = 16
+grid.max_grid_size_x = 64
+grid.max_grid_size_y = 64

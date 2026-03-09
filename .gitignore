@@ -6,6 +6,6 @@ Source/numerics.h
 *.depends
 *.ex
 __pycache__
-*.eg-info
+*.egg-info
 **/tmp_build_dir
 
