@@ -1,37 +1,44 @@
 #include "plotfile_utils.H"
 #include "AMReX_MultiFabUtil.H"
 
-#include "constants.H"
-#include "model.h"
+#include "Model.H"
 
 using namespace amrex;
 
-void
-write_plotfiles_2d (const int identifier, const int step, MultiFab const& solution, Geometry const& geom, const Real time)
+void write_plotfiles_2d (const int identifier, const int step, MultiFab const& solution, MultiFab const& solution_aux, Geometry const& geom, const Real time)
 {
     const std::string& pltfile = amrex::Concatenate(amrex::Concatenate("plt_2d_", identifier),step,5);
 
-    int ncomp = solution.nComp();
+    int ncomp_q = solution.nComp();
+    int ncomp_aux = solution_aux.nComp();
+    int ncomp_total = ncomp_q + ncomp_aux;
 
+    // 1. Create a combined MultiFab with enough components for both Q and Qaux
+    MultiFab plot_mf(solution.boxArray(), solution.DistributionMap(), ncomp_total, 0);
+
+    // 2. Stitch the data into the combined MultiFab
+    amrex::MultiFab::Copy(plot_mf, solution,     0, 0,       ncomp_q,   0);
+    amrex::MultiFab::Copy(plot_mf, solution_aux, 0, ncomp_q, ncomp_aux, 0);
+
+    // 3. Setup variable names WITHOUT underscores so ParaView doesn't auto-group them!
     Vector<std::string> var_names;
-    for (int n=0; n<ncomp; ++n) {
-        var_names.push_back(amrex::Concatenate("q_",n,1));
+    for (int n=0; n<ncomp_q; ++n) {
+        var_names.push_back(amrex::Concatenate("var", n, 1));
+    }
+    for (int n=0; n<ncomp_aux; ++n) {
+        var_names.push_back(amrex::Concatenate("aux", n, 1));
     }
 
-    WriteSingleLevelPlotfile(pltfile, solution, var_names, geom, time, step);
+    WriteSingleLevelPlotfile(pltfile, plot_mf, var_names, geom, time, step);
 }
 
-void
-write_plotfiles_3d (const int identifier, const int step, MultiFab const& solution, MultiFab const& solution_aux, Geometry const& geom, const Real time)
+void write_plotfiles_3d (const int identifier, const int step, MultiFab const& solution, MultiFab const& solution_aux, Geometry const& geom, const Real time)
 {
     const std::string& pltfile = amrex::Concatenate(amrex::Concatenate("plt_3d_", identifier),step,5);
 
     int ifac = 8;
     Real fac = static_cast<Real>(ifac);
 
-    //
-    // These must be in the same order as the components in the solution MultiFab solution_3d
-    //
     Vector<std::string> var_names;
     var_names.push_back("b");
     var_names.push_back("h");
@@ -41,20 +48,13 @@ write_plotfiles_3d (const int identifier, const int step, MultiFab const& soluti
     var_names.push_back("p");
 
     BoxArray ba = solution.boxArray();
-
-    // This defines a Geometry object
     Geometry geom_3d;
 
-    //
-    // Make the physical domain "fac" times taller in the vertical
-    //
     Box domain_3d = geom.Domain();
     domain_3d.setBig(2,ifac);
-    //amrex::Print() << "3D Domain " << domain_3d << std::endl;
 
     RealBox rb = geom.ProbDomain();
     rb.setHi(2,fac*geom.ProbDomain().hi(2));
-    //amrex::Print() << "3D ProbSize " << rb << std::endl;
 
     geom_3d.define(domain_3d, rb, CoordSys::cartesian, geom.isPeriodic());
 
@@ -66,18 +66,18 @@ write_plotfiles_3d (const int identifier, const int step, MultiFab const& soluti
 
     AMREX_ALWAYS_ASSERT (ncomp == var_names.size());
 
-    // Here we arbitrarily set the fake 3D domain to have ifac cells in the vertical
     BoxList bl3d = BoxList(ba);
     for (auto& b : bl3d) {
         b.setBig(2,ifac);
     }
     BoxArray ba_3d(std::move(bl3d));
-    //amrex::Print() << "3D BoxArray " << ba_3d << std::endl;
 
     MultiFab solution_3d(ba_3d, solution.DistributionMap(), ncomp, nghost);
 
-    Real z0 = 0.5 * geom_3d.ProbDomain().hi(2);
-    //amrex::Print() << "Setting z0 to " << z0 << std::endl; 
+    // Dynamically extract parameters using Model::n_parameters to avoid hardcoded bounds
+    auto p_std = Model::default_parameters();
+    amrex::GpuArray<amrex::Real, Model::n_parameters> params_arr;
+    for(int i=0; i<Model::n_parameters; ++i) params_arr[i] = p_std[i];
 
     // Loop over boxes
     for (MFIter mfi(solution_3d); mfi.isValid(); ++mfi)
@@ -88,51 +88,42 @@ write_plotfiles_3d (const int identifier, const int step, MultiFab const& soluti
         const Array4<Real const>& sol_2d_arr_aux = solution_aux.const_array(mfi);
         const Array4<Real      >& sol_3d_arr = solution_3d.array(mfi);
 
-
         ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k)
         {
             Real dz = 1. / ifac;
             Real z = (k) * dz;
-                    //
-            VecQ Q;
-            VecQaux Qaux;
-            VecQ3d Q3d;
-            Vec3 X;
-
-            for (int n=0;n<n_dof; ++n) {
-                Q(n, 0) = sol_2d_arr(i, j, 0, n);
-            }
-            for (int n=0;n<n_dof_aux; ++n) {
-                Qaux(n, 0) = sol_2d_arr_aux(i, j, 0, n);
-            }
             
-            X = makeSmallMatrix<3, 1>({0., 0., z}); 
-            Q3d = Model::project_2d_to_3d(Q, Qaux, X);
+            amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> Q;
+            amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> Qaux;
+            amrex::SmallMatrix<amrex::Real, 6, 1> Q3d; 
+            amrex::SmallMatrix<amrex::Real, 3, 1> X;
+            amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1> p;
+
+            for (int n=0;n<n_dof; ++n) Q(n, 0) = sol_2d_arr(i, j, 0, n);
+            for (int n=0;n<n_dof_aux; ++n) Qaux(n, 0) = sol_2d_arr_aux(i, j, 0, n);
+            for (int n=0;n<Model::n_parameters; ++n) p(n, 0) = params_arr[n];
+            
+            X(0, 0) = 0.;
+            X(1, 0) = 0.;
+            X(2, 0) = z; 
+            
+            Q3d = Model::project_2d_to_3d(X, Q, Qaux, p);
 
             for (int n=0;n<6; ++n) {
                 sol_3d_arr(i, j, k, n) = Q3d(n, 0);
             }
         });
-    } // mfi
+    } 
 
     WriteSingleLevelPlotfile(pltfile, solution_3d, var_names, geom_3d, time, step);
 }
 
-void write_plotfiles (const int identifier, const int step, MultiFab& solution, MultiFab& solution_aux,Geometry const& geom, const Real time)
+void write_plotfiles (const int identifier, const int step, MultiFab& solution, MultiFab& solution_aux, Geometry const& geom, const Real time)
 {
-    // Note that this average from cell centers to nodes assumes that the ghost cells of the solution array
-    //      have been filled
     solution.FillBoundary(geom.periodicity());
-
-    //
-    // Next we write the plotfile which interprets the results to create a full 3D field 
-    // using what we know about the basis functions.  This arbitrarily is set to have 8 cells in the vertical
-    //
-    write_plotfiles_2d (identifier ,step, solution, geom, time);
-
-    //
-    // Next we write the plotfile which interprets the results to create a full 3D field 
-    // using what we know about the basis functions.  This arbitrarily is set to have 8 cells in the vertical
-    //
-    write_plotfiles_3d (identifier, step, solution, solution_aux,geom, time);
+    solution_aux.FillBoundary(geom.periodicity());
+    
+    // Explicitly pass solution_aux down to both writing functions
+    write_plotfiles_2d (identifier ,step, solution, solution_aux, geom, time);
+    write_plotfiles_3d (identifier, step, solution, solution_aux, geom, time);
 }
