@@ -175,9 +175,15 @@ int main (int argc, char* argv[])
     init_solution(geom, Q);
     init_solution(geom, Qtmp);
     init_solution(geom, Qaux);
-    readRasterIntoComponent(release_file, geom, Q, 1);
-    readRasterIntoComponent(dem_file, geom, Q, 0);
-    readRasterIntoComponent(friction_file, geom, Qaux, 1);
+    if (!release_file.empty() && amrex::FileSystem::Exists(release_file)) {
+        readRasterIntoComponent(release_file, geom, Q, 1);
+    }
+    if (!dem_file.empty() && amrex::FileSystem::Exists(dem_file)) {
+        readRasterIntoComponent(dem_file, geom, Q, 0);
+    } 
+    if (!friction_file.empty() && amrex::FileSystem::Exists(friction_file)) {
+        readRasterIntoComponent(friction_file, geom, Qaux, 1);
+    } 
 
     Real time = 0.0, next_write = 0.0;
     int step = 0, iteration = 0;
