@@ -131,9 +131,11 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
     }
     for(int n=0; n<n_a; ++n) a_curr(n,0) = Qaux(i,j,0,n);
 
-    if (q_curr(1,0) < 1e-6) return; // Dry cell skip (idx_h is 1)
+    if (q_curr(1,0) < 1e-6) return; // Dry cell skip 
 
-    for(int iter=0; iter<15; ++iter) {
+    bool converged = false;
+
+    for(int iter=0; iter<25; ++iter) {
         a_curr = Model::update_aux_variables(q_curr, a_curr, p_mat);
         auto S = Model::source(q_curr, a_curr, p_mat);
 
@@ -143,7 +145,11 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
             residual(n,0) = q_curr(n,0) - q_old(n,0) - dt * S(n,0);
             res_norm += residual(n,0) * residual(n,0);
         }
-        if (std::sqrt(res_norm) < 1e-8) break;
+        
+        if (std::sqrt(res_norm) < 1e-5) { 
+            converged = true; 
+            break; 
+        }
 
         auto dS_dQ = Model::source_jacobian_wrt_variables(q_curr, a_curr, p_mat);
         auto dS_dA = Model::source_jacobian_wrt_aux_variables(q_curr, a_curr, p_mat);
@@ -168,7 +174,7 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
             for(int r=k+1; r<n_q; ++r) {
                 if (std::abs(J(r,k)) > max_val) { max_val = std::abs(J(r,k)); max_row = r; }
             }
-            if (max_val < 1e-14) { singular = true; break; }
+            if (max_val < 1e-14 || std::isnan(max_val)) { singular = true; break; }
             
             if (max_row != k) {
                 for(int c=k; c<n_q; ++c) { amrex::Real tmp = J(k,c); J(k,c) = J(max_row,c); J(max_row,c) = tmp; }
@@ -187,8 +193,18 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
             for(int c=r+1; c<n_q; ++c) sum += J(r,c) * delta(c,0);
             delta(r,0) = (residual(r,0) - sum) / J(r,r);
         }
-        for(int n=0; n<n_q; ++n) q_curr(n,0) += delta(n,0);
+
+        amrex::Real damping = 1.0;
+        if (std::abs(delta(1,0)) > 0.5 * q_curr(1,0)) {
+            damping = 0.5;
+        }
+
+        for(int n=0; n<n_q; ++n) q_curr(n,0) += damping * delta(n,0);
+
+        if (q_curr(1,0) < 1e-6) q_curr(1,0) = 1e-6;
     }
 
-    for(int n=0; n<n_q; ++n) Q(i,j,0,n) = q_curr(n,0);
+    if (converged) {
+        for(int n=0; n<n_q; ++n) Q(i,j,0,n) = q_curr(n,0);
+    }
 }
