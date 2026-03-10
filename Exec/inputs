@@ -13,7 +13,7 @@ output.identifier       = 0
 output.plot_dt_interval = 1.
 
 # ---------------- solver --------------
-solver.time_end        = 30.
+solver.time_end        = 50.
 solver.cfl             = 0.45
 solver.dtmin           = 1.e-7
 solver.dtmax           = 0.5
