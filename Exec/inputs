@@ -1,34 +1,35 @@
-# # ---------------- init ----------------
-# init.dem_file      = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/data/ravaflow/ca_elev.raw"
-# init.release_file  = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/data/ravaflow/ca_debrisflow.raw"
-# init.dem_file      = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/adjusted_ca_elev.raw"
-# init.release_file  = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/adjusted_ca_debrisflow.raw"
-# init.dem_file      = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/ca_elev.raw"
-# init.release_file  = "/rwthfs/rz/cluster/home/is086873/Git/Zoomy/tutorials/amrex/ca_debrisflow.raw"
+# =============== AMR Configuration ===============
+# AmrCore settings (read by AMReX internals)
+amr.max_level     = 0        # 0 = single level, 1+ = AMR
+amr.n_cell        = 64 64 1  # Base grid resolution
+amr.max_grid_size = 32       # Max box size per MPI rank
+amr.ref_ratio     = 2        # Refinement ratio between levels
+amr.blocking_factor = 8      # Grid alignment factor
+amr.regrid_int    = 4        # Regrid every N steps
 
+# Geometry (read by AMReX internals)
+geometry.prob_lo  = 0.0 0.0 0.0
+geometry.prob_hi  = 1.0 1.0 1.0
+geometry.is_periodic = 0 0 0
 
+# =============== Zoomy Configuration ==============
+
+# ---------------- init ----------------
+# init.dem_file      = "path/to/dem.raw"
+# init.release_file  = "path/to/release.raw"
+# init.friction_file = "path/to/friction.raw"
 
 # ---------------- output --------------
 output.identifier       = 0
-output.plot_dt_interval = 1.
+output.plot_dt_interval = 0.1
 
 # ---------------- solver --------------
-solver.time_end        = 50.
+solver.time_end        = 1.0
 solver.cfl             = 0.45
 solver.dtmin           = 1.e-7
 solver.dtmax           = 0.5
-solver.spatial_order   = 1      # 1 for 1st order, 2 for 2nd order
-solver.implicit_source = false   # true for implicit, false for explicit
+solver.spatial_order   = 1
+solver.implicit_source = false
 
-# ---------------- geometry ------------
-# Note: Ensure these match your .raw file dimensions
-geometry.n_cell_x = 1537
-geometry.n_cell_y = 887
-geometry.phy_bb_x0 = 0.0
-geometry.phy_bb_y0 = 0.0
-geometry.phy_bb_x1 = 7685.0
-geometry.phy_bb_y1 = 4435.0
-
-# ---------------- grid ----------------
-grid.max_grid_size_x = 64
-grid.max_grid_size_y = 64
+# ---------------- tagging (AMR) -------
+tagging.threshold      = 0.01  # Gradient threshold for refinement
