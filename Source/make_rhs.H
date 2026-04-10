@@ -93,22 +93,80 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
     if (!implicit_source) source_term = Model::source(q_curr, a_curr, p_mat);
 
     for(int n=0; n<Model::n_dof_q; ++n) {
-        
+
         // D+ is at index [n]. D- is offset by [n_dof_q + n]
         // Cell `i` receives D- from the right face, and D+ from the left face!
-        amrex::Real F_x = - (flux_xr(n,0) - flux_xl(n,0)) 
+        amrex::Real F_x = - (flux_xr(n,0) - flux_xl(n,0))
                           - fluct_xr(Model::n_dof_q + n, 0) // D-
-                          - fluct_xl(n, 0);                 // D+       
-        
+                          - fluct_xl(n, 0);                 // D+
+
         amrex::Real F_y = 0.0;
         if constexpr (Model::dimension == 2) {
-            F_y = - (flux_yr(n,0) - flux_yl(n,0)) 
+            F_y = - (flux_yr(n,0) - flux_yl(n,0))
                   - fluct_yr(Model::n_dof_q + n, 0)         // D-
                   - fluct_yl(n, 0);                         // D+
         }
 
         RHS(i,j,0,n) = F_x / dx + F_y / dy;
         if (!implicit_source) RHS(i,j,0,n) += source_term(n,0);
+    }
+
+    // ---- Diffusive flux (optional, compile-time gated) ----
+    if constexpr (Model::has_diffusion) {
+        constexpr int n_q = Model::n_dof_q;
+        constexpr int dim = Model::dimension;
+        constexpr int n_gradQ = Model::n_dof_gradQ; // n_q * dim
+
+        // Compute the normal-projected diffusive flux at a single face.
+        // dir  = face-normal direction (0=x, 1=y)
+        // (iL,jL) = left cell,  (iR,jR) = right cell
+        // dx_face = cell spacing in the face-normal direction
+        // Returns the face-normal component of the diffusive flux for each variable.
+        auto diff_flux_at_face = [&](int iL, int jL, int iR, int jR,
+                                     int dir, amrex::Real dx_face)
+            -> amrex::SmallMatrix<amrex::Real, n_q, 1>
+        {
+            // Face-averaged state
+            amrex::SmallMatrix<amrex::Real, n_q, 1> q_face;
+            amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> a_face;
+            for (int v = 0; v < n_q; ++v)
+                q_face(v, 0) = 0.5 * (Q(iL, jL, 0, v) + Q(iR, jR, 0, v));
+            for (int v = 0; v < Model::n_dof_qaux; ++v)
+                a_face(v, 0) = 0.5 * (Qaux(iL, jL, 0, v) + Qaux(iR, jR, 0, v));
+
+            // Face-normal gradient via central difference
+            // gradQ layout: [dQ0_d0, dQ0_d1, ..., dQ1_d0, dQ1_d1, ...]
+            amrex::SmallMatrix<amrex::Real, n_gradQ, 1> gradQ_face{};
+            for (int v = 0; v < n_q; ++v) {
+                gradQ_face(v * dim + dir, 0) =
+                    (Q(iR, jR, 0, v) - Q(iL, jL, 0, v)) / dx_face;
+            }
+
+            // Evaluate model diffusive flux (returns n_q * dim flat)
+            auto Fd = Model::diffusive_flux(q_face, a_face, gradQ_face, p_mat);
+
+            // Project onto face-normal direction
+            amrex::SmallMatrix<amrex::Real, n_q, 1> Fd_n;
+            for (int v = 0; v < n_q; ++v)
+                Fd_n(v, 0) = Fd(v * dim + dir, 0);
+            return Fd_n;
+        };
+
+        // Divergence form: RHS += (Fd_right - Fd_left)/dx [+ (Fd_top - Fd_bot)/dy]
+        // This mirrors the convective flux pattern (eval_face at xl,xr,yl,yr).
+        auto Fd_xr = diff_flux_at_face(i,   j, i+1, j, 0, dx);
+        auto Fd_xl = diff_flux_at_face(i-1, j, i,   j, 0, dx);
+
+        for (int v = 0; v < n_q; ++v)
+            RHS(i, j, 0, v) += (Fd_xr(v, 0) - Fd_xl(v, 0)) / dx;
+
+        if constexpr (dim == 2) {
+            auto Fd_yr = diff_flux_at_face(i, j,   i, j+1, 1, dy);
+            auto Fd_yl = diff_flux_at_face(i, j-1, i, j,   1, dy);
+
+            for (int v = 0; v < n_q; ++v)
+                RHS(i, j, 0, v) += (Fd_yr(v, 0) - Fd_yl(v, 0)) / dy;
+        }
     }
 }
 
