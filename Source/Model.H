@@ -20,6 +20,8 @@ struct Model {
     static constexpr int n_dof_qaux = 0;
     static constexpr int n_parameters = 3;
     static constexpr int dimension  = 2;
+    static constexpr int n_dof_gradQ = 8;
+    static constexpr bool has_diffusion = false;
     static constexpr int n_boundary_tags = 0;
     static const std::vector<std::string> get_boundary_tags() { return {  }; }
     static const std::vector<std::string> parameter_names() { return { "g", "chezy_C", "eps" }; }
