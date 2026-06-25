@@ -274,6 +274,15 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         blocks.append(self._kernel("initial_aux_condition", self._zeros(na),
                                    (na, 1), ("X", "p")))
 
+        # state_update — the Chorin corrector operator (rank-1, len = #corrected
+        # modes).  Only present on a corrector sub-model (SM_corr from
+        # chorin_split); emitted when the slot is populated.  dt rides in p(last).
+        su = getattr(sm, "state_update", None)
+        if su is not None:
+            su_list = list(su)
+            blocks.append(self._kernel("state_update", self._vec(su_list),
+                                       (len(su_list), 1), ("Q", "Qaux", "p")))
+
         # update variables / aux + jacobians
         blocks.append(self._kernel("update_variables", self._vec(list(sm.state)),
                                    (ne, 1), ("Q", "Qaux", "p")))
