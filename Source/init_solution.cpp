@@ -1,5 +1,6 @@
 
 #include "AMReX_MultiFab.H"
+#include "constants.H"
 
 using namespace amrex;
 
@@ -69,8 +70,18 @@ void init_solution(const Geometry&     geom,
                    MultiFab&           solution)
 {
     GpuArray<Real,AMREX_SPACEDIM> dx = geom.CellSizeArray();
+    GpuArray<Real,AMREX_SPACEDIM> problo = geom.ProbLoArray();
+    GpuArray<Real,AMREX_SPACEDIM> probhi = geom.ProbHiArray();
 
-    int ncomp = solution.nComp();
+    const int ncomp = solution.nComp();
+    // Default initial condition: a flat-bed 2-D dam break in x.
+    // Applied only to the conserved-state field (ncomp >= 2, i.e. has h);
+    // auxiliary fields (ncomp == 1) are zero-filled.  When a release/DEM raster
+    // is supplied, InitData() overlays it on top of this default afterwards.
+    const Real x_mid = 0.5 * (problo[0] + probhi[0]);
+    const Real h_left  = 2.0;
+    const Real h_right = 1.0;
+    const bool is_state = (ncomp >= 2);
 
     // Loop over boxes
     for (MFIter mfi(solution); mfi.isValid(); ++mfi)
@@ -82,10 +93,13 @@ void init_solution(const Geometry&     geom,
         ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k)
         {
             for (int n = 0; n < ncomp; n++) {
-
                 sol_array(i,j,k,n) = 0.0;
-
-            } // n
+            }
+            if (is_state) {
+                const Real x = problo[0] + (i + 0.5) * dx[0];
+                sol_array(i,j,k,idx_b) = 0.0;                       // flat bed
+                sol_array(i,j,k,idx_h) = (x < x_mid) ? h_left : h_right;
+            }
         });
     } // mfi
     //

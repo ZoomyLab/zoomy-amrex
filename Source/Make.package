@@ -8,3 +8,7 @@ CEXE_headers += ZoomyAmr.H
 CEXE_headers += make_rhs.H
 CEXE_headers += plotfile_utils.H
 CEXE_headers += constants.H
+# Generated device code (refreshed by build.py from a zoomy_core SystemModel)
+CEXE_headers += Model.H
+CEXE_headers += Numerics.H
+CEXE_headers += UserFunctions.H
