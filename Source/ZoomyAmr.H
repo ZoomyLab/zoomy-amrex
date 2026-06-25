@@ -89,6 +89,10 @@ private:
     // BC descriptors
     amrex::Vector<amrex::BCRec> bcs;
 
+    // Per-side boundary-condition tag names (resolved to the sorted index in
+    // Model::get_boundary_tags() at fill time).  Empty => tag index 0.
+    std::string bc_x_lo, bc_x_hi, bc_y_lo, bc_y_hi;
+
     // IO
     std::string dem_file, release_file, friction_file;
     int plot_step = 0;

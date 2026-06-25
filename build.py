@@ -47,15 +47,24 @@ include $(AMREX_HOME)/Tools/GNUMake/Make.rules
 """
 
 
-def build_system_model(model_name, dim, level):
+def build_system_model(model_name, dim, level, bc="extrap"):
     """Return a frozen SystemModel for the requested model.
 
     Convention reminder: ``SWE.dimension`` counts *horizontal* dims (2 → 2-D),
     while ``SME.dimension`` counts the total incl. the vertical (3 → 2 horizontal).
+
+    ``bc``: "extrap" (zero-gradient on all sides) or "wall" (a reflective ``wall``
+    tag + an ``outer`` extrapolation tag; pick per side in the inputs via
+    ``bc.x_lo`` etc.).
     """
     from zoomy_core.model import models as M
-    from zoomy_core.model.boundary_conditions import BoundaryConditions, Extrapolation
-    bcs = BoundaryConditions([Extrapolation(tag="left"), Extrapolation(tag="right")])
+    from zoomy_core.model.boundary_conditions import (
+        BoundaryConditions, Extrapolation, Wall)
+    if bc == "wall":
+        bcs = BoundaryConditions([Wall(tag="wall"), Extrapolation(tag="outer")])
+    else:
+        bcs = BoundaryConditions([Extrapolation(tag="left"),
+                                  Extrapolation(tag="right")])
     if model_name == "SWE":
         return M.SWE(dimension=dim, boundary_conditions=bcs).system_model
     if model_name == "SME":
@@ -64,11 +73,15 @@ def build_system_model(model_name, dim, level):
     raise SystemExit(f"unknown model {model_name!r} (try SWE or SME)")
 
 
-def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45):
+def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap"):
     ncell_line = " ".join([str(ncell)] * 2 + (["1"] if dim_mesh == 3 else []))
     prob_hi = "1.0 1.0 1.0" if dim_mesh == 3 else "1.0 1.0"
     prob_lo = "0.0 0.0 0.0" if dim_mesh == 3 else "0.0 0.0"
     isper = "0 0 0" if dim_mesh == 3 else "0 0"
+    bc_block = ""
+    if bc == "wall":  # closed basin: every side reflective
+        bc_block = ("bc.x_lo = wall\nbc.x_hi = wall\n"
+                    "bc.y_lo = wall\nbc.y_hi = wall\n")
     path.write_text(f"""amr.max_level     = 0
 amr.n_cell        = {ncell_line}
 amr.max_grid_size = 64
@@ -76,7 +89,7 @@ amr.blocking_factor = 1
 geometry.prob_lo  = {prob_lo}
 geometry.prob_hi  = {prob_hi}
 geometry.is_periodic = {isper}
-output.identifier       = 0
+{bc_block}output.identifier       = 0
 output.plot_dt_interval = {plot_dt}
 solver.time_end        = {tend}
 solver.cfl             = {cfl}
@@ -100,6 +113,8 @@ def main():
     ap.add_argument("--plot-dt", type=float, default=0.02)
     ap.add_argument("--dim-mesh", type=int, default=3, choices=(2, 3),
                     help="AMReX mesh DIM (3 with nz=1 matches the committed driver)")
+    ap.add_argument("--bc", default="extrap", choices=("extrap", "wall"),
+                    help="extrap (zero-gradient) or wall (closed reflective basin)")
     ap.add_argument("--build-dir", default="/tmp/zoomy_amrex_run")
     ap.add_argument("--make", action="store_true")
     ap.add_argument("--run", action="store_true")
@@ -119,15 +134,15 @@ def main():
             shutil.copy2(f, src / f.name)
 
     # generate device code from the SystemModel
-    sm = build_system_model(a.model, a.dim, a.level)
+    sm = build_system_model(a.model, a.dim, a.level, bc=a.bc)
     generate_headers(sm, src)
-    print(f"generated headers for {a.model} (state={[str(s) for s in sm.state]})")
+    print(f"generated headers for {a.model} (state={[str(s) for s in sm.state]}, bc={a.bc})")
 
     # build files
     amrex_home = os.environ.get("AMREX_HOME", "/opt/amrex")
     (ex / "GNUmakefile").write_text(
         GNUMAKEFILE.format(amrex_home=amrex_home, dim=a.dim_mesh))
-    write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt)
+    write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc)
 
     if a.make:
         n = os.cpu_count() or 4

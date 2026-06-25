@@ -287,16 +287,19 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
                                    self._zeros(na * ne), (na * ne, 1),
                                    ("Q", "Qaux", "p")))
 
-        # boundary conditions.  For now emit zero-gradient extrapolation
-        # (ghost = interior), which is exactly the ``Extrapolation`` BC and what
-        # the dam-break milestone needs.  The full per-tag Piecewise dispatch
-        # from ``sm.boundary_conditions`` is the next step (task 0025).
-        blocks.append(self._kernel("boundary_conditions",
-                                   self._vec(list(sm.state)), (ne, 1),
+        # boundary conditions — the real per-tag dispatch: ``sm.boundary_conditions``
+        # is a framework ``Function`` whose ``.definition`` is a Piecewise over
+        # ``bc_idx`` (the sorted-tag index) with a ghost-state vector per branch.
+        # ``convert_expression_body`` lowers the Piecewise to an if/else-if chain;
+        # ``bc_idx`` prints as itself (matches the C++ arg), Q/Qaux/n via the maps.
+        bc_def = self._bc_definition("boundary_conditions")
+        bc_expr = bc_def if bc_def is not None else self._vec(list(sm.state))
+        blocks.append(self._kernel("boundary_conditions", bc_expr, (ne, 1),
                                    ("bc_idx", "Q", "Qaux", "n", "X", "time", "dX")))
-        blocks.append(self._kernel("aux_boundary_conditions",
-                                   self._vec(list(sm.aux_state)) if na else self._zeros(0),
-                                   (na, 1),
+        abc_def = self._bc_definition("aux_boundary_conditions")
+        abc_expr = abc_def if abc_def is not None else (
+            self._vec(list(sm.aux_state)) if na else self._zeros(0))
+        blocks.append(self._kernel("aux_boundary_conditions", abc_expr, (na, 1),
                                    ("bc_idx", "Q", "Qaux", "n", "X", "time", "dX")))
 
         blocks.append("};\n")

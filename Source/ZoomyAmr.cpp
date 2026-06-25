@@ -41,6 +41,12 @@ ZoomyAmr::ZoomyAmr()
     { ParmParse pp("tagging");
       pp.query("threshold", tag_threshold);
     }
+    { ParmParse pp("bc");
+      pp.query("x_lo", bc_x_lo);
+      pp.query("x_hi", bc_x_hi);
+      pp.query("y_lo", bc_y_lo);
+      pp.query("y_hi", bc_y_hi);
+    }
 
     auto p_std = Model::default_parameters();
     for (int i = 0; i < Model::n_parameters; ++i)
@@ -252,6 +258,21 @@ void ZoomyAmr::FillPhysicalBC(int lev, Real time)
     const int dom_lo_y = domain.smallEnd(1), dom_hi_y = domain.bigEnd(1);
     auto const& p = p_mat;
 
+    // Resolve each domain side's configured BC tag name to its index in the
+    // model's sorted tag list (Model::boundary_conditions is a Piecewise over
+    // that index).  Empty/unknown name => tag index 0.  Done on the host once.
+    auto tag_index = [](const std::string& name) -> int {
+        if (name.empty()) return 0;
+        auto tags = Model::get_boundary_tags();
+        for (int t = 0; t < (int)tags.size(); ++t)
+            if (tags[t] == name) return t;
+        return 0;
+    };
+    const int bcix_xlo = tag_index(bc_x_lo);
+    const int bcix_xhi = tag_index(bc_x_hi);
+    const int bcix_ylo = tag_index(bc_y_lo);
+    const int bcix_yhi = tag_index(bc_y_hi);
+
     for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
         const Box& gbx = mfi.growntilebox();
         auto Q_arr = Q[lev].array(mfi);
@@ -270,13 +291,13 @@ void ZoomyAmr::FillPhysicalBC(int lev, Real time)
             int bc_idx = -1;
             SmallMatrix<Real, Model::dimension, 1> n_hat{};
             if constexpr (Model::dimension == 1) {
-                if (i < dom_lo_x) { bc_idx = 3; n_hat(0, 0) = -1.0; }
-                else if (i > dom_hi_x) { bc_idx = 0; n_hat(0, 0) = 1.0; }
+                if (i < dom_lo_x) { bc_idx = bcix_xlo; n_hat(0, 0) = -1.0; }
+                else if (i > dom_hi_x) { bc_idx = bcix_xhi; n_hat(0, 0) = 1.0; }
             } else if constexpr (Model::dimension == 2) {
-                if (i < dom_lo_x)      { bc_idx = 3; n_hat(0, 0) = -1.0; }
-                else if (i > dom_hi_x) { bc_idx = 0; n_hat(0, 0) =  1.0; }
-                else if (j < dom_lo_y) { bc_idx = 2; n_hat(1, 0) = -1.0; }
-                else if (j > dom_hi_y) { bc_idx = 1; n_hat(1, 0) =  1.0; }
+                if (i < dom_lo_x)      { bc_idx = bcix_xlo; n_hat(0, 0) = -1.0; }
+                else if (i > dom_hi_x) { bc_idx = bcix_xhi; n_hat(0, 0) =  1.0; }
+                else if (j < dom_lo_y) { bc_idx = bcix_ylo; n_hat(1, 0) = -1.0; }
+                else if (j > dom_hi_y) { bc_idx = bcix_yhi; n_hat(1, 0) =  1.0; }
             }
 
             if (bc_idx != -1) {

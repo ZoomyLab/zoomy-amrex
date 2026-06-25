@@ -504,12 +504,16 @@ struct Model {
         amrex::Real const time,
         amrex::Real const dX) noexcept
     {
-    amrex::SmallMatrix<amrex::Real,4,1> res;
-    res(0, 0) = Q(0, 0);
-    res(1, 0) = Q(1, 0);
-    res(2, 0) = Q(2, 0);
-    res(3, 0) = Q(3, 0);
-    return res;
+    if (bc_idx == 0 || bc_idx == 1) {
+        amrex::SmallMatrix<amrex::Real,4,1> res;
+        res(0, 0) = Q(0, 0);
+        res(1, 0) = Q(1, 0);
+        res(2, 0) = Q(2, 0);
+        res(3, 0) = Q(3, 0);
+        return res;
+    }
+    amrex::SmallMatrix<amrex::Real,4,1> default_res{};
+    return default_res;
     }
 
 
@@ -523,8 +527,12 @@ struct Model {
         amrex::Real const time,
         amrex::Real const dX) noexcept
     {
-    amrex::SmallMatrix<amrex::Real,0,1> res{};
-    return res;
+    if (bc_idx == 0 || bc_idx == 1) {
+        amrex::SmallMatrix<amrex::Real,0,1> res{};
+        return res;
+    }
+    amrex::SmallMatrix<amrex::Real,0,1> default_res{};
+    return default_res;
     }
 
 };
