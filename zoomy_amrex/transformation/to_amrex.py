@@ -341,9 +341,12 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         bc_expr = bc_def if bc_def is not None else self._vec(list(sm.state))
         blocks.append(self._kernel("boundary_conditions", bc_expr, (ns, 1),
                                    ("bc_idx", "Q", "Qaux", "n", "X", "time", "dX")))
-        abc_def = self._bc_definition("aux_boundary_conditions")
-        abc_expr = abc_def if abc_def is not None else (
-            self._vec(list(sm.aux_state)) if na else self._zeros(0))
+        # aux BCs are extrapolation (ghost aux = interior) for SWE/SME/VAM — and
+        # the aux at ghosts are recomputed (FD gradients / closure) downstream
+        # anyway.  Emit identity at the full aux count: the source BC definition
+        # may cover only a subset (a Chorin split adds pressure-gradient aux the
+        # original aux-BC kernel never knew about), so always size it to n_aux.
+        abc_expr = self._vec(list(sm.aux_state)) if na else self._zeros(0)
         blocks.append(self._kernel("aux_boundary_conditions", abc_expr, (na, 1),
                                    ("bc_idx", "Q", "Qaux", "n", "X", "time", "dX")))
 
