@@ -177,11 +177,21 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return self._vec([e[i, 0] for i in range(self.n_state)]), self.n_state
 
     def _expr_source_jac(self):
-        J = getattr(self.sm, "source_jacobian", None)  # (n_eq, n_state)
+        # core renamed source_jacobian -> source_jacobian_wrt_variables (n_eq, n_state)
+        J = getattr(self.sm, "source_jacobian_wrt_variables", None)
+        if J is None:
+            J = getattr(self.sm, "source_jacobian", None)  # legacy fallback
         if J is None:
             return self._zeros(self.n_eq * self.n_state), self.n_eq * self.n_state
         return self._vec([J[r, c] for r in range(self.n_eq)
                           for c in range(self.n_state)]), self.n_eq * self.n_state
+
+    def _expr_source_jac_aux(self):
+        J = getattr(self.sm, "source_jacobian_wrt_aux_variables", None)  # (n_eq, n_aux)
+        if J is None:
+            return self._zeros(self.n_eq * self.n_aux), self.n_eq * self.n_aux
+        return self._vec([J[r, c] for r in range(self.n_eq)
+                          for c in range(self.n_aux)]), self.n_eq * self.n_aux
 
     def _expr_update_aux(self):
         ua = getattr(self.sm, "update_aux_variables", None)
@@ -292,9 +302,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         jexpr, _ = self._expr_source_jac()
         blocks.append(self._kernel("source_jacobian_wrt_variables", jexpr,
                                    (ne * ns, 1), ("Q", "Qaux", "p")))
+        jauxexpr, _ = self._expr_source_jac_aux()
         blocks.append(self._kernel("source_jacobian_wrt_aux_variables",
-                                   self._zeros(ne * na), (ne * na, 1),
-                                   ("Q", "Qaux", "p")))
+                                   jauxexpr, (ne * na, 1), ("Q", "Qaux", "p")))
 
         # 3d projection / misc (stubs; ZoomyAmr writes var0..varN directly)
         blocks.append(self._kernel("project_2d_to_3d", self._zeros(6), (6, 1),
