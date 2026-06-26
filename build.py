@@ -43,6 +43,8 @@ INCLUDE_LOCATIONS += ../Source
 include $(AMREX_HOME)/Src/Base/Make.package
 include $(AMREX_HOME)/Src/Boundary/Make.package
 include $(AMREX_HOME)/Src/AmrCore/Make.package
+include $(AMREX_HOME)/Src/LinearSolvers/MLMG/Make.package
+INCLUDE_LOCATIONS += $(AMREX_HOME)/Src/LinearSolvers
 include $(AMREX_HOME)/Tools/GNUMake/Make.rules
 """
 
@@ -73,7 +75,8 @@ def build_system_model(model_name, dim, level, bc="extrap"):
     raise SystemExit(f"unknown model {model_name!r} (try SWE or SME)")
 
 
-def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap"):
+def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap",
+                 implicit_source=False, implicit_global=False, friction=None):
     ncell_line = " ".join([str(ncell)] * 2 + (["1"] if dim_mesh == 3 else []))
     prob_hi = "1.0 1.0 1.0" if dim_mesh == 3 else "1.0 1.0"
     prob_lo = "0.0 0.0 0.0" if dim_mesh == 3 else "0.0 0.0"
@@ -82,6 +85,7 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
     if bc == "wall":  # closed basin: every side reflective
         bc_block = ("bc.x_lo = wall\nbc.x_hi = wall\n"
                     "bc.y_lo = wall\nbc.y_hi = wall\n")
+    fric_block = f"params.n_m = {friction}\n" if friction is not None else ""
     path.write_text(f"""amr.max_level     = 0
 amr.n_cell        = {ncell_line}
 amr.max_grid_size = 64
@@ -89,14 +93,15 @@ amr.blocking_factor = 1
 geometry.prob_lo  = {prob_lo}
 geometry.prob_hi  = {prob_hi}
 geometry.is_periodic = {isper}
-{bc_block}output.identifier       = 0
+{bc_block}{fric_block}output.identifier       = 0
 output.plot_dt_interval = {plot_dt}
 solver.time_end        = {tend}
 solver.cfl             = {cfl}
 solver.dtmin           = 1.e-7
 solver.dtmax           = {tend}
 solver.spatial_order   = {order}
-solver.implicit_source = false
+solver.implicit_source = {'true' if implicit_source else 'false'}
+solver.implicit_global = {'true' if implicit_global else 'false'}
 tagging.threshold      = 0.01
 """)
 
@@ -115,6 +120,11 @@ def main():
                     help="AMReX mesh DIM (3 with nz=1 matches the committed driver)")
     ap.add_argument("--bc", default="extrap", choices=("extrap", "wall"),
                     help="extrap (zero-gradient) or wall (closed reflective basin)")
+    ap.add_argument("--implicit", action="store_true", help="implicit source")
+    ap.add_argument("--implicit-global", action="store_true",
+                    help="matrix-free JFNK source solve (nonlocal-capable)")
+    ap.add_argument("--friction", type=float, default=None,
+                    help="Manning n_m override (params.n_m)")
     ap.add_argument("--build-dir", default="/tmp/zoomy_amrex_run")
     ap.add_argument("--make", action="store_true")
     ap.add_argument("--run", action="store_true")
@@ -142,7 +152,9 @@ def main():
     amrex_home = os.environ.get("AMREX_HOME", "/opt/amrex")
     (ex / "GNUmakefile").write_text(
         GNUMAKEFILE.format(amrex_home=amrex_home, dim=a.dim_mesh))
-    write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc)
+    write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc,
+                 implicit_source=a.implicit, implicit_global=a.implicit_global,
+                 friction=a.friction)
 
     if a.make:
         n = os.cpu_count() or 4

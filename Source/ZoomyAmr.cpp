@@ -3,6 +3,8 @@
 #include <AMReX_PlotFileUtil.H>
 #include <AMReX_MultiFabUtil.H>
 #include <AMReX_FillPatchUtil.H>
+#include <AMReX_GMRES.H>
+#include "imex_solver.H"
 
 using namespace amrex;
 
@@ -37,6 +39,7 @@ ZoomyAmr::ZoomyAmr()
       pp.query("dtmax", dtmax);
       pp.query("spatial_order", spatial_order);
       pp.query("implicit_source", implicit_source);
+      pp.query("implicit_global", implicit_global);
     }
     { ParmParse pp("tagging");
       pp.query("threshold", tag_threshold);
@@ -51,6 +54,21 @@ ZoomyAmr::ZoomyAmr()
     auto p_std = Model::default_parameters();
     for (int i = 0; i < Model::n_parameters; ++i)
         p_mat(i, 0) = p_std[i];
+
+    // Optional per-parameter overrides from inputs: `params.<name> = value`
+    // (e.g. params.n_m = 0.05 for Manning friction).  Lets a case tune any
+    // model parameter without regenerating Model.H.
+    {
+        ParmParse pp("params");
+        auto names = Model::parameter_names();
+        for (int i = 0; i < Model::n_parameters; ++i) {
+            amrex::Real v;
+            if (pp.query(names[i].c_str(), v)) {
+                p_mat(i, 0) = v;
+                amrex::Print() << "param override: " << names[i] << " = " << v << "\n";
+            }
+        }
+    }
 
     bcs.resize(Model::n_dof_q);
     for (int n = 0; n < Model::n_dof_q; ++n) {
@@ -252,6 +270,12 @@ void ZoomyAmr::UpdateState(int lev)
 
 void ZoomyAmr::FillPhysicalBC(int lev, Real time)
 {
+    // Delegate to the MF-generic version on the level's own state arrays.
+    FillPhysicalBC_mf(Q[lev], Qaux[lev], lev, time);
+}
+
+void ZoomyAmr::FillPhysicalBC_mf(MultiFab& Qmf, MultiFab& Qauxmf, int lev, Real time)
+{
     const auto& geom = Geom(lev);
     const auto& domain = geom.Domain();
     const int dom_lo_x = domain.smallEnd(0), dom_hi_x = domain.bigEnd(0);
@@ -273,10 +297,10 @@ void ZoomyAmr::FillPhysicalBC(int lev, Real time)
     const int bcix_ylo = tag_index(bc_y_lo);
     const int bcix_yhi = tag_index(bc_y_hi);
 
-    for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
+    for (MFIter mfi(Qmf); mfi.isValid(); ++mfi) {
         const Box& gbx = mfi.growntilebox();
-        auto Q_arr = Q[lev].array(mfi);
-        auto Qaux_arr = Qaux[lev].array(mfi);
+        auto Q_arr = Qmf.array(mfi);
+        auto Qaux_arr = Qauxmf.array(mfi);
         auto prob_lo = geom.ProbLoArray();
         auto dx = geom.CellSizeArray();
 
@@ -401,13 +425,19 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
         }
 
         if (impl_src) {
-            for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
-                auto Q_arr = Q[lev].array(mfi);
-                auto Qaux_arr = Qaux[lev].const_array(mfi);
-                ParallelFor(mfi.validbox(),
-                    [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-                        apply_implicit_source(i, j, Q_arr, Qaux_arr, dt, p);
-                    });
+            if (implicit_global) {
+                // General matrix-free Newton-Krylov backward-Euler source solve
+                // (nonlocal-capable). Q[lev] currently holds the post-flux Qexp.
+                SolveImplicitSourceGlobal(lev, dt, time);
+            } else {
+                for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
+                    auto Q_arr = Q[lev].array(mfi);
+                    auto Qaux_arr = Qaux[lev].const_array(mfi);
+                    ParallelFor(mfi.validbox(),
+                        [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                            apply_implicit_source(i, j, Q_arr, Qaux_arr, dt, p);
+                        });
+                }
             }
         }
     };

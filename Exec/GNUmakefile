@@ -21,5 +21,7 @@ INCLUDE_LOCATIONS += $(ZOOMY_AMREX_MODEL)
 include $(AMREX_HOME)/Src/Base/Make.package
 include $(AMREX_HOME)/Src/Boundary/Make.package
 include $(AMREX_HOME)/Src/AmrCore/Make.package
+include $(AMREX_HOME)/Src/LinearSolvers/MLMG/Make.package
+INCLUDE_LOCATIONS += $(AMREX_HOME)/Src/LinearSolvers
 
 include $(AMREX_HOME)/Tools/GNUMake/Make.rules

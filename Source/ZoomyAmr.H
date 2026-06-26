@@ -24,6 +24,18 @@ public:
     // Raster loading (level 0 only)
     void LoadRaster(const std::string& filename, int comp, bool is_aux = false);
 
+    // ---- Implicit-source helpers (public so the JFNK GMRES operator can call
+    //      them). General matrix-free Newton-Krylov backward-Euler source solve;
+    //      the source may be nonlocal (the FD-JVP matvec recomputes ghosts/aux). ----
+    // Fill ghost cells (FillBoundary + physical BC dispatch) on an arbitrary MF.
+    void FillPhysicalBC_mf(amrex::MultiFab& Qmf, amrex::MultiFab& Qauxmf,
+                           int lev, amrex::Real time);
+    // S(Q) into Sout (valid region): fills Qin ghosts/aux, evaluates Model::source.
+    void ComputeSourceField(amrex::MultiFab& Qin, amrex::MultiFab& Sout,
+                            int lev, amrex::Real time);
+    // Solve Q = Qexp + dt*S(Q) for Q[lev] in place (matrix-free Newton + GMRES).
+    void SolveImplicitSourceGlobal(int lev, amrex::Real dt, amrex::Real time);
+
 private:
     // ---- AmrCore pure virtual overrides ----
     void MakeNewLevelFromScratch(int lev, amrex::Real time,
@@ -79,6 +91,8 @@ private:
     amrex::Real dtmax     = 1.0e-2;
     int spatial_order     = 1;
     bool implicit_source  = true;
+    bool implicit_global  = false;  // true: matrix-free JFNK (nonlocal-capable)
+                                    // false: per-cell local Newton
     amrex::Real plot_dt_interval = 0.1;
     int identifier        = 0;
     amrex::Real tag_threshold = 0.01; // gradient threshold for refinement

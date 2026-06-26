@@ -6,6 +6,7 @@ CEXE_sources += plotfile_utils.cpp
 
 CEXE_headers += ZoomyAmr.H
 CEXE_headers += make_rhs.H
+CEXE_headers += imex_solver.H
 CEXE_headers += plotfile_utils.H
 CEXE_headers += constants.H
 # Generated device code (refreshed by build.py from a zoomy_core SystemModel)
