@@ -1,4 +1,5 @@
 #pragma once
+#include "NumericsUser.H"
 #include <AMReX_Array4.H>
 #include <AMReX_Vector.H>
 #include <AMReX_SmallMatrix.H>
@@ -56,7 +57,7 @@ struct Numerics {
         amrex::SmallMatrix<amrex::Real,4,1> const& p,
         amrex::SmallMatrix<amrex::Real,2,1> const& n) noexcept
     {
-    amrex::Real t0 = 0.5*amrex::max(amrex::max(amrex::Math::abs(Q_minus(0, 0)), amrex::max(amrex::Math::abs(Q_minus(1, 0)), amrex::max(amrex::Math::abs(Q_minus(2, 0)), amrex::max(amrex::Math::abs(Q_minus(3, 0)), amrex::max(amrex::Math::abs(p(0, 0)), amrex::max(amrex::Math::abs(p(1, 0)), amrex::max(amrex::Math::abs(p(2, 0)), amrex::max(amrex::Math::abs(p(3, 0)), amrex::max(amrex::Math::abs(n(0, 0)), amrex::Math::abs(n(1, 0))))))))))), amrex::max(amrex::Math::abs(Q_plus(0, 0)), amrex::max(amrex::Math::abs(Q_plus(1, 0)), amrex::max(amrex::Math::abs(Q_plus(2, 0)), amrex::max(amrex::Math::abs(Q_plus(3, 0)), amrex::max(amrex::Math::abs(p(0, 0)), amrex::max(amrex::Math::abs(p(1, 0)), amrex::max(amrex::Math::abs(p(2, 0)), amrex::max(amrex::Math::abs(p(3, 0)), amrex::max(amrex::Math::abs(n(0, 0)), amrex::Math::abs(n(1, 0))))))))))));
+    amrex::Real t0 = 0.5*amrex::max(amrex_user::max_wavespeed(Q_minus(0, 0), Q_minus(1, 0), Q_minus(2, 0), Q_minus(3, 0), p(0, 0), p(1, 0), p(2, 0), p(3, 0), n(0, 0), n(1, 0)), amrex_user::max_wavespeed(Q_plus(0, 0), Q_plus(1, 0), Q_plus(2, 0), Q_plus(3, 0), p(0, 0), p(1, 0), p(2, 0), p(3, 0), n(0, 0), n(1, 0)));
     amrex::Real t1 = t0*(-Q_minus(1, 0) + Q_plus(1, 0));
     amrex::Real t2 = t0*(-Q_minus(2, 0) + Q_plus(2, 0));
     amrex::Real t3 = 0.1127016653792583*Q_minus(1, 0) + 0.8872983346207417*Q_plus(1, 0);
@@ -91,7 +92,7 @@ struct Numerics {
         amrex::SmallMatrix<amrex::Real,2,1> const& n) noexcept
     {
     amrex::SmallMatrix<amrex::Real,1,1> res;
-    res(0, 0) = amrex::max(amrex::Math::abs(Q(0, 0)), amrex::max(amrex::Math::abs(Q(1, 0)), amrex::max(amrex::Math::abs(Q(2, 0)), amrex::max(amrex::Math::abs(Q(3, 0)), amrex::max(amrex::Math::abs(p(0, 0)), amrex::max(amrex::Math::abs(p(1, 0)), amrex::max(amrex::Math::abs(p(2, 0)), amrex::max(amrex::Math::abs(p(3, 0)), amrex::max(amrex::Math::abs(n(0, 0)), amrex::Math::abs(n(1, 0)))))))))));
+    res(0, 0) = amrex_user::max_wavespeed(Q(0, 0), Q(1, 0), Q(2, 0), Q(3, 0), p(0, 0), p(1, 0), p(2, 0), p(3, 0), n(0, 0), n(1, 0));
     return res;
     }
 

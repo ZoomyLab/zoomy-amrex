@@ -70,13 +70,20 @@ def build_system_model(model_name, dim, level, bc="extrap"):
     if model_name == "SWE":
         return M.SWE(dimension=dim, boundary_conditions=bcs).system_model
     if model_name == "SME":
-        # dim here is the TOTAL dimension; level adds moments q_1..q_level.
-        return M.SME(level=level, dimension=dim, boundary_conditions=bcs).system_model
+        # dim is the TOTAL dimension incl. the vertical (dim=3 -> 2 horizontal).
+        # The full closure set makes the moment source self-contained (the slip
+        # stress is inlined): friction lives in `lambda_s`, viscosity in `nu`,
+        # both settable via params.<name>.  level adds moments q_1..q_level.
+        from zoomy_core.model.models.closures import (
+            Newtonian, NavierSlip, StressFree)
+        return M.SME(level=level, dimension=dim,
+                     closures=[Newtonian(), NavierSlip(), StressFree()],
+                     boundary_conditions=bcs).system_model
     raise SystemExit(f"unknown model {model_name!r} (try SWE or SME)")
 
 
 def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap",
-                 implicit_source=False, implicit_global=False, friction=None):
+                 implicit_source=False, implicit_global=False, friction=None, slip=None):
     ncell_line = " ".join([str(ncell)] * 2 + (["1"] if dim_mesh == 3 else []))
     prob_hi = "1.0 1.0 1.0" if dim_mesh == 3 else "1.0 1.0"
     prob_lo = "0.0 0.0 0.0" if dim_mesh == 3 else "0.0 0.0"
@@ -85,7 +92,11 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
     if bc == "wall":  # closed basin: every side reflective
         bc_block = ("bc.x_lo = wall\nbc.x_hi = wall\n"
                     "bc.y_lo = wall\nbc.y_hi = wall\n")
-    fric_block = f"params.n_m = {friction}\n" if friction is not None else ""
+    fric_block = ""
+    if friction is not None:
+        fric_block += f"params.n_m = {friction}\n"
+    if slip is not None:
+        fric_block += f"params.lambda_s = {slip}\n"
     path.write_text(f"""amr.max_level     = 0
 amr.n_cell        = {ncell_line}
 amr.max_grid_size = 64
@@ -125,6 +136,8 @@ def main():
                     help="matrix-free JFNK source solve (nonlocal-capable)")
     ap.add_argument("--friction", type=float, default=None,
                     help="Manning n_m override (params.n_m)")
+    ap.add_argument("--slip", type=float, default=None,
+                    help="SME slip length lambda_s override (params.lambda_s)")
     ap.add_argument("--build-dir", default="/tmp/zoomy_amrex_run")
     ap.add_argument("--make", action="store_true")
     ap.add_argument("--run", action="store_true")
@@ -154,7 +167,7 @@ def main():
         GNUMAKEFILE.format(amrex_home=amrex_home, dim=a.dim_mesh))
     write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc,
                  implicit_source=a.implicit, implicit_global=a.implicit_global,
-                 friction=a.friction)
+                 friction=a.friction, slip=a.slip)
 
     if a.make:
         n = os.cpu_count() or 4
