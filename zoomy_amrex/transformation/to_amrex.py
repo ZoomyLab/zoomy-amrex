@@ -417,7 +417,27 @@ amrex::Real max_wavespeed(Ts... args) noexcept
     auto ev = Model::eigenvalues(Q, Qaux, p, n);
     amrex::Real mx = 0.0;
     for (int k = 0; k < NQ; ++k) mx = amrex::max(mx, std::abs(ev(k, 0)));
-    return mx;
+    if (mx > amrex::Real(0)) return mx;   // analytical spectrum present (SWE/SME)
+
+    // No closed-form spectrum (e.g. hand-built VAM, eigenvalues=None): estimate
+    // the spectral radius of the normal-projected quasilinear matrix A_n =
+    // sum_d n_d A_d via the GERSHGORIN row-sum bound  rho(A) <= max_i sum_j|A_ij|.
+    // GPU-portable, allocation-free, guaranteed upper bound (always stable;
+    // mildly over-diffusive).  quasilinear_matrix is stacked dir-major:
+    // index = d*(NE*NQ) + i*NQ + j  (NE = n_dof_eq rows, NQ = n_state cols).
+    constexpr int NE = Model::n_dof_eq;
+    auto QL = Model::quasilinear_matrix(Q, Qaux, p);
+    amrex::Real bound = 0.0;
+    for (int ii = 0; ii < NE; ++ii) {
+        amrex::Real rowsum = 0.0;
+        for (int jj = 0; jj < NQ; ++jj) {
+            amrex::Real a = 0.0;
+            for (int d = 0; d < ND; ++d) a += n(d, 0) * QL(d * NE * NQ + ii * NQ + jj, 0);
+            rowsum += std::abs(a);
+        }
+        bound = amrex::max(bound, rowsum);
+    }
+    return bound;
 }
 
 }  // namespace amrex_user
