@@ -62,14 +62,29 @@ def build_system_model(model_name, dim, level, bc="extrap"):
     from zoomy_core.model import models as M
     from zoomy_core.model.boundary_conditions import (
         BoundaryConditions, Extrapolation, Wall)
-    if bc == "wall":
-        bcs = BoundaryConditions([Wall(tag="wall"), Extrapolation(tag="outer")])
-    else:
-        bcs = BoundaryConditions([Extrapolation(tag="left"),
-                                  Extrapolation(tag="right")])
+
+    def _wall(mom_idx=None):
+        # mom_idx: explicit momentum-reflection groups, needed for SME because
+        # core's _state_momentum_groups mis-derives the moment-hierarchy slots
+        # (reflects [h, q_x_0] -> negative ghost h -> NaN; core REQ filed). For
+        # SWE the auto-derivation is correct, so leave it default.
+        w = Wall(tag="wall", momentum_field_indices=mom_idx) if mom_idx else Wall(tag="wall")
+        return BoundaryConditions([w, Extrapolation(tag="outer")])
+
     if model_name == "SWE":
+        bcs = _wall() if bc == "wall" else BoundaryConditions(
+            [Extrapolation(tag="left"), Extrapolation(tag="right")])
         return M.SWE(dimension=dim, boundary_conditions=bcs).system_model
     if model_name == "SME":
+        # SME(level=L, dim=3) state = [b, h, q_x_0..q_x_L, q_y_0..q_y_L];
+        # wall reflects each moment vector (q_x_k, q_y_k) -> groups [2+k, 3+L+k].
+        if bc == "wall":
+            groups = [[2 + k, 2 + (level + 1) + k] for k in range(level + 1)] \
+                if dim == 3 else [[2 + k] for k in range(level + 1)]
+            bcs = _wall(groups)
+        else:
+            bcs = BoundaryConditions([Extrapolation(tag="left"),
+                                      Extrapolation(tag="right")])
         # dim is the TOTAL dimension incl. the vertical (dim=3 -> 2 horizontal).
         # The full closure set makes the moment source self-contained (the slip
         # stress is inlined): friction lives in `lambda_s`, viscosity in `nu`,
