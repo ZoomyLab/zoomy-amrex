@@ -32,32 +32,12 @@ from zoomy_core.transformation.generic_c import GenericCppBase
 from zoomy_core.transformation.to_amrex import AmrexCore, AmrexNumerics
 
 
-def _emit_max_wavespeed(printer, *args):
-    """Emit the ``max_wavespeed`` placeholder as a flat variadic call to the
-    eigenvalue-based helper in ``NumericsUser.H`` — NOT the base
-    ``max(|all args|)`` fallback, which wrongly includes the parameters (e.g.
-    ``lambda_s``) and so blows up the CFL dt and the Rusanov dissipation."""
-    return ("amrex_user::max_wavespeed("
-            + ", ".join(printer.doprint(a) for a in args) + ")")
-
-
-class AmrexNumericsPrinter(AmrexNumerics):
-    """AMReX numerics printer with a correct ``max_wavespeed`` mapping.
-
-    The core ``AmrexNumerics`` inherits the base C ``max_wavespeed`` =
-    ``max(|args|)`` which includes the parameter vector — fine for SWE (g≈10)
-    but catastrophic for SME (slip ``lambda_s`` dominates → dt≈dx/lambda_s).
-    We route it to ``amrex_user::max_wavespeed`` (eigenvalue-based), mirroring
-    foam's ``numerics::max_wavespeed`` (to_openfoam.py)."""
-
-    c_functions = {**AmrexNumerics.c_functions, "max_wavespeed": _emit_max_wavespeed}
-
-    def create_code(self):
-        code = super().create_code()
-        # NumericsUser.H defines amrex_user::max_wavespeed (needs Model::); it is
-        # included after Model.H is already in scope (make_rhs.H/ZoomyAmr.H order).
-        return code.replace('#pragma once',
-                            '#pragma once\n#include "NumericsUser.H"', 1)
+# Numerics printer = core's AmrexNumerics directly.  As of zoomy_core@4e3e1f9 it
+# emits a REAL ``local_max_abs_eigenvalue`` (Max|lambda_i| inline, Gershgorin
+# row-sum fallback when eigenvalues=None) and #includes Model.H — there is no
+# ``max_wavespeed`` indirection anymore, so the old NumericsUser.H + c_functions
+# override are gone (REQ-58).
+AmrexNumericsPrinter = AmrexNumerics
 
 
 def _emit_user_call(name):
@@ -391,72 +371,6 @@ T compute_derivative(T) noexcept { return T(0); }
 """
 
 
-NUMERICS_USER_H = """#pragma once
-// amrex_user::max_wavespeed — eigenvalue-based wave speed for the Rusanov
-// dissipation + CFL.  The generated Numerics kernels emit the symbolic
-// max_wavespeed(*Q, *Qaux, *p, *n) as ONE flat variadic call; here we unpack
-// it back into SmallMatrix args and take the spectral radius from
-// Model::eigenvalues.  This avoids the base max(|args|) fallback (which
-// wrongly includes the parameter vector — e.g. the slip length lambda_s).
-#include "Model.H"
-#include <AMReX_REAL.H>
-#include <AMReX_SmallMatrix.H>
-#include <AMReX_GpuQualifiers.H>
-#include <AMReX_Math.H>
-#include <cmath>
-
-namespace amrex_user {
-
-template <typename... Ts>
-AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-amrex::Real max_wavespeed(Ts... args) noexcept
-{
-    constexpr int NQ = Model::n_dof_q;
-    constexpr int NA = Model::n_dof_qaux;
-    constexpr int NP = Model::n_parameters;
-    constexpr int ND = Model::dimension;
-    static_assert(sizeof...(args) == NQ + NA + NP + ND,
-        "max_wavespeed: arg count must equal n_dof_q+n_dof_qaux+n_parameters+dimension");
-    const amrex::Real packed[] = { static_cast<amrex::Real>(args)... };
-    amrex::SmallMatrix<amrex::Real, NQ, 1> Q;
-    amrex::SmallMatrix<amrex::Real, NA, 1> Qaux;
-    amrex::SmallMatrix<amrex::Real, NP, 1> p;
-    amrex::SmallMatrix<amrex::Real, ND, 1> n;
-    int i = 0;
-    for (int k = 0; k < NQ; ++k) Q(k, 0)    = packed[i++];
-    for (int k = 0; k < NA; ++k) Qaux(k, 0) = packed[i++];
-    for (int k = 0; k < NP; ++k) p(k, 0)    = packed[i++];
-    for (int k = 0; k < ND; ++k) n(k, 0)    = packed[i++];
-    auto ev = Model::eigenvalues(Q, Qaux, p, n);
-    amrex::Real mx = 0.0;
-    for (int k = 0; k < NQ; ++k) mx = amrex::max(mx, std::abs(ev(k, 0)));
-    if (mx > amrex::Real(0)) return mx;   // analytical spectrum present (SWE/SME)
-
-    // No closed-form spectrum (e.g. hand-built VAM, eigenvalues=None): estimate
-    // the spectral radius of the normal-projected quasilinear matrix A_n =
-    // sum_d n_d A_d via the GERSHGORIN row-sum bound  rho(A) <= max_i sum_j|A_ij|.
-    // GPU-portable, allocation-free, guaranteed upper bound (always stable;
-    // mildly over-diffusive).  quasilinear_matrix is stacked dir-major:
-    // index = d*(NE*NQ) + i*NQ + j  (NE = n_dof_eq rows, NQ = n_state cols).
-    constexpr int NE = Model::n_dof_eq;
-    auto QL = Model::quasilinear_matrix(Q, Qaux, p);
-    amrex::Real bound = 0.0;
-    for (int ii = 0; ii < NE; ++ii) {
-        amrex::Real rowsum = 0.0;
-        for (int jj = 0; jj < NQ; ++jj) {
-            amrex::Real a = 0.0;
-            for (int d = 0; d < ND; ++d) a += n(d, 0) * QL(d * NE * NQ + ii * NQ + jj, 0);
-            rowsum += std::abs(a);
-        }
-        bound = amrex::max(bound, rowsum);
-    }
-    return bound;
-}
-
-}  // namespace amrex_user
-"""
-
-
 def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
     """Generate ``Model.H``, ``Numerics.H`` and ``UserFunctions.H`` into *out_dir*.
 
@@ -477,7 +391,6 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
     num = riemann(model=sm)
 
     (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
-    (out / "NumericsUser.H").write_text(NUMERICS_USER_H)
     (out / "Model.H").write_text(
         AmrexSystemModelPrinter(sm, analytical_eigenvalues=analytical_eigenvalues)
         .create_code())
