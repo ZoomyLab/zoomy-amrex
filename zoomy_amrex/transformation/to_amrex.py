@@ -89,7 +89,11 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         self.sm = sm
         self.model = sm  # AmrexCore signature helpers read ``self.model.*``
         self.analytical_eigenvalues = analytical_eigenvalues
-        self.n_eq = len(sm.state)
+        # n_state = length of the Q vector; n_eq = number of evolution equations
+        # (operator rows).  Equal for square models (SWE/SME/full VAM); for a
+        # Chorin split sub-model n_eq < n_state (it evolves only its own rows).
+        self.n_state = len(sm.state)
+        self.n_eq = int(getattr(sm, "n_equations", len(sm.state)))
         self.n_aux = len(sm.aux_state)
         self.dim = int(sm.dimension)
         self.n_param = len(list(sm.parameters.keys()))
@@ -106,12 +110,12 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
     def _args(self, *names):
         tbl = {
-            "Q": f"{self._t(self.n_eq)} const& Q",
+            "Q": f"{self._t(self.n_state)} const& Q",
             "Qaux": f"{self._t(self.n_aux)} const& Qaux",
             "p": f"{self._t(self.n_param)} const& p",
             "n": f"{self._t(self.dim)} const& n",
             "X": f"{self._t(3)} const& X",
-            "gradQ": f"{self._t(self.n_eq * self.dim)} const& gradQ",
+            "gradQ": f"{self._t(self.n_state * self.dim)} const& gradQ",
             "time": "amrex::Real const time",
             "dX": "amrex::Real const dX",
             "bc_idx": "const int bc_idx",
@@ -156,21 +160,28 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         flat = [mat[i, j, d]
                 for d in range(self.dim)
                 for i in range(self.n_eq)
-                for j in range(self.n_eq)]
-        return self._vec(flat), self.dim * self.n_eq * self.n_eq
+                for j in range(self.n_state)]
+        return self._vec(flat), self.dim * self.n_eq * self.n_state
 
     def _expr_source(self):
         s = self.sm.source
         return self._vec([s[i, 0] for i in range(self.n_eq)]), self.n_eq
 
     def _expr_eigenvalues(self):
-        e = self.sm.eigenvalues
-        return self._vec([e[i, 0] for i in range(self.n_eq)]), self.n_eq
+        # eigenvalues are length n_state (the spectrum of the full quasilinear
+        # operator).  None (declarative / hand-built VAM) -> zeros: the backend
+        # falls back to a numerical spectral radius (Chorin predictor path).
+        e = getattr(self.sm, "eigenvalues", None)
+        if e is None:
+            return self._zeros(self.n_state), self.n_state
+        return self._vec([e[i, 0] for i in range(self.n_state)]), self.n_state
 
     def _expr_source_jac(self):
-        J = self.sm.source_jacobian  # (n_eq, n_eq)
+        J = getattr(self.sm, "source_jacobian", None)  # (n_eq, n_state)
+        if J is None:
+            return self._zeros(self.n_eq * self.n_state), self.n_eq * self.n_state
         return self._vec([J[r, c] for r in range(self.n_eq)
-                          for c in range(self.n_eq)]), self.n_eq * self.n_eq
+                          for c in range(self.n_state)]), self.n_eq * self.n_state
 
     def _expr_update_aux(self):
         ua = getattr(self.sm, "update_aux_variables", None)
@@ -218,11 +229,12 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             "",
             "struct Model {",
             "    using T = amrex::Real;",
-            f"    static constexpr int n_dof_q    = {self.n_eq};",
+            f"    static constexpr int n_dof_q    = {self.n_state};",
+            f"    static constexpr int n_dof_eq   = {self.n_eq};",
             f"    static constexpr int n_dof_qaux = {self.n_aux};",
             f"    static constexpr int n_parameters = {self.n_param};",
             f"    static constexpr int dimension  = {self.dim};",
-            f"    static constexpr int n_dof_gradQ = {self.n_eq * self.dim};",
+            f"    static constexpr int n_dof_gradQ = {self.n_state * self.dim};",
             "    static constexpr bool has_diffusion = false;",
             f"    static constexpr int n_boundary_tags = {len(bc_tags)};",
             f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
@@ -238,7 +250,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             if hasattr(sm, "_bc_source") else []
         blocks = [self._file_header(bc_tags)]
 
-        ne, na, d = self.n_eq, self.n_aux, self.dim
+        ne, ns, na, d = self.n_eq, self.n_state, self.n_aux, self.dim
 
         # flux / NCP / quasilinear (emitted for completeness; the C++ driver
         # reads these from Numerics.H, not from Model.H)
@@ -261,25 +273,25 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         blocks.append(self._kernel("diffusive_flux", self._zeros(ne * d),
                                    (ne * d, 1), ("Q", "Qaux", "gradQ", "p")))
 
-        # eigenvalues (depend on the face normal)
+        # eigenvalues (length n_state; depend on the face normal)
         eexpr, _ = self._expr_eigenvalues()
         if self.analytical_eigenvalues:
-            blocks.append(self._kernel("eigenvalues", eexpr, (ne, 1),
+            blocks.append(self._kernel("eigenvalues", eexpr, (ns, 1),
                                        ("Q", "Qaux", "p", "n")))
         else:
-            blocks.append(self._kernel("eigenvalues", self._zeros(ne), (ne, 1),
+            blocks.append(self._kernel("eigenvalues", self._zeros(ns), (ns, 1),
                                        ("Q", "Qaux", "p", "n")))
-        blocks.append(self._kernel("left_eigenvectors", self._zeros(ne * ne),
-                                   (ne * ne, 1), ("Q", "Qaux", "p", "n")))
-        blocks.append(self._kernel("right_eigenvectors", self._zeros(ne * ne),
-                                   (ne * ne, 1), ("Q", "Qaux", "p", "n")))
+        blocks.append(self._kernel("left_eigenvectors", self._zeros(ns * ns),
+                                   (ns * ns, 1), ("Q", "Qaux", "p", "n")))
+        blocks.append(self._kernel("right_eigenvectors", self._zeros(ns * ns),
+                                   (ns * ns, 1), ("Q", "Qaux", "p", "n")))
 
-        # source + jacobians
+        # source + jacobians (n_eq rows; jacobian (n_eq, n_state))
         sexpr, _ = self._expr_source()
         blocks.append(self._kernel("source", sexpr, (ne, 1), ("Q", "Qaux", "p")))
         jexpr, _ = self._expr_source_jac()
         blocks.append(self._kernel("source_jacobian_wrt_variables", jexpr,
-                                   (ne * ne, 1), ("Q", "Qaux", "p")))
+                                   (ne * ns, 1), ("Q", "Qaux", "p")))
         blocks.append(self._kernel("source_jacobian_wrt_aux_variables",
                                    self._zeros(ne * na), (ne * na, 1),
                                    ("Q", "Qaux", "p")))
@@ -287,13 +299,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         # 3d projection / misc (stubs; ZoomyAmr writes var0..varN directly)
         blocks.append(self._kernel("project_2d_to_3d", self._zeros(6), (6, 1),
                                    ("X", "Q", "Qaux", "p")))
-        blocks.append(self._kernel("project_3d_to_2d", self._zeros(ne), (ne, 1),
+        blocks.append(self._kernel("project_3d_to_2d", self._zeros(ns), (ns, 1),
                                    ("Q", "Qaux", "p")))
-        blocks.append(self._kernel("residual", self._zeros(ne), (ne, 1),
+        blocks.append(self._kernel("residual", self._zeros(ns), (ns, 1),
                                    ("time", "X", "dX", "Q", "Qaux", "p")))
         blocks.append(self._kernel("interpolate", self._vec(list(sm.state)),
-                                   (ne, 1), ("Q", "Qaux", "p")))
-        blocks.append(self._kernel("initial_condition", self._zeros(ne), (ne, 1),
+                                   (ns, 1), ("Q", "Qaux", "p")))
+        blocks.append(self._kernel("initial_condition", self._zeros(ns), (ns, 1),
                                    ("X", "p")))
         blocks.append(self._kernel("initial_aux_condition", self._zeros(na),
                                    (na, 1), ("X", "p")))
@@ -309,15 +321,15 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
         # update variables / aux + jacobians
         blocks.append(self._kernel("update_variables", self._vec(list(sm.state)),
-                                   (ne, 1), ("Q", "Qaux", "p")))
+                                   (ns, 1), ("Q", "Qaux", "p")))
         uaexpr, _ = self._expr_update_aux()
         blocks.append(self._kernel("update_aux_variables", uaexpr, (na, 1),
                                    ("Q", "Qaux", "p")))
         blocks.append(self._kernel("update_variables_jacobian_wrt_variables",
-                                   self._identity_flat(ne), (ne * ne, 1),
+                                   self._identity_flat(ns), (ns * ns, 1),
                                    ("Q", "Qaux", "p")))
         blocks.append(self._kernel("update_aux_variables_jacobian_wrt_variables",
-                                   self._zeros(na * ne), (na * ne, 1),
+                                   self._zeros(na * ns), (na * ns, 1),
                                    ("Q", "Qaux", "p")))
 
         # boundary conditions — the real per-tag dispatch: ``sm.boundary_conditions``
@@ -327,7 +339,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         # ``bc_idx`` prints as itself (matches the C++ arg), Q/Qaux/n via the maps.
         bc_def = self._bc_definition("boundary_conditions")
         bc_expr = bc_def if bc_def is not None else self._vec(list(sm.state))
-        blocks.append(self._kernel("boundary_conditions", bc_expr, (ne, 1),
+        blocks.append(self._kernel("boundary_conditions", bc_expr, (ns, 1),
                                    ("bc_idx", "Q", "Qaux", "n", "X", "time", "dX")))
         abc_def = self._bc_definition("aux_boundary_conditions")
         abc_expr = abc_def if abc_def is not None else (
