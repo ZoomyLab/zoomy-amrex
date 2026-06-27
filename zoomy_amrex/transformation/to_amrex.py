@@ -18,10 +18,12 @@ Design notes
   onto the SystemModel.  Foam handled this with ``FoamSystemModelPrinter``; this
   is the AMReX analogue.
 * Placeholder ("kernel") functions are mapped in :attr:`c_functions`, extending
-  the base C map (``conditional``/``Min``/``Max``/``Abs``/``clamp_*``/
-  ``max_wavespeed``) with the opaque kernels ``eigensystem`` / ``compute_derivative``
-  routed to hand-written helpers in ``UserFunctions.H`` — the same opaque-call
-  pattern foam uses (``to_openfoam.py``).
+  the base C map (``conditional``/``Min``/``Max``/``Abs``/``clamp_*``) with the
+  opaque kernels ``eigensystem`` / ``compute_derivative`` routed to hand-written
+  helpers in ``UserFunctions.H`` — the same opaque-call pattern foam uses
+  (``to_openfoam.py``).  The CFL wave speed is no longer an opaque
+  ``max_wavespeed`` call: core's ``AmrexNumerics`` emits a real
+  ``local_max_abs_eigenvalue`` kernel into ``Numerics.H`` (REQ-58).
 """
 
 import functools

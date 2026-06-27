@@ -15,9 +15,11 @@ Model  ──▶  SystemModel  ──▶  AMReX device code  ──▶  AmrCore 
   backend owns its printer the same way). `AmrexSystemModelPrinter` emits
   `Model.H` from a frozen `SystemModel`; `Numerics.H` comes from `zoomy_core`'s
   `AmrexNumerics` (a Riemann scheme over the same SystemModel). All "placeholder"
-  kernel functions (`conditional`, `clamp_*`, `max_wavespeed`, `eigensystem`,
+  kernel functions (`conditional`, `clamp_*`, `eigensystem`,
   `compute_derivative`, …) are mapped in the printer's `c_functions`; the opaque
-  ones resolve to hand-written helpers in the generated `UserFunctions.H`.
+  ones resolve to hand-written helpers in the generated `UserFunctions.H`. The CFL
+  wave speed is `Numerics::local_max_abs_eigenvalue` (a real `Max(|λ_i|)` kernel
+  emitted by core's `AmrexNumerics`, Gershgorin row-sum when `eigenvalues=None`).
 * **`Source/`** — the hand-written C++ driver: `ZoomyAmr.cpp` (AmrCore: multi-level
   AMR, subcycling, FillPatch, RK1/SSP-RK2), `make_rhs.H` (MUSCL/minmod
   reconstruction, path-conservative D± fluxes, a per-cell implicit-source Newton
