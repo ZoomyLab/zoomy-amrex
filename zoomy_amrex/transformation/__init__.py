@@ -13,10 +13,12 @@ from zoomy_amrex.transformation.to_amrex import (
     AmrexSystemModelPrinter,
     AmrexNumericsPrinter,
     generate_headers,
+    write_chorin_headers,
 )
 
 __all__ = [
     "AmrexSystemModelPrinter",
     "AmrexNumericsPrinter",
     "generate_headers",
+    "write_chorin_headers",
 ]

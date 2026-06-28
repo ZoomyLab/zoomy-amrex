@@ -66,11 +66,12 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         "compute_derivative": _emit_user_call("compute_derivative"),
     }
 
-    def __init__(self, sm, *, analytical_eigenvalues=True):
+    def __init__(self, sm, *, analytical_eigenvalues=True, wrapper_name="Model"):
         super().__init__()
         self.sm = sm
         self.model = sm  # AmrexCore signature helpers read ``self.model.*``
         self.analytical_eigenvalues = analytical_eigenvalues
+        self._wrapper_name = wrapper_name
         # n_state = length of the Q vector; n_eq = number of evolution equations
         # (operator rows).  Equal for square models (SWE/SME/full VAM); for a
         # Chorin split sub-model n_eq < n_state (it evolves only its own rows).
@@ -219,7 +220,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             "",
             '#include "UserFunctions.H"',
             "",
-            "struct Model {",
+            f"struct {self._wrapper_name} {{",
             "    using T = amrex::Real;",
             f"    static constexpr int n_dof_q    = {self.n_state};",
             f"    static constexpr int n_dof_eq   = {self.n_eq};",
@@ -238,8 +239,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
     # ── top-level emission ───────────────────────────────────────────────────
     def create_code(self):
         sm = self.sm
-        bc_tags = sorted(sm._bc_source.boundary_conditions_list_dict.keys()) \
-            if hasattr(sm, "_bc_source") else []
+        bc_src = getattr(sm, "_bc_source", None)
+        bc_tags = sorted(bc_src.boundary_conditions_list_dict.keys()) \
+            if bc_src is not None else []
         blocks = [self._file_header(bc_tags)]
 
         ne, ns, na, d = self.n_eq, self.n_state, self.n_aux, self.dim
@@ -342,8 +344,39 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         blocks.append(self._kernel("aux_boundary_conditions", abc_expr, (na, 1),
                                    ("bc_idx", "Q", "Qaux", "n", "X", "time", "dX")))
 
+        blocks.append(self._chorin_meta())
         blocks.append("};\n")
         return "\n".join(blocks)
+
+    def _chorin_meta(self):
+        """Static metadata the Chorin C++ driver needs: which state rows this
+        sub-model evolves (``e2s``), and the derivative auxiliaries it must
+        FD-fill (``deriv_aux``: {aux_row, state_index, x_order}) — live ones
+        from ``aux_registry`` and frozen ones from ``aux_input_registry``."""
+        sm = self.sm
+        e2s = list(getattr(sm, "equation_to_state_index", range(self.n_eq)))
+        def _rows(reg):
+            out = []
+            for e in (reg or []):
+                mi = e.get("multi_index", (0,))
+                out.append((e["row"], e["state_index"], int(mi[0]) if mi else 0))
+            return out
+        live = _rows(getattr(sm, "aux_registry", None))
+        frozen = _rows(getattr(sm, "aux_input_registry", None))
+        def _arr(name, rows):
+            if not rows:
+                return (f"    static constexpr int n_{name} = 0;\n"
+                        f"    static constexpr int {name}[1][3] = {{{{0,0,0}}}};")
+            body = ", ".join(f"{{{r},{s},{o}}}" for r, s, o in rows)
+            return (f"    static constexpr int n_{name} = {len(rows)};\n"
+                    f"    static constexpr int {name}[{len(rows)}][3] = {{{body}}};")
+        L = [
+            f"    static constexpr int n_e2s = {len(e2s)};",
+            f"    static constexpr int e2s[{max(len(e2s),1)}] = {{ {', '.join(map(str, e2s)) or '0'} }};",
+            _arr("deriv_aux", live),
+            _arr("input_aux", frozen),
+        ]
+        return "\n".join(L)
 
 
 # ── user-functions helper header (opaque kernel bodies) ─────────────────────
@@ -397,4 +430,40 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
         AmrexSystemModelPrinter(sm, analytical_eigenvalues=analytical_eigenvalues)
         .create_code())
     (out / "Numerics.H").write_text(AmrexNumericsPrinter(num).create_code())
+    return out
+
+
+def write_chorin_headers(sm, pressure_vars, out_dir, *, dt_symbol=None):
+    """Generate the three Chorin split sub-model headers for the C++ ChorinDriver.
+
+    ``sm``           a frozen non-hydrostatic SystemModel (e.g. hand-built VAM).
+    ``pressure_vars`` the pressure-mode state symbols (e.g. [P_0, P_1]).
+    Emits ``ModelPred.H`` / ``ModelPress.H`` / ``ModelCorr.H`` (distinct struct
+    names so all three coexist in one TU) each carrying its ``e2s`` + derivative
+    -aux metadata, ``NumericsPred.H`` (the predictor's Rusanov flux), and
+    ``UserFunctions.H``.  The driver: predictor (explicit flux on SM_pred's e2s
+    rows) → pressure (matrix-free GMRES on SM_press.source, FD ∂P/∂²P) →
+    corrector (SM_corr.update_variables, dt) — see task 0029.
+    """
+    from pathlib import Path
+    import sympy as sp
+    from zoomy_core.model.splitter import split_simple
+    from zoomy_core.fvm.riemann_solvers import NonconservativeRusanov
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    dt = dt_symbol or sp.Symbol("dt", positive=True)
+    split = split_simple(sm, list(pressure_vars), dt)
+
+    (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
+    for sub, name in [(split.SM_pred, "ModelPred"),
+                      (split.SM_press, "ModelPress"),
+                      (split.SM_corr, "ModelCorr")]:
+        (out / f"{name}.H").write_text(
+            AmrexSystemModelPrinter(sub, analytical_eigenvalues=False,
+                                    wrapper_name=name).create_code())
+    # predictor flux (the only sub-model with a hyperbolic flux)
+    npred = NonconservativeRusanov(model=split.SM_pred)
+    prn = AmrexNumericsPrinter(npred)
+    prn._wrapper_name = "NumericsPred"
+    (out / "NumericsPred.H").write_text(
+        prn.create_code().replace('#include "Model.H"', '#include "ModelPred.H"'))
     return out
