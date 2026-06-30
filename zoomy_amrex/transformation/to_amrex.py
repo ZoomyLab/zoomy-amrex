@@ -168,8 +168,25 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return ",\n        ".join(tbl[a] for a in names)
 
     def _kernel(self, name, expr, shape, argnames):
+        expr = self._resolve_subs(expr)
         body = self.convert_expression_body(expr, shape)
         return self.wrap_function_signature(name, self._args(*argnames), body, shape)
+
+    @staticmethod
+    def _resolve_subs(expr):
+        """Evaluate any ``Subs(f(ζ), ζ, 0)`` bed/surface-trace nodes BEFORE CSE so
+        the inner ζ-dependence is substituted concretely (C has no ``Subs``).  Only
+        Subs nodes are touched — opaque Galerkin brackets / Integrals are left
+        alone (they never reach the backend).  This mirrors what the numpy printer
+        gets for free via lambdify."""
+        def fix(e):
+            return sp.sympify(e).replace(
+                lambda n: isinstance(n, sp.Subs), lambda n: n.doit())
+        shape = getattr(expr, "shape", None)
+        if shape is None:
+            return fix(expr)
+        flat = [fix(e) for e in list(expr)]      # ZArray/Array -> flat sympy list
+        return sp.Array(flat).reshape(*shape)
 
     # ── expression builders ─────────────────────────────────────────────────
     def _vec(self, elements):
@@ -549,7 +566,7 @@ def write_chorin_headers(split, out_dir):
     corrector (SM_corr.update_variables, dt) — see task 0029.
     """
     from pathlib import Path
-    from zoomy_core.fvm.riemann_solvers import NonconservativeRusanov
+    from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
 
     (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
@@ -559,8 +576,11 @@ def write_chorin_headers(split, out_dir):
         (out / f"{name}.H").write_text(
             AmrexSystemModelPrinter(sub, analytical_eigenvalues=False,
                                     wrapper_name=name).create_code())
-    # predictor flux (the only sub-model with a hyperbolic flux)
-    npred = NonconservativeRusanov(model=split.SM_pred)
+    # predictor flux: Audusse PositiveNonconservativeRusanov (hydrostatic
+    # reconstruction = well-balanced over the bed), matching the numpy reference
+    # ChorinSplitVAMSolver.  Plain Rusanov is NOT WB -> spurious pressure spike +
+    # surface hump at the steepest bed slope (the bump crest).
+    npred = PositiveNonconservativeRusanov(model=split.SM_pred)
     prn = AmrexNumericsPrinter(npred)
     prn._wrapper_name = "NumericsPred"
     (out / "NumericsPred.H").write_text(

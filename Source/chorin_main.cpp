@@ -99,8 +99,11 @@ static amrex::SmallMatrix<Real,N,1> packp(const std::vector<Real>& v)
 // components are zero-gradient.  No model structure here.
 struct BCInfo {
     int n_in = 0;
-    std::vector<int> comp;       // state slots to prescribe at x-lo
+    std::vector<int> comp;       // state slots to prescribe at x-lo (inflow)
     std::vector<Real> val;
+    int n_pin = 0;               // state slots Dirichlet-pinned at x-hi (e.g. P=0)
+    std::vector<int> pin_comp;   // -> the Chorin pressure reference
+    std::vector<Real> pin_val;
 };
 static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
 {
@@ -111,11 +114,11 @@ static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
     for (MFIter mfi(Q); mfi.isValid(); ++mfi) {
         const Box& gbx = mfi.growntilebox(Q.nGrow());
         auto a = Q.array(mfi);
-        const int ncomp = NS, ng = Q.nGrow();
-        const int nin = bc.n_in;
-        // copy the small inflow spec to device-capturable buffers
-        int  ic[16]; Real iv[16];
-        for (int m = 0; m < nin && m < 16; ++m) { ic[m] = bc.comp[m]; iv[m] = bc.val[m]; }
+        const int ncomp = NS;
+        const int nin = bc.n_in, npin = bc.n_pin;
+        int  ic[16]; Real iv[16]; int pc[16]; Real pv[16];
+        for (int m = 0; m < nin  && m < 16; ++m) { ic[m] = bc.comp[m];     iv[m] = bc.val[m]; }
+        for (int m = 0; m < npin && m < 16; ++m) { pc[m] = bc.pin_comp[m]; pv[m] = bc.pin_val[m]; }
         ParallelFor(gbx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
             int ii = amrex::min(amrex::max(i, ilo), ihi);   // clamp into domain
             int jj = amrex::min(amrex::max(j, jlo), jhi);
@@ -123,6 +126,9 @@ static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
             for (int n = 0; n < ncomp; ++n) a(i, j, 0, n) = a(ii, jj, 0, n);  // zeroGrad
             if (i < ilo)                                    // x-lo inflow override
                 for (int m = 0; m < nin; ++m) a(i, j, 0, ic[m]) = iv[m];
+            if (i > ihi)                                    // x-hi Dirichlet pin
+                for (int m = 0; m < npin; ++m)              //   ghost = 2*val - edge
+                    a(i, j, 0, pc[m]) = 2.0*pv[m] - a(ii, jj, 0, pc[m]);
         });
     }
 }
@@ -208,6 +214,9 @@ int main(int argc, char* argv[])
     { ParmParse pp("inflow"); Vector<int> c; Vector<Real> v;
       if (pp.queryarr("comp", c)) { pp.getarr("val", v); bc.n_in = c.size();
           bc.comp.assign(c.begin(), c.end()); bc.val.assign(v.begin(), v.end()); } }
+    { ParmParse pp("pin"); Vector<int> c; Vector<Real> v;       // x-hi Dirichlet pin
+      if (pp.queryarr("comp", c)) { pp.getarr("val", v); bc.n_pin = c.size();
+          bc.pin_comp.assign(c.begin(), c.end()); bc.pin_val.assign(v.begin(), v.end()); } }
 
 
     // ── predictor explicit RHS (Rusanov flux + NCP + source) on e2s rows ────

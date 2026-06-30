@@ -215,10 +215,14 @@ def prepare_escalante_rasters(out_dir, n_inner=60, domain=(-1.5, 1.5)):
 
 
 def write_chorin_inputs(path, geom, tend, cfl, plot_dt, inflow_q_U0,
-                        g=9.81, rho=1000.0):
-    """inputs for chorin_main.cpp.  Inflow is mapped to the PRINTED VAM state
-    order [b,h,q_U0,q_U1,q_W0,q_W1,P_0,P_1]: prescribe q_U0 (slot 2) at x-lo,
-    zero the other moments (3,4,5); b,h extrapolate.  No model structure here."""
+                        g=9.81, rho=1.0):
+    """inputs for chorin_main.cpp.  Matches run_derived.py exactly:
+      - state order [b,h,q_0,q_1,r_0,r_1,P_0,P_1];
+      - x-lo INFLOW: prescribe q_0 (slot 2), zero q_1/r_0/r_1 (3,4,5); b,h,P extrap;
+      - x-hi PIN: P_0,P_1 (slots 6,7) Dirichlet 0 — the pressure reference the
+        Chorin elliptic solve needs (without it the pure-Neumann system is
+        singular -> arbitrary additive pressure -> wrong p_b & corrector);
+      - rho=1 (the derived VAM uses kinematic pressure)."""
     nx, ny = geom["nx"], geom["ny"]
     gx0, gy0 = geom["prob_lo"]; gx1, gy1 = geom["prob_hi"]
     path.write_text(f"""amr.n_cell        = {nx} {ny}
@@ -231,6 +235,8 @@ init.dem_file     = {geom['dem_file']}
 init.release_file = {geom['release_file']}
 inflow.comp = 2 3 4 5
 inflow.val  = {inflow_q_U0} 0.0 0.0 0.0
+pin.comp = 6 7
+pin.val  = 0.0 0.0
 params.g = {g}
 params.rho = {rho}
 params.nu = 0.0
@@ -246,8 +252,9 @@ def build_vam(a):
     sub-model headers → stage chorin_main.cpp (model-agnostic) → Escalante case
     rasters/inputs → make/run.  Nothing here is Riemann/model-specific; swapping
     the model below (any model with a chorin_split) reuses the same driver."""
-    from zoomy_core.model.models import VAM
-    from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+    import sympy as sp
+    from zoomy_core.model.models.vam import VAM
+    from zoomy_core.model.models.closures import Newtonian, StressFree
     from zoomy_amrex.transformation import write_chorin_headers
 
     bdir = Path(a.build_dir); src = bdir / "Source"; ex = bdir / "Exec"
@@ -259,9 +266,13 @@ def build_vam(a):
         shutil.copy2(SRC / name, src / name)
     (src / "Make.package").write_text(CHORIN_MAKE_PACKAGE)
 
-    # printed split headers
-    model = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1)
-    split = model.chorin_split(system_model=model.system_model)
+    # printed split headers — IDENTICAL construction to the numpy reference
+    # thesis/cases/escalante_vam_bump/run_derived.py (verified term-by-term equal:
+    # same state, same SM_pred/press/corr operators).  dt passed explicitly so the
+    # printer's DT_SYMBOL maps to p(last).
+    model = VAM(level=1, dimension=2, closures=[Newtonian(), StressFree()])
+    split = model.chorin_split(sp.Symbol("dt", positive=True),
+                               system_model=model.system_model)
     write_chorin_headers(split, src)
     print(f"generated chorin headers: state={[str(s) for s in split.SM_pred.state]}")
 
