@@ -72,6 +72,12 @@ ZoomyAmr::ZoomyAmr()
                 amrex::Print() << "param override: " << names[i] << " = " << v << "\n";
             }
         }
+        // The wet/dry depth threshold is a MODEL parameter (wet_dry_eps); the
+        // driver reads its value to floor the depth fed to the flux/dt kernels,
+        // consistent with how the model's own eigenvalues use max(h,wet_dry_eps).
+        // No driver-side wet/dry constant is invented.
+        for (int i = 0; i < Model::n_parameters; ++i)
+            if (names[i] == "wet_dry_eps") wet_eps = p_mat(i, 0);
     }
 
     bcs.resize(Model::n_dof_q);
@@ -279,30 +285,14 @@ void ZoomyAmr::UpdateState(int lev)
             for (int n = 0; n < Model::n_dof_q; ++n) q(n, 0) = Q_arr(i, j, 0, n);
             for (int n = 0; n < Model::n_dof_qaux; ++n) a(n, 0) = Qaux_arr(i, j, 0, n);
 
-            // Physics hygiene INHERITED from the (Numerical)SystemModel:
-            // update_variables caps |momentum|/h and zeros dry-cell momentum.
+            // All wet/dry hygiene is INHERITED from the (Numerical)SystemModel:
+            // update_variables caps |momentum|/h and zeros dry-cell momentum;
+            // update_aux_variables computes the KP-desingularised hinv. The
+            // driver adds nothing. The optional positivity clamp (no magic
+            // constant, just h>=0) is off by default for an exactly mass-
+            // conserving run.
             q = Model::update_variables(q, a, p);
-            // Driver numerical safety net for the explicit FV update (the model
-            // cleans the symbolic operators but the conservative update can still
-            // overshoot at the steep wet/dry front): clamp negative depth, zero
-            // dry-cell momentum, and hard-cap |u| as a backstop. No-op for fully
-            // wet states; clamp is toggleable for an exactly-conserving run.
             if (clamp && q(idx_h, 0) < 0.0) q(idx_h, 0) = 0.0;
-            if (q(idx_h, 0) < h_dry) {
-                for (int n = 0; n < Model::n_dof_q; ++n)
-                    if (n != idx_b && n != idx_h) q(n, 0) = 0.0;
-            } else if (u_max > 0.0) {
-                Real h = q(idx_h, 0), sp2 = 0.0;
-                for (int d = 0; d < Model::dimension; ++d) {
-                    Real m = q(idx_h + 1 + d, 0); sp2 += m * m;
-                }
-                Real speed = std::sqrt(sp2) / h;
-                if (speed > u_max) {
-                    Real s = u_max / speed;
-                    for (int d = 0; d < Model::dimension; ++d)
-                        q(idx_h + 1 + d, 0) *= s;
-                }
-            }
             a = Model::update_aux_variables(q, a, p);
 
             for (int n = 0; n < Model::n_dof_q; ++n) Q_arr(i, j, 0, n) = q(n, 0);
@@ -356,6 +346,10 @@ void ZoomyAmr::FillPhysicalBC_mf(MultiFab& Qmf, MultiFab& Qauxmf, int lev, Real 
             int j_int = amrex::max(dom_lo_y, amrex::min(dom_hi_y, j));
 
             int bc_idx = -1;
+            // Force-capture the per-side BC indices in the lambda body BEFORE the
+            // constexpr-if: nvcc cannot first-capture a variable inside a
+            // constexpr-if branch of an extended __device__ lambda.
+            amrex::ignore_unused(bcix_xlo, bcix_xhi, bcix_ylo, bcix_yhi);
             SmallMatrix<Real, Model::dimension, 1> n_hat{};
             if constexpr (Model::dimension == 1) {
                 if (i < dom_lo_x) { bc_idx = bcix_xlo; n_hat(0, 0) = -1.0; }
@@ -397,6 +391,7 @@ Real ZoomyAmr::ComputeDt(int lev)
     auto dx = geom.CellSizeArray();
     Real min_dx = amrex::min(dx[0], dx[1]);
     auto const& p = p_mat;
+    const Real we = wet_eps;   // model's wet/dry depth threshold
 
     ReduceOps<ReduceOpMax> reduce_op;
     ReduceData<Real> reduce_data(reduce_op);
@@ -413,12 +408,12 @@ Real ZoomyAmr::ComputeDt(int lev)
                 for (int n = 0; n < Model::n_dof_q; ++n) q(n, 0) = Q_arr(i, j, 0, n);
                 for (int n = 0; n < Model::n_dof_qaux; ++n) a(n, 0) = Qaux_arr(i, j, 0, n);
 
-                // The model gates the wavespeed for dry cells and uses hinv, but
-                // a transient slightly-negative depth (front overshoot before the
-                // next positivity clamp) would still hit sqrt(g*h) -> NaN. A tiny
-                // floor here is a pure NaN guard, invisible to wet cells.
-                if (q(idx_h, 0) < h_min) q(idx_h, 0) = h_min;
-
+                // Floor the depth at the model's own wet_dry_eps before the
+                // eigenvalue: a cell left with h<eps (and a stale momentum from
+                // the explicit update) would read a spurious large wavespeed and
+                // collapse dt. With h<-eps gated to eps the model's eigenvalue
+                // returns 0 there, so only genuinely-wet cells set dt.
+                if (q(idx_h, 0) < we) q(idx_h, 0) = we;
                 Real max_ev = 0.0;
                 for (int dir = 0; dir < Model::dimension; ++dir) {
                     SmallMatrix<Real, Model::dimension, 1> n_hat{};
@@ -466,6 +461,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
     int order = spatial_order;
     bool impl_src = implicit_source;
     bool wb = well_balanced;
+    Real we = wet_eps;
 
     auto do_stage = [&]() {
         UpdateState(lev);
@@ -486,7 +482,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
             ParallelFor(mfi.validbox(),
                 [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     compute_cell_rhs(i, j, Q_arr, Qaux_arr, RHS_arr,
-                                     dx[0], dx[1], order, impl_src, p, wb);
+                                     dx[0], dx[1], order, impl_src, p, wb, we);
                 });
         }
 
@@ -534,6 +530,15 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
                 });
         }
     }
+
+    // Clean the post-update state with the MODEL's update_variables (caps |u|,
+    // zeros dry-cell momentum). The conservative update can leave a thin cell
+    // with large momentum; without this the NEXT ComputeDt (which runs before
+    // the next stage's UpdateState) would read that un-capped state and see a
+    // spurious huge wavespeed -> dt collapses to dtmin. Capping here uses the
+    // model only (no driver wet/dry constants) and does not touch the depth, so
+    // mass stays exactly conserved.
+    UpdateState(lev);
 }
 
 void ZoomyAmr::TimeStep(int lev, Real time, int iteration)

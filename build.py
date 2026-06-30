@@ -31,8 +31,10 @@ SRC = HERE / "Source"
 
 GNUMAKEFILE = """AMREX_HOME ?= {amrex_home}
 DEBUG        = FALSE
-USE_MPI      = TRUE
+USE_MPI      = {use_mpi}
 USE_OMP      = FALSE
+USE_CUDA     = {use_cuda}
+CUDA_ARCH    = {cuda_arch}
 COMP         = gnu
 DIM          = {dim}
 
@@ -222,6 +224,11 @@ def main():
                     help="bbox padding (fraction of span) so the domain is fully "
                          "ringed by wall cells -> a closed, exactly-conserving basin")
     ap.add_argument("--build-dir", default="/tmp/zoomy_amrex_run")
+    ap.add_argument("--gpu", action="store_true",
+                    help="build for CUDA GPU (USE_CUDA=TRUE, single device: "
+                         "USE_MPI=FALSE); needs nvcc + an --nv container")
+    ap.add_argument("--cuda-arch", default="89",
+                    help="CUDA compute capability (L40S/Ada=89)")
     ap.add_argument("--make", action="store_true")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
@@ -234,9 +241,10 @@ def main():
         a.model, a.dim, a.dim_mesh = "MalpassetSWE", 2, 2  # canonical wet/dry SWE
         a.well_balanced = True                     # real bathymetry needs WB
         a.bc = "wall"                              # closed basin
-        # The model's wet/dry hygiene + driver NaN guards (h floor, dry-momentum
-        # zeroing) keep the run stable WITHOUT the non-conservative depth clamp,
-        # so leave the clamp off -> mass is conserved to machine precision.
+        # No positivity clamp: the model's update_variables (applied after each
+        # update) caps momentum and keeps the wavespeed/dt bounded, and the model
+        # operators are finite for any depth, so the run is stable without
+        # clamping h -> mass is conserved to machine precision.
         a.no_clamp = True
         if a.pad == 0.0:
             a.pad = 0.04   # closed basin (domain ringed by wall) -> exact mass
@@ -269,7 +277,10 @@ def main():
     # build files
     amrex_home = os.environ.get("AMREX_HOME", "/opt/amrex")
     (ex / "GNUmakefile").write_text(
-        GNUMAKEFILE.format(amrex_home=amrex_home, dim=a.dim_mesh))
+        GNUMAKEFILE.format(amrex_home=amrex_home, dim=a.dim_mesh,
+                           use_mpi="FALSE" if a.gpu else "TRUE",
+                           use_cuda="TRUE" if a.gpu else "FALSE",
+                           cuda_arch=a.cuda_arch))
     write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc,
                  cfl=a.cfl, implicit_source=a.implicit, implicit_global=a.implicit_global,
                  friction=a.friction, slip=a.slip,
@@ -280,7 +291,12 @@ def main():
 
     if a.make:
         n = os.cpu_count() or 4
-        subprocess.run(["make", f"-j{n}"], cwd=ex, check=True)
+        make_cmd = ["make", f"-j{n}"]
+        if a.gpu:
+            # Pass CUDA_ARCH as a command-line make var (highest precedence) so
+            # AMReX's auto-detect / AMREX_CUDA_ARCH override cannot clobber it.
+            make_cmd.append(f"CUDA_ARCH={a.cuda_arch}")
+        subprocess.run(make_cmd, cwd=ex, check=True)
     if a.run:
         exe = next((p for p in ex.iterdir()
                     if p.name.startswith("main") and os.access(p, os.X_OK)), None)

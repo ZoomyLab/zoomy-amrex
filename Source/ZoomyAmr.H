@@ -36,7 +36,10 @@ public:
     // Solve Q = Qexp + dt*S(Q) for Q[lev] in place (matrix-free Newton + GMRES).
     void SolveImplicitSourceGlobal(int lev, amrex::Real dt, amrex::Real time);
 
-private:
+    // NOTE: public (not private). nvcc forbids an extended __device__ lambda
+    // (amrex::ParallelFor) inside a private/protected member function, and
+    // several of these methods launch device kernels.
+public:
     // ---- AmrCore pure virtual overrides ----
     void MakeNewLevelFromScratch(int lev, amrex::Real time,
                                  const amrex::BoxArray& ba,
@@ -104,6 +107,8 @@ private:
                                     // exactly mass-conserving run.
     amrex::Real plot_dt_interval = 0.1;
     int identifier        = 0;
+    amrex::Real wet_eps = 0.0;        // model's wet_dry_eps (depth floor for the
+                                      // flux/dt kernels); 0 if model has none
     amrex::Real tag_threshold = 0.01; // gradient threshold for refinement
     amrex::Real tag_b_max = 1.0e30;   // only refine cells with bed < tag_b_max
                                       // (keeps the exterior wall bed coarse)

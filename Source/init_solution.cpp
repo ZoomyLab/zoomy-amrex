@@ -39,11 +39,20 @@ void readRasterIntoComponent (const std::string& filename,
         amrex::Abort("Raw file size mismatch");
     }
 
-    // 3. read
+    // 3. read into a host buffer
     std::vector<Real> hostBuf(ncell);
     ifs.read(reinterpret_cast<char*>(hostBuf.data()), nbytes);
     if (!ifs.good()) amrex::Abort("### Error while reading " + filename);
     ifs.close();
+
+    // 3b. stage to device so the ParallelFor lambda dereferences a valid
+    // pointer on the GPU (a captured std::vector would carry a host pointer).
+    // On a CPU build Gpu::DeviceVector is host memory, so this is a no-op copy.
+    amrex::Gpu::DeviceVector<Real> devBuf(ncell);
+    amrex::Gpu::copyAsync(amrex::Gpu::hostToDevice, hostBuf.begin(), hostBuf.end(),
+                          devBuf.begin());
+    amrex::Gpu::streamSynchronize();
+    const Real* dptr = devBuf.data();
 
     // 4. copy into the MultiFab
     for (MFIter mfi(mf); mfi.isValid(); ++mfi)
@@ -54,7 +63,7 @@ void readRasterIntoComponent (const std::string& filename,
         ParallelFor(bx, [=] AMREX_GPU_DEVICE (int i,int j,int k)
         {
             const std::size_t idx = i + nx*j;   // 2-D
-            arr(i,j,k,comp) = hostBuf[idx];
+            arr(i,j,k,comp) = dptr[idx];
         });
     }
 
