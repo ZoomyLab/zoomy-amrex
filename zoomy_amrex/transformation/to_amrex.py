@@ -479,11 +479,15 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
     return out
 
 
-def write_chorin_headers(sm, pressure_vars, out_dir, *, dt_symbol=None):
+def write_chorin_headers(split, out_dir):
     """Generate the three Chorin split sub-model headers for the C++ ChorinDriver.
 
-    ``sm``           a frozen non-hydrostatic SystemModel (e.g. hand-built VAM).
-    ``pressure_vars`` the pressure-mode state symbols (e.g. [P_0, P_1]).
+    ``split`` is the result of the MODEL's own splitter — ``model.chorin_split(
+    system_model=sm)`` (the canonical entry every test/case uses; it dispatches
+    to the right splitter per model, e.g. split_for_pressure_structural for VAM,
+    its own for ML-VAM).  The printer does NOT choose a splitter; it just emits
+    headers from the sub-models the model handed it.
+
     Emits ``ModelPred.H`` / ``ModelPress.H`` / ``ModelCorr.H`` (distinct struct
     names so all three coexist in one TU) each carrying its ``e2s`` + derivative
     -aux metadata, ``NumericsPred.H`` (the predictor's Rusanov flux), and
@@ -492,15 +496,8 @@ def write_chorin_headers(sm, pressure_vars, out_dir, *, dt_symbol=None):
     corrector (SM_corr.update_variables, dt) — see task 0029.
     """
     from pathlib import Path
-    import sympy as sp
-    # split_for_pressure_structural is the maintained splitter (the one
-    # VAM.chorin_split uses); split_simple is bit-rotted against the current
-    # SystemModel API (expects a removed `equation_names`).
-    from zoomy_core.model.splitter import split_for_pressure_structural
     from zoomy_core.fvm.riemann_solvers import NonconservativeRusanov
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
-    dt = dt_symbol or sp.Symbol("dt", positive=True)
-    split = split_for_pressure_structural(sm, list(pressure_vars), dt)
 
     (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
     for sub, name in [(split.SM_pred, "ModelPred"),
