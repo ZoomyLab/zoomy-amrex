@@ -3,6 +3,7 @@
 #include <AMReX_Array4.H>
 #include "Model.H"
 #include "Numerics.H"
+#include "constants.H"
 
 // Simple MinMod Limiter for 2nd-order TVD stability
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
@@ -51,6 +52,12 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
         }
     }
     
+    // Wet/dry desingularisation: keep the reconstructed depth strictly positive
+    // so the flux/eigenvalue kernels never divide by zero at a dry/front face.
+    // For fully-wet states this is a no-op (h >> h_min).
+    qL(idx_h,0) = amrex::max(qL(idx_h,0), h_min);
+    qR(idx_h,0) = amrex::max(qR(idx_h,0), h_min);
+
     for(int n=0; n<Model::n_dof_qaux; ++n) {
         aL(n,0) = Qaux(iL, jL, 0, n);
         aR(n,0) = Qaux(iR, jR, 0, n);
@@ -86,11 +93,15 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
 
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> q_curr, source_term;
     amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> a_curr;
-    
+
     for(int n=0; n<Model::n_dof_q; ++n) q_curr(n,0) = Q(i,j,0,n);
     for(int n=0; n<Model::n_dof_qaux; ++n) a_curr(n,0) = Qaux(i,j,0,n);
-    
-    if (!implicit_source) source_term = Model::source(q_curr, a_curr, p_mat);
+
+    for(int n=0; n<Model::n_dof_q; ++n) source_term(n,0) = 0.0;
+    // The friction source divides by h^(7/3); on a dry cell (h≈0) that is a
+    // NaN. Dry cells carry no flow, so their source is identically zero.
+    if (!implicit_source && q_curr(idx_h,0) >= h_dry)
+        source_term = Model::source(q_curr, a_curr, p_mat);
 
     for(int n=0; n<Model::n_dof_q; ++n) {
 

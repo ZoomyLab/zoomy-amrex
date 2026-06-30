@@ -260,6 +260,27 @@ void ZoomyAmr::UpdateState(int lev)
             for (int n = 0; n < Model::n_dof_qaux; ++n) a(n, 0) = Qaux_arr(i, j, 0, n);
 
             q = Model::update_variables(q, a, p);
+            // Wet/dry handling (mass-conserving): clamp negative depth to zero,
+            // and zero the momentum/moments of dry cells so hu/h cannot blow up
+            // the wavespeed. Depth is preserved; the flux/dt division uses the
+            // h_min floor. No-op for fully-wet runs (h >= h_dry everywhere).
+            if (q(idx_h, 0) < 0.0) q(idx_h, 0) = 0.0;
+            if (q(idx_h, 0) < h_dry) {
+                for (int n = 0; n < Model::n_dof_q; ++n)
+                    if (n != idx_b && n != idx_h) q(n, 0) = 0.0;
+            } else if (u_max > 0.0) {
+                // Cap |momentum|/h at the wet/dry front (see constants.H).
+                Real h = q(idx_h, 0), sp2 = 0.0;
+                for (int d = 0; d < Model::dimension; ++d) {
+                    Real m = q(idx_h + 1 + d, 0); sp2 += m * m;
+                }
+                Real speed = std::sqrt(sp2) / h;
+                if (speed > u_max) {
+                    Real s = u_max / speed;
+                    for (int d = 0; d < Model::dimension; ++d)
+                        q(idx_h + 1 + d, 0) *= s;
+                }
+            }
             a = Model::update_aux_variables(q, a, p);
 
             for (int n = 0; n < Model::n_dof_q; ++n) Q_arr(i, j, 0, n) = q(n, 0);
@@ -369,6 +390,10 @@ Real ZoomyAmr::ComputeDt(int lev)
                 SmallMatrix<Real, Model::n_dof_qaux, 1> a;
                 for (int n = 0; n < Model::n_dof_q; ++n) q(n, 0) = Q_arr(i, j, 0, n);
                 for (int n = 0; n < Model::n_dof_qaux; ++n) a(n, 0) = Qaux_arr(i, j, 0, n);
+
+                // Wet/dry: floor the depth so the eigenvalue division is finite
+                // (dry h=0 would give u=hu/h -> NaN and poison the dt reduction).
+                if (q(idx_h, 0) < h_min) q(idx_h, 0) = h_min;
 
                 Real max_ev = 0.0;
                 for (int dir = 0; dir < Model::dimension; ++dir) {
