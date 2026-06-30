@@ -98,7 +98,8 @@ def build_system_model(model_name, dim, level, bc="extrap"):
 
 
 def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap",
-                 implicit_source=False, implicit_global=False, friction=None, slip=None):
+                 implicit_source=False, implicit_global=False, friction=None, slip=None,
+                 max_level=0, ref_ratio=2):
     ncell_line = " ".join([str(ncell)] * 2 + (["1"] if dim_mesh == 3 else []))
     prob_hi = "1.0 1.0 1.0" if dim_mesh == 3 else "1.0 1.0"
     prob_lo = "0.0 0.0 0.0" if dim_mesh == 3 else "0.0 0.0"
@@ -112,10 +113,17 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
         fric_block += f"params.n_m = {friction}\n"
     if slip is not None:
         fric_block += f"params.lambda_s = {slip}\n"
-    path.write_text(f"""amr.max_level     = 0
+    # AMR: blocking_factor must divide n_cell in every mesh dimension. On DIM=3
+    # with nz=1 only bf=1 is legal (and refinement in the degenerate z is moot),
+    # so real adaptive refinement needs a DIM=2 mesh — then bf>=2 + ref_ratio
+    # refine in x,y.
+    bf = 2 if (max_level > 0 and dim_mesh == 2) else 1
+    path.write_text(f"""amr.max_level     = {max_level}
 amr.n_cell        = {ncell_line}
 amr.max_grid_size = 64
-amr.blocking_factor = 1
+amr.blocking_factor = {bf}
+amr.ref_ratio     = {ref_ratio}
+amr.regrid_int    = 2
 geometry.prob_lo  = {prob_lo}
 geometry.prob_hi  = {prob_hi}
 geometry.is_periodic = {isper}
@@ -128,7 +136,7 @@ solver.dtmax           = {tend}
 solver.spatial_order   = {order}
 solver.implicit_source = {'true' if implicit_source else 'false'}
 solver.implicit_global = {'true' if implicit_global else 'false'}
-tagging.threshold      = 0.01
+tagging.threshold      = 0.02
 """)
 
 
@@ -153,6 +161,8 @@ def main():
                     help="Manning n_m override (params.n_m)")
     ap.add_argument("--slip", type=float, default=None,
                     help="SME slip length lambda_s override (params.lambda_s)")
+    ap.add_argument("--max-level", type=int, default=0, help="AMR levels (needs --dim-mesh 2)")
+    ap.add_argument("--ref-ratio", type=int, default=2)
     ap.add_argument("--build-dir", default="/tmp/zoomy_amrex_run")
     ap.add_argument("--make", action="store_true")
     ap.add_argument("--run", action="store_true")
@@ -182,7 +192,8 @@ def main():
         GNUMAKEFILE.format(amrex_home=amrex_home, dim=a.dim_mesh))
     write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc,
                  implicit_source=a.implicit, implicit_global=a.implicit_global,
-                 friction=a.friction, slip=a.slip)
+                 friction=a.friction, slip=a.slip,
+                 max_level=a.max_level, ref_ratio=a.ref_ratio)
 
     if a.make:
         n = os.cpu_count() or 4
