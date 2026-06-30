@@ -182,8 +182,121 @@ tagging.threshold      = 0.02
 """)
 
 
+CHORIN_MAKE_PACKAGE = """CEXE_sources += chorin_main.cpp
+CEXE_sources += init_solution.cpp
+
+CEXE_headers += constants.H
+CEXE_headers += ModelPred.H
+CEXE_headers += ModelPress.H
+CEXE_headers += ModelCorr.H
+CEXE_headers += NumericsPred.H
+CEXE_headers += UserFunctions.H
+"""
+
+
+def prepare_escalante_rasters(out_dir, n_inner=60, domain=(-1.5, 1.5)):
+    """Escalante 2024 dam-break-over-bump IC as two raw rasters the generic
+    ChorinDriver ingests (bed = comp 0, depth = comp 1) — the ONLY case-specific
+    code.  bump b = 0.20·exp(-x²/2·0.2²); dam-break h = max(0.34−b | 0.015, 0.015)
+    for x<1, else 0.015.  Returns the geometry + raster paths + the left-inflow
+    discharge q_U0 the BC must hold."""
+    import numpy as np
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    x0, x1 = domain; dx = (x1 - x0) / n_inner
+    xc = x0 + (np.arange(n_inner) + 0.5) * dx
+    b = 0.20 * np.exp(-(xc**2) / (2 * 0.20**2))
+    h = np.maximum(np.where(xc < 1.0, 0.34 - b, 0.015), 0.015)
+    bed = out / "bed.raw"; dep = out / "depth.raw"
+    b.astype(np.float64).tofile(bed)
+    h.astype(np.float64).tofile(dep)
+    return {"nx": n_inner, "ny": 1, "prob_lo": (x0, 0.0), "prob_hi": (x1, dx),
+            "dem_file": str(bed), "release_file": str(dep),
+            "inflow_q_U0": 0.11197}
+
+
+def write_chorin_inputs(path, geom, tend, cfl, plot_dt, inflow_q_U0,
+                        g=9.81, rho=1000.0):
+    """inputs for chorin_main.cpp.  Inflow is mapped to the PRINTED VAM state
+    order [b,h,q_U0,q_U1,q_W0,q_W1,P_0,P_1]: prescribe q_U0 (slot 2) at x-lo,
+    zero the other moments (3,4,5); b,h extrapolate.  No model structure here."""
+    nx, ny = geom["nx"], geom["ny"]
+    gx0, gy0 = geom["prob_lo"]; gx1, gy1 = geom["prob_hi"]
+    path.write_text(f"""amr.n_cell        = {nx} {ny}
+amr.max_grid_size = 4096
+amr.blocking_factor = 1
+geometry.prob_lo  = {gx0} {gy0}
+geometry.prob_hi  = {gx1} {gy1}
+geometry.is_periodic = 0 0
+init.dem_file     = {geom['dem_file']}
+init.release_file = {geom['release_file']}
+inflow.comp = 2 3 4 5
+inflow.val  = {inflow_q_U0} 0.0 0.0 0.0
+params.g = {g}
+params.rho = {rho}
+params.nu = 0.0
+params.lambda_s = 0.0
+solver.time_end = {tend}
+solver.cfl      = {cfl}
+output.plot_dt_interval = {plot_dt}
+""")
+
+
+def build_vam(a):
+    """Generic Chorin driver build: VAM(level=1) → chorin_split → printed
+    sub-model headers → stage chorin_main.cpp (model-agnostic) → Escalante case
+    rasters/inputs → make/run.  Nothing here is Riemann/model-specific; swapping
+    the model below (any model with a chorin_split) reuses the same driver."""
+    from zoomy_core.model.models import VAM
+    from zoomy_core.model.models.closures import Newtonian, NavierSlip, StressFree
+    from zoomy_amrex.transformation import write_chorin_headers
+
+    bdir = Path(a.build_dir); src = bdir / "Source"; ex = bdir / "Exec"
+    src.mkdir(parents=True, exist_ok=True); ex.mkdir(parents=True, exist_ok=True)
+
+    # stage ONLY the chorin driver + raster loader (NOT main.cpp/ZoomyAmr.cpp,
+    # which carry a second main() and need the SWE Model.H).
+    for name in ("chorin_main.cpp", "init_solution.cpp", "constants.H"):
+        shutil.copy2(SRC / name, src / name)
+    (src / "Make.package").write_text(CHORIN_MAKE_PACKAGE)
+
+    # printed split headers
+    model = VAM(closures=[Newtonian(), NavierSlip(), StressFree()], level=1)
+    split = model.chorin_split(system_model=model.system_model)
+    write_chorin_headers(split, src)
+    print(f"generated chorin headers: state={[str(s) for s in split.SM_pred.state]}")
+
+    # case rasters + inputs (the only case-specific code)
+    geom = prepare_escalante_rasters(str(bdir / "raster"))
+    amrex_home = os.environ.get("AMREX_HOME", "/opt/amrex")
+    (ex / "GNUmakefile").write_text(
+        GNUMAKEFILE.format(amrex_home=amrex_home, dim=2,
+                           use_mpi="FALSE" if a.gpu else "TRUE",
+                           use_cuda="TRUE" if a.gpu else "FALSE",
+                           cuda_arch=a.cuda_arch))
+    write_chorin_inputs(ex / "inputs", geom, tend=a.tend, cfl=a.cfl,
+                        plot_dt=a.plot_dt, inflow_q_U0=geom["inflow_q_U0"])
+    print(f"escalante raster {geom['nx']}x{geom['ny']} "
+          f"x=({geom['prob_lo'][0]},{geom['prob_hi'][0]}) q_in={geom['inflow_q_U0']}")
+
+    if a.make:
+        n = os.cpu_count() or 4
+        cmd = ["make", f"-j{n}"] + ([f"CUDA_ARCH={a.cuda_arch}"] if a.gpu else [])
+        subprocess.run(cmd, cwd=ex, check=True)
+    if a.run:
+        exe = next((p for p in ex.iterdir()
+                    if p.name.startswith("main") and os.access(p, os.X_OK)), None)
+        if exe is None:
+            raise SystemExit("no executable; pass --make first")
+        subprocess.run([f"./{exe.name}", "inputs"], cwd=ex, check=True)
+        print(f"run complete; profile.dat + plotfiles in {ex}")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--vam", action="store_true",
+                    help="build the generic Chorin pressure-projection driver "
+                         "(chorin_main.cpp) from VAM(level=1).chorin_split + run "
+                         "the Escalante dam-break-over-bump verification case")
     ap.add_argument("--model", default="SWE")
     ap.add_argument("--dim", type=int, default=2,
                     help="model dimension (SWE: horizontal=2; SME: total=3 for 2-D)")
@@ -234,6 +347,9 @@ def main():
     a = ap.parse_args()
 
     from zoomy_amrex.transformation import generate_headers
+
+    if a.vam:
+        return build_vam(a)
 
     geom = dem_file = release_file = None
     if a.malpasset:
