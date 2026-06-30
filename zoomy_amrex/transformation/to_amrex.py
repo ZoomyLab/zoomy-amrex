@@ -493,11 +493,14 @@ def write_chorin_headers(sm, pressure_vars, out_dir, *, dt_symbol=None):
     """
     from pathlib import Path
     import sympy as sp
-    from zoomy_core.model.splitter import split_simple
+    # split_for_pressure_structural is the maintained splitter (the one
+    # VAM.chorin_split uses); split_simple is bit-rotted against the current
+    # SystemModel API (expects a removed `equation_names`).
+    from zoomy_core.model.splitter import split_for_pressure_structural
     from zoomy_core.fvm.riemann_solvers import NonconservativeRusanov
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     dt = dt_symbol or sp.Symbol("dt", positive=True)
-    split = split_simple(sm, list(pressure_vars), dt)
+    split = split_for_pressure_structural(sm, list(pressure_vars), dt)
 
     (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
     for sub, name in [(split.SM_pred, "ModelPred"),
