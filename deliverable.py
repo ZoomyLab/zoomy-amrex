@@ -182,6 +182,18 @@ def _draw_mesh(ax, levels, ext, colors=("0.7", "k", "r", "m")):
                                            lw=0.3, alpha=0.8))
 
 
+def _frame_flood(ax, bed, h, ext, title, hmax, bed_lim, dry=0.01):
+    """Flood map: greyscale bathymetry relief with the water depth (Blues)
+    overlaid only where wet (dry cells transparent)."""
+    ax.imshow(bed, origin="lower", extent=ext, cmap="Greys",
+              vmin=bed_lim[0], vmax=bed_lim[1], aspect="auto")
+    wet = np.ma.masked_less_equal(h, dry)
+    im = ax.imshow(wet, origin="lower", extent=ext, cmap="Blues",
+                   vmin=0, vmax=hmax, aspect="auto")
+    ax.set_title(title); ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+    return im
+
+
 def _frame_mesh(ax_h, ax_p, levels, ext, title, vlim):
     comp = composite_field(levels, comp_idx=1)
     NY, NX = comp.shape
@@ -222,12 +234,44 @@ def main():
     ap.add_argument("--mesh", action="store_true",
                     help="composite the field at the finest level and draw the "
                          "real cell grid (shows where the mesh refines)")
+    ap.add_argument("--flood", action="store_true",
+                    help="flood map: water depth (Blues) over greyscale "
+                         "bathymetry, dry cells transparent (real-geometry cases)")
     a = ap.parse_args()
 
     plts = sorted(glob.glob(os.path.join(a.run_dir, "plt_*")))
     if not plts:
         raise SystemExit(f"no plt_* in {a.run_dir}")
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+
+    if a.flood:
+        from PIL import Image
+        snaps = [read_plotfile(p) for p in plts]   # (arr, names, ext, rects)
+        ext = snaps[0][2]
+        beds = [s[0][0] for s in snaps]
+        hs = [s[0][1] for s in snaps]
+        hmax = max(np.nanmax(h) for h in hs)
+        bed_lim = (min(np.nanmin(b) for b in beds), max(np.nanmax(b) for b in beds))
+        frames = []
+        for i, (b, h) in enumerate(zip(beds, hs)):
+            fig, ax = plt.subplots(figsize=(9, 5))
+            im = _frame_flood(ax, b, h, ext,
+                              f"Malpasset SWE — water depth  (snapshot {i})",
+                              hmax, bed_lim)
+            if i == 0:
+                fig.colorbar(im, ax=ax, label="depth h [m]")
+            fig.tight_layout()
+            if i == len(hs) - 1:
+                fig.savefig(a.out + ".png", dpi=120)
+            fig.canvas.draw()
+            w, hh = fig.canvas.get_width_height()
+            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            frames.append(Image.fromarray(buf.reshape(hh, w, 4)[..., :3].copy()))
+            plt.close(fig)
+        frames[0].save(a.out + ".gif", save_all=True, append_images=frames[1:],
+                       duration=200, loop=0)
+        print("wrote", a.out + ".png and .gif")
+        return
 
     if a.mesh:
         from PIL import Image

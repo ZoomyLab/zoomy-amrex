@@ -99,10 +99,18 @@ def build_system_model(model_name, dim, level, bc="extrap"):
 
 def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap",
                  implicit_source=False, implicit_global=False, friction=None, slip=None,
-                 max_level=0, ref_ratio=2):
-    ncell_line = " ".join([str(ncell)] * 2 + (["1"] if dim_mesh == 3 else []))
-    prob_hi = "1.0 1.0 1.0" if dim_mesh == 3 else "1.0 1.0"
-    prob_lo = "0.0 0.0 0.0" if dim_mesh == 3 else "0.0 0.0"
+                 max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None):
+    if geom is not None:
+        # Externally-supplied rectangular geometry (e.g. the Malpasset bbox).
+        nx, ny = geom["nx"], geom["ny"]
+        gx0, gy0 = geom["prob_lo"]; gx1, gy1 = geom["prob_hi"]
+        ncell_line = f"{nx} {ny}" + (" 1" if dim_mesh == 3 else "")
+        prob_lo = f"{gx0} {gy0}" + (" 0.0" if dim_mesh == 3 else "")
+        prob_hi = f"{gx1} {gy1}" + (" 1.0" if dim_mesh == 3 else "")
+    else:
+        ncell_line = " ".join([str(ncell)] * 2 + (["1"] if dim_mesh == 3 else []))
+        prob_hi = "1.0 1.0 1.0" if dim_mesh == 3 else "1.0 1.0"
+        prob_lo = "0.0 0.0 0.0" if dim_mesh == 3 else "0.0 0.0"
     isper = "0 0 0" if dim_mesh == 3 else "0 0"
     bc_block = ""
     if bc == "wall":  # closed basin: every side reflective
@@ -113,6 +121,10 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
         fric_block += f"params.n_m = {friction}\n"
     if slip is not None:
         fric_block += f"params.lambda_s = {slip}\n"
+    if dem_file is not None:
+        fric_block += f"init.dem_file = {dem_file}\n"
+    if release_file is not None:
+        fric_block += f"init.release_file = {release_file}\n"
     # AMR: blocking_factor must divide n_cell in every mesh dimension. On DIM=3
     # with nz=1 only bf=1 is legal (and refinement in the degenerate z is moot),
     # so real adaptive refinement needs a DIM=2 mesh — then bf>=2 + ref_ratio
@@ -163,12 +175,34 @@ def main():
                     help="SME slip length lambda_s override (params.lambda_s)")
     ap.add_argument("--max-level", type=int, default=0, help="AMR levels (needs --dim-mesh 2)")
     ap.add_argument("--ref-ratio", type=int, default=2)
+    ap.add_argument("--malpasset", metavar="MSH", default=None,
+                    help="project the Malpasset triangular mesh onto a structured "
+                         "grid: forces SWE/dim-mesh=2, sets the bbox geometry and "
+                         "bed/depth rasters from the .msh node data")
+    ap.add_argument("--ncell-x", type=int, default=180, help="structured nx (--malpasset)")
+    ap.add_argument("--ncell-y", type=int, default=96, help="structured ny (--malpasset)")
+    ap.add_argument("--wall-above", type=float, default=5.0,
+                    help="exterior wall bed = reservoir surface + this (m)")
     ap.add_argument("--build-dir", default="/tmp/zoomy_amrex_run")
     ap.add_argument("--make", action="store_true")
     ap.add_argument("--run", action="store_true")
     a = ap.parse_args()
 
     from zoomy_amrex.transformation import generate_headers
+
+    geom = dem_file = release_file = None
+    if a.malpasset:
+        from zoomy_amrex.malpasset import prepare_rasters
+        a.model, a.dim, a.dim_mesh = "SWE", 2, 2   # structured 2-D SWE
+        geom = prepare_rasters(a.malpasset, str(Path(a.build_dir) / "raster"),
+                               ncell_x=a.ncell_x, ncell_y=a.ncell_y,
+                               wall_above=a.wall_above)
+        dem_file, release_file = geom["dem_file"], geom["release_file"]
+        print(f"malpasset raster: {geom['nx']}x{geom['ny']} "
+              f"prob_lo={geom['prob_lo']} prob_hi={geom['prob_hi']} "
+              f"dx={geom['dx']:.1f} dy={geom['dy']:.1f} "
+              f"wet={100*geom['wet_frac']:.1f}% bed=[{geom['bed_min']:.1f},"
+              f"{geom['bed_max']:.1f}] wall={geom['wall_bed']:.1f}")
 
     bdir = Path(a.build_dir)
     src = bdir / "Source"
@@ -193,7 +227,8 @@ def main():
     write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc,
                  implicit_source=a.implicit, implicit_global=a.implicit_global,
                  friction=a.friction, slip=a.slip,
-                 max_level=a.max_level, ref_ratio=a.ref_ratio)
+                 max_level=a.max_level, ref_ratio=a.ref_ratio,
+                 geom=geom, dem_file=dem_file, release_file=release_file)
 
     if a.make:
         n = os.cpu_count() or 4
