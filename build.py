@@ -50,7 +50,7 @@ include $(AMREX_HOME)/Tools/GNUMake/Make.rules
 
 
 def build_system_model(model_name, dim, level, bc="extrap"):
-    """Return a frozen SystemModel for the requested model.
+    """Return a NumericalSystemModel for the requested model.
 
     Convention reminder: ``SWE.dimension`` counts *horizontal* dims (2 → 2-D),
     while ``SME.dimension`` counts the total incl. the vertical (3 → 2 horizontal).
@@ -58,10 +58,20 @@ def build_system_model(model_name, dim, level, bc="extrap"):
     ``bc``: "extrap" (zero-gradient on all sides) or "wall" (a reflective ``wall``
     tag + an ``outer`` extrapolation tag; pick per side in the inputs via
     ``bc.x_lo`` etc.).
+
+    The Model's SystemModel is promoted through
+    :func:`to_numerical_system_model`, the same front door the core
+    numpy/jax/foam printers use.  For a depth-bearing transport system that runs
+    ``desingularize_hinv()`` (Kurganov-Petrova ``1/h -> hinv`` so ``u = q·hinv``
+    stays bounded as ``h -> 0``) and ``gate_eigenvalues_dry()`` (dry eigenvalue
+    protection).  amrex thus INHERITS the wet/dry regularisation instead of
+    relying on ad-hoc floors/caps in the C++ driver.
     """
     from zoomy_core.model import models as M
     from zoomy_core.model.boundary_conditions import (
         BoundaryConditions, Extrapolation, Wall)
+    from zoomy_core.numerics.numerical_system_model import (
+        to_numerical_system_model)
 
     def _wall(mom_idx=None):
         # mom_idx: explicit momentum-reflection groups, needed for SME because
@@ -71,10 +81,23 @@ def build_system_model(model_name, dim, level, bc="extrap"):
         w = Wall(tag="wall", momentum_field_indices=mom_idx) if mom_idx else Wall(tag="wall")
         return BoundaryConditions([w, Extrapolation(tag="outer")])
 
+    if model_name == "MalpassetSWE":
+        # Canonical viscous wet/dry SWE (zoomy_core.model.models.malpasset):
+        # state [b,h,hu,hv] + aux [hinv]. It carries ALL the wet/dry mechanisms
+        # natively, so amrex inherits them through the generated code with no
+        # driver-side floors/caps:
+        #   1. eigenvalues gated for dry cells (conditional(h>eps, ., 0)),
+        #   2. KP-desingularized 1/h via the hinv aux (flux/eigenvalues use it),
+        #   3. update_variables caps |u|<=U_MAX and zeros dry-cell momentum.
+        from zoomy_core.model.models.malpasset import MalpassetSWE
+        bcs = _wall([[2, 3]]) if bc == "wall" else BoundaryConditions(
+            [Extrapolation(tag="left"), Extrapolation(tag="right")])
+        return MalpassetSWE(boundary_conditions=bcs).system_model
     if model_name == "SWE":
         bcs = _wall() if bc == "wall" else BoundaryConditions(
             [Extrapolation(tag="left"), Extrapolation(tag="right")])
-        return M.SWE(dimension=dim, boundary_conditions=bcs).system_model
+        return to_numerical_system_model(
+            M.SWE(dimension=dim, boundary_conditions=bcs))
     if model_name == "SME":
         # SME(level=L, dim=3) state = [b, h, q_x_0..q_x_L, q_y_0..q_y_L];
         # wall reflects each moment vector (q_x_k, q_y_k) -> groups [2+k, 3+L+k].
@@ -91,9 +114,10 @@ def build_system_model(model_name, dim, level, bc="extrap"):
         # both settable via params.<name>.  level adds moments q_1..q_level.
         from zoomy_core.model.models.closures import (
             Newtonian, NavierSlip, StressFree)
-        return M.SME(level=level, dimension=dim,
-                     closures=[Newtonian(), NavierSlip(), StressFree()],
-                     boundary_conditions=bcs).system_model
+        return to_numerical_system_model(
+            M.SME(level=level, dimension=dim,
+                  closures=[Newtonian(), NavierSlip(), StressFree()],
+                  boundary_conditions=bcs))
     raise SystemExit(f"unknown model {model_name!r} (try SWE or SME)")
 
 
@@ -207,8 +231,13 @@ def main():
     geom = dem_file = release_file = None
     if a.malpasset:
         from zoomy_amrex.malpasset import prepare_rasters
-        a.model, a.dim, a.dim_mesh = "SWE", 2, 2   # structured 2-D SWE
+        a.model, a.dim, a.dim_mesh = "MalpassetSWE", 2, 2  # canonical wet/dry SWE
         a.well_balanced = True                     # real bathymetry needs WB
+        a.bc = "wall"                              # closed basin
+        # The model's wet/dry hygiene + driver NaN guards (h floor, dry-momentum
+        # zeroing) keep the run stable WITHOUT the non-conservative depth clamp,
+        # so leave the clamp off -> mass is conserved to machine precision.
+        a.no_clamp = True
         if a.pad == 0.0:
             a.pad = 0.04   # closed basin (domain ringed by wall) -> exact mass
         geom = prepare_rasters(a.malpasset, str(Path(a.build_dir) / "raster"),

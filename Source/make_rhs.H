@@ -79,9 +79,10 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
     if (hLstar) *hLstar = hLs;
     if (hRstar) *hRstar = hRs;
 
-    // Wet/dry desingularisation: keep the reconstructed depth strictly positive
-    // so the flux/eigenvalue kernels never divide by zero at a dry/front face.
-    // For fully-wet states this is a no-op (h >> h_min).
+    // The model regularises 1/h via the KP ``hinv`` aux, so the flux never
+    // divides by a raw depth. This floor is only a NaN guard so a transient
+    // negative reconstructed depth cannot reach sqrt(g*h); it is invisible to
+    // wet states (h >> h_min) and does not replace the model regularisation.
     qL(idx_h,0) = amrex::max(qL(idx_h,0), h_min);
     qR(idx_h,0) = amrex::max(qR(idx_h,0), h_min);
 
@@ -128,9 +129,11 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
     for(int n=0; n<Model::n_dof_qaux; ++n) a_curr(n,0) = Qaux(i,j,0,n);
 
     for(int n=0; n<Model::n_dof_q; ++n) source_term(n,0) = 0.0;
-    // The friction source divides by h^(7/3); on a dry cell (h≈0) that is a
-    // NaN. Dry cells carry no flow, so their source is identically zero.
-    if (!implicit_source && q_curr(idx_h,0) >= h_dry)
+    // The friction source carries a pow(h, 4/3) term; a transient slightly
+    // negative depth at the front (before the next positivity clamp) would make
+    // pow(<0, 4/3) NaN.  Skip the source on non-positive depth (a dry cell
+    // carries no friction anyway).  The model still regularises 1/h via hinv.
+    if (!implicit_source && q_curr(idx_h,0) > h_min)
         source_term = Model::source(q_curr, a_curr, p_mat);
 
     for(int n=0; n<Model::n_dof_q; ++n) {

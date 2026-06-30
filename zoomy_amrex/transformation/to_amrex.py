@@ -34,12 +34,42 @@ from zoomy_core.transformation.generic_c import GenericCppBase
 from zoomy_core.transformation.to_amrex import AmrexCore, AmrexNumerics
 
 
-# Numerics printer = core's AmrexNumerics directly.  As of zoomy_core@4e3e1f9 it
-# emits a REAL ``local_max_abs_eigenvalue`` (Max|lambda_i| inline, Gershgorin
-# row-sum fallback when eigenvalues=None) and #includes Model.H — there is no
-# ``max_wavespeed`` indirection anymore, so the old NumericsUser.H + c_functions
-# override are gone (REQ-58).
-AmrexNumericsPrinter = AmrexNumerics
+# Cast both branches of a ``conditional`` to ``amrex::Real`` so a dry-gate
+# ternary whose branches are integer 0 (e.g. ``gate_eigenvalues_dry``) does not
+# produce an ``int`` that breaks ``amrex::max(int, double)``.  Core's default
+# emits raw ``(c ? t : f)``; we override only the type.
+def _conditional_real(p, c, t, f):
+    return (f"(({p.doprint(c)}) ? (amrex::Real({p.doprint(t)})) "
+            f": (amrex::Real({p.doprint(f)})))")
+
+
+# sympy emits the 2-arg ``Heaviside(x, h0)`` from a subgradient, e.g.
+# ``d/dh Max(h, c) = Heaviside(h - c, 1/2)`` (the friction h-floor). C++ has no
+# Heaviside; lower it to a branch with the same value-at-zero ``h0``.
+def _heaviside_real(p, x, *h0):
+    xv = p.doprint(x)
+    h0v = p.doprint(h0[0]) if h0 else "0.5"
+    return (f"(({xv}) > 0.0 ? amrex::Real(1.0) "
+            f": (({xv}) < 0.0 ? amrex::Real(0.0) : amrex::Real({h0v})))")
+
+
+# Numerics printer = core's AmrexNumerics, extended only to print a singleton
+# ``ImmutableDenseNDimArray`` reaching a scalar context.  The NumericalSystemModel
+# wet/dry gate (``gate_eigenvalues_dry``) wraps each eigenvalue in
+# ``conditional(h > eps, [lambda_k], 0)`` whose true branch is a one-element
+# array; core's printer has no scalar handler for it.  We keep core untouched and
+# add the unwrap here (mirrors AmrexSystemModelPrinter._print_ImmutableDenseNDimArray).
+# Otherwise core's AmrexNumerics is used verbatim (REQ-58: real
+# local_max_abs_eigenvalue, no NumericsUser.H indirection).
+class AmrexNumericsPrinter(AmrexNumerics):
+    c_functions = {**AmrexNumerics.c_functions, "conditional": _conditional_real,
+                   "Heaviside": _heaviside_real}
+
+    def _print_ImmutableDenseNDimArray(self, expr):
+        flat = list(expr)
+        if len(flat) == 1:
+            return self._print(flat[0])
+        return "{" + ", ".join(self._print(e) for e in flat) + "}"
 
 
 def _emit_user_call(name):
@@ -62,6 +92,8 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
     # Placeholder-function map: base C kernels + the opaque ones (foam parity).
     c_functions = {
         **GenericCppBase.c_functions,
+        "conditional": _conditional_real,
+        "Heaviside": _heaviside_real,
         "eigensystem": _emit_user_call("eigensystem"),
         "compute_derivative": _emit_user_call("compute_derivative"),
     }
@@ -175,6 +207,20 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             return self._zeros(self.n_eq * self.n_aux), self.n_eq * self.n_aux
         return self._vec([J[r, c] for r in range(self.n_eq)
                           for c in range(self.n_aux)]), self.n_eq * self.n_aux
+
+    def _print_ImmutableDenseNDimArray(self, expr):
+        """Print a sympy NDimArray that reaches a *scalar* context.
+
+        ``gate_eigenvalues_dry`` wraps each eigenvalue in
+        ``conditional(h > eps, [lambda_k], 0)`` whose true branch is a
+        one-element array.  When the ``conditional`` lambda doprints that
+        branch it lands here; unwrap the singleton to its scalar.  (A genuine
+        multi-element array in scalar context would be a bug, so brace-list it
+        defensively rather than silently dropping elements.)"""
+        flat = list(expr)
+        if len(flat) == 1:
+            return self._print(flat[0])
+        return "{" + ", ".join(self._print(e) for e in flat) + "}"
 
     def _expr_update_aux(self):
         ua = getattr(self.sm, "update_aux_variables", None)
