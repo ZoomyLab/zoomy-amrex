@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Reproducible deliverable for the zoomy_amrex SWE dam break.
+"""Reproducible deliverable for the zoomy_amrex dam break.
 
-Reads the single-level AMReX plotfiles produced by ``main3d.gnu.MPI.ex`` and
-renders (a) a water-depth heat-map + centreline profile PNG at the final time
-and (b) a GIF over all snapshots.  Headless (Agg backend); needs only
+Reads the AMReX plotfiles produced by ``main{2,3}d.gnu.MPI.ex`` and renders
+(a) a water-depth heat-map + centreline profile PNG at the final time and
+(b) a GIF over all snapshots.  Headless (Agg backend); needs only
 numpy + matplotlib + Pillow, all present in the zoomy_amrex container.
+
+Handles both 2-D and 3-D (nz=1) plotfiles and *multi-level* (AMR) output:
+the level-0 field is shown as the heat-map, and every refined patch is
+outlined so the adaptive mesh is visible.
 
 Usage (inside the container):
     python3 deliverable.py <run_dir> [--out figures/dam_break]
 
 where ``<run_dir>`` holds ``plt_*`` directories.  Variable order is
-``[b, h, hu, hv]`` (var0..var3).
+``[b, h, q_x_0, ...]`` (var0 = bed, var1 = depth).
 """
 import argparse
 import glob
@@ -22,65 +26,102 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 
-# ── minimal single-level AMReX plotfile reader ──────────────────────────────
+# ── AMReX plotfile reader (2-D / 3-D, multi-level) ──────────────────────────
 def _read_header(path):
+    """Parse the plotfile Header: ncomp, names, finest_level, prob_lo/hi, refs."""
     with open(os.path.join(path, "Header")) as f:
         lines = f.read().splitlines()
     ncomp = int(lines[1])
     names = lines[2:2 + ncomp]
-    # domain corners are deeper in the header; we instead read geometry from
-    # the Level_0 boxes + the problem-domain line.
-    return ncomp, names
+    i = 2 + ncomp
+    dim = int(lines[i]); i += 1
+    _time = float(lines[i]); i += 1
+    finest_level = int(lines[i]); i += 1
+    prob_lo = [float(v) for v in lines[i].split()]; i += 1
+    prob_hi = [float(v) for v in lines[i].split()]; i += 1
+    refs = [int(v) for v in lines[i].split()] if lines[i].split() and \
+        lines[i].split()[0].lstrip("-").isdigit() else []
+    return dict(ncomp=ncomp, names=names, dim=dim, finest_level=finest_level,
+                prob_lo=prob_lo, prob_hi=prob_hi, refs=refs)
 
 
-def _read_level0(path, ncomp):
-    """Return a dense (ncomp, ny, nx) array for a single-level plotfile."""
-    lvl = os.path.join(path, "Level_0")
-    with open(os.path.join(lvl, "Cell_H")) as f:
+# Box format is dimension-agnostic: ((i,j[,k]) (i,j[,k]) (i,j[,k])).
+_BOX = re.compile(r"\(\(([-\d,]+)\) \(([-\d,]+)\)")
+
+
+def _pad3(coords):
+    c = [int(v) for v in coords.split(",")]
+    return c + [0] * (3 - len(c))
+
+
+def _read_level(lvl_dir, ncomp):
+    """Return (dense (ncomp,ny,nx) array, (ilo,jlo,nx,ny), boxes) for one level.
+
+    boxes is a list of (lo_i, lo_j, hi_i, hi_j) in this level's index space.
+    """
+    with open(os.path.join(lvl_dir, "Cell_H")) as f:
         txt = f.read()
-    # Boxes: lines like ((0,0,0) (51,51,0) (0,0,0))
-    boxes = re.findall(r"\(\((\d+),(\d+),(\d+)\) \((\d+),(\d+),(\d+)\)", txt)
-    boxes = [tuple(map(int, b)) for b in boxes]
-    # FabOnDisk: Cell_D_00000 <offset>
+    raw_boxes = [(_pad3(a), _pad3(b)) for a, b in _BOX.findall(txt)]
     fods = re.findall(r"FabOnDisk:\s+(\S+)\s+(\d+)", txt)
-    # global extent
-    ilo = min(b[0] for b in boxes); jlo = min(b[1] for b in boxes)
-    ihi = max(b[3] for b in boxes); jhi = max(b[4] for b in boxes)
+    ilo = min(lo[0] for lo, _ in raw_boxes); jlo = min(lo[1] for lo, _ in raw_boxes)
+    ihi = max(hi[0] for _, hi in raw_boxes); jhi = max(hi[1] for _, hi in raw_boxes)
     nx = ihi - ilo + 1; ny = jhi - jlo + 1
     out = np.full((ncomp, ny, nx), np.nan)
-    for (lo_i, lo_j, lo_k, hi_i, hi_j, hi_k), (fname, off) in zip(boxes, fods):
-        bx = hi_i - lo_i + 1; by = hi_j - lo_j + 1; bz = hi_k - lo_k + 1
-        with open(os.path.join(lvl, fname), "rb") as fb:
+    boxes = []
+    for (lo, hi), (fname, off) in zip(raw_boxes, fods):
+        bx = hi[0] - lo[0] + 1; by = hi[1] - lo[1] + 1; bz = hi[2] - lo[2] + 1
+        boxes.append((lo[0], lo[1], hi[0], hi[1]))
+        with open(os.path.join(lvl_dir, fname), "rb") as fb:
             fb.seek(int(off))
-            # FAB ASCII header terminated by newline, then raw doubles
             hdr = b""
             while not hdr.endswith(b"\n"):
                 hdr += fb.read(1)
             count = bx * by * bz * ncomp
-            raw = fb.read(count * 8)
-            data = np.array(struct.unpack("<%dd" % count, raw))
-        # FAB layout: comp-major, then z,y,x with x fastest
+            data = np.array(struct.unpack("<%dd" % count, fb.read(count * 8)))
         data = data.reshape(ncomp, bz, by, bx)[:, 0, :, :]  # k=0 slice
-        out[:, lo_j - jlo:hi_j - jlo + 1, lo_i - ilo:hi_i - ilo + 1] = data
-    return out
+        out[:, lo[1] - jlo:hi[1] - jlo + 1, lo[0] - ilo:hi[0] - ilo + 1] = data
+    return out, (ilo, jlo, nx, ny), boxes
 
 
 def read_plotfile(path):
-    ncomp, names = _read_header(path)
-    arr = _read_level0(path, ncomp)
-    return arr, names
+    """Return (level0 array, names, prob extent, list of fine-patch rects).
+
+    Fine-patch rects are (x0, y0, w, h) in physical coordinates, one per box
+    on every refined level.
+    """
+    H = _read_header(path)
+    arr, ext0, _ = _read_level(os.path.join(path, "Level_0"), H["ncomp"])
+    plo, phi = H["prob_lo"], H["prob_hi"]
+    Lx = phi[0] - plo[0]; Ly = phi[1] - plo[1]
+    nx0, ny0 = ext0[2], ext0[3]
+    rects = []
+    cum_ref = 1
+    for lev in range(1, H["finest_level"] + 1):
+        cum_ref *= (H["refs"][lev - 1] if lev - 1 < len(H["refs"]) else 2)
+        nlx, nly = nx0 * cum_ref, ny0 * cum_ref
+        _, _, boxes = _read_level(os.path.join(path, f"Level_{lev}"), H["ncomp"])
+        for (li, lj, hi, hj) in boxes:
+            x0 = plo[0] + li / nlx * Lx
+            y0 = plo[1] + lj / nly * Ly
+            rects.append((x0, y0, (hi - li + 1) / nlx * Lx,
+                          (hj - lj + 1) / nly * Ly))
+    return arr, H["names"], (plo[0], phi[0], plo[1], phi[1]), rects
 
 
 # ── figures ─────────────────────────────────────────────────────────────────
-def _frame(ax_h, ax_p, arr, title, vlim):
+def _frame(ax_h, ax_p, arr, ext, rects, title, vlim):
     h = arr[1]                      # var1 = water depth
     ny, nx = h.shape
-    im = ax_h.imshow(h, origin="lower", extent=[0, 1, 0, 1],
+    im = ax_h.imshow(h, origin="lower", extent=ext,
                      vmin=vlim[0], vmax=vlim[1], cmap="viridis", aspect="auto")
+    for (x0, y0, w, hh) in rects:   # outline every refined patch
+        ax_h.add_patch(Rectangle((x0, y0), w, hh, fill=False,
+                                  edgecolor="red", lw=0.8))
     ax_h.set_title(title); ax_h.set_xlabel("x"); ax_h.set_ylabel("y")
-    x = (np.arange(nx) + 0.5) / nx
+    x = ext[0] + (np.arange(nx) + 0.5) / nx * (ext[1] - ext[0])
     ax_p.plot(x, h[ny // 2], "b-")
     ax_p.set_ylim(vlim[0] - 0.05, vlim[1] + 0.05)
     ax_p.set_xlabel("x"); ax_p.set_ylabel("h (centreline)")
@@ -99,14 +140,17 @@ def main():
         raise SystemExit(f"no plt_* in {a.run_dir}")
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
 
-    fields = [read_plotfile(p)[0] for p in plts]
-    hmin = min(f[1].min() for f in fields)
-    hmax = max(f[1].max() for f in fields)
+    snaps = [read_plotfile(p) for p in plts]   # (arr, names, ext, rects) each
+    hmin = min(s[0][1].min() for s in snaps)
+    hmax = max(s[0][1].max() for s in snaps)
     vlim = (hmin, hmax)
+    nlev = max(1 + bool(s[3]) for s in snaps)
 
     # final-time PNG
+    arr, _, ext, rects = snaps[-1]
     fig, (axh, axp) = plt.subplots(1, 2, figsize=(10, 4))
-    _frame(axh, axp, fields[-1], f"SWE dam break — h at final snapshot", vlim)
+    _frame(axh, axp, arr, ext, rects,
+           f"dam break — h, final snapshot ({len(rects)} refined patches)", vlim)
     fig.colorbar(axh.images[0], ax=axh, label="h")
     fig.tight_layout(); fig.savefig(a.out + ".png", dpi=110)
     print("wrote", a.out + ".png")
@@ -114,9 +158,9 @@ def main():
     # GIF over all snapshots (via Pillow)
     from PIL import Image
     frames = []
-    for i, f in enumerate(fields):
+    for i, (arr, _, ext, rects) in enumerate(snaps):
         fig, (axh, axp) = plt.subplots(1, 2, figsize=(10, 4))
-        _frame(axh, axp, f, f"SWE dam break — snapshot {i}", vlim)
+        _frame(axh, axp, arr, ext, rects, f"dam break — snapshot {i}", vlim)
         fig.colorbar(axh.images[0], ax=axh, label="h")
         fig.tight_layout()
         fig.canvas.draw()
