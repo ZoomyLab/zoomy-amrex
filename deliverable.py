@@ -111,6 +111,92 @@ def read_plotfile(path):
     return arr, H["names"], (plo[0], phi[0], plo[1], phi[1]), rects
 
 
+def read_levels(path):
+    """Return (per-level dicts, header).
+
+    Each level dict: arr (ncomp,ny,nx over its bounding box), ext (ilo,jlo,nx,ny)
+    in that level's index space, boxes (list of li,lj,hi,hj), ref (cumulative
+    refinement factor vs level 0).
+    """
+    H = _read_header(path)
+    levels = []
+    cum = 1
+    for lev in range(H["finest_level"] + 1):
+        if lev > 0:
+            cum *= (H["refs"][lev - 1] if lev - 1 < len(H["refs"]) else 2)
+        arr, ext, boxes = _read_level(os.path.join(path, f"Level_{lev}"), H["ncomp"])
+        levels.append(dict(arr=arr, ext=ext, boxes=boxes, ref=cum))
+    return levels, H
+
+
+def composite_field(levels, comp_idx=1):
+    """Paint every level onto one array at the finest resolution.
+
+    Coarse cells are block-replicated; each finer level overwrites its patches,
+    so the returned image shows the actual data the solver carries on the
+    highest-resolution mesh available at each location.
+    """
+    nx0, ny0 = levels[0]["ext"][2], levels[0]["ext"][3]
+    cum_f = levels[-1]["ref"]
+    NX, NY = nx0 * cum_f, ny0 * cum_f
+    comp = np.full((NY, NX), np.nan)
+    for L in levels:
+        f = cum_f // L["ref"]
+        ilo, jlo, nx, ny = L["ext"]
+        data = L["arr"][comp_idx]
+        up = np.repeat(np.repeat(data, f, axis=0), f, axis=1)
+        I0, J0 = ilo * f, jlo * f
+        sub = comp[J0:J0 + ny * f, I0:I0 + nx * f]
+        m = ~np.isnan(up)
+        sub[m] = up[m]
+    return comp
+
+
+def _draw_mesh(ax, levels, ext, colors=("0.7", "k", "r", "m")):
+    """Draw the real cell grid, each level only where it is the *finest* cell.
+
+    A coarse cell that is covered by a finer level is skipped, so the result is
+    a clean nested mesh: coarse cells in smooth regions, progressively finer
+    cells where the solver refined (the gradients)."""
+    plo_x, phi_x, plo_y, phi_y = ext
+    Lx, Ly = phi_x - plo_x, phi_y - plo_y
+    nx0, ny0 = levels[0]["ext"][2], levels[0]["ext"][3]
+    for li, L in enumerate(levels):
+        nlx, nly = nx0 * L["ref"], ny0 * L["ref"]
+        dx, dy = Lx / nlx, Ly / nly
+        covered = set()                     # this-level cells hidden by a finer level
+        if li + 1 < len(levels):
+            r = levels[li + 1]["ref"] // L["ref"]
+            for (fi, fj, fhi, fhj) in levels[li + 1]["boxes"]:
+                for ci in range(fi // r, fhi // r + 1):
+                    for cj in range(fj // r, fhj // r + 1):
+                        covered.add((ci, cj))
+        c = colors[min(li, len(colors) - 1)]
+        for (bi, bj, bhi, bhj) in L["boxes"]:
+            for ci in range(bi, bhi + 1):
+                for cj in range(bj, bhj + 1):
+                    if (ci, cj) in covered:
+                        continue
+                    ax.add_patch(Rectangle((plo_x + ci * dx, plo_y + cj * dy),
+                                           dx, dy, fill=False, edgecolor=c,
+                                           lw=0.3, alpha=0.8))
+
+
+def _frame_mesh(ax_h, ax_p, levels, ext, title, vlim):
+    comp = composite_field(levels, comp_idx=1)
+    NY, NX = comp.shape
+    im = ax_h.imshow(comp, origin="lower", extent=ext,
+                     vmin=vlim[0], vmax=vlim[1], cmap="viridis", aspect="auto")
+    _draw_mesh(ax_h, levels, ext)
+    ax_h.set_title(title); ax_h.set_xlabel("x"); ax_h.set_ylabel("y")
+    x = ext[0] + (np.arange(NX) + 0.5) / NX * (ext[1] - ext[0])
+    ax_p.plot(x, comp[NY // 2], "b-")
+    ax_p.set_ylim(vlim[0] - 0.05, vlim[1] + 0.05)
+    ax_p.set_xlabel("x"); ax_p.set_ylabel("h (finest level, centreline)")
+    ax_p.grid(True, alpha=0.3)
+    return im
+
+
 # ── figures ─────────────────────────────────────────────────────────────────
 def _frame(ax_h, ax_p, arr, ext, rects, title, vlim):
     h = arr[1]                      # var1 = water depth
@@ -133,12 +219,42 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("run_dir")
     ap.add_argument("--out", default="figures/dam_break")
+    ap.add_argument("--mesh", action="store_true",
+                    help="composite the field at the finest level and draw the "
+                         "real cell grid (shows where the mesh refines)")
     a = ap.parse_args()
 
     plts = sorted(glob.glob(os.path.join(a.run_dir, "plt_*")))
     if not plts:
         raise SystemExit(f"no plt_* in {a.run_dir}")
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+
+    if a.mesh:
+        from PIL import Image
+        lv_snaps = [read_levels(p)[0] for p in plts]
+        ext = read_plotfile(plts[-1])[2]
+        comps = [composite_field(lv) for lv in lv_snaps]
+        vlim = (min(np.nanmin(c) for c in comps),
+                max(np.nanmax(c) for c in comps))
+        frames = []
+        for i, lv in enumerate(lv_snaps):
+            fig, (axh, axp) = plt.subplots(1, 2, figsize=(10, 4))
+            nfine = sum(len(L["boxes"]) for L in lv[1:])
+            _frame_mesh(axh, axp, lv, ext,
+                        f"dam break — finest-level h + mesh "
+                        f"(snapshot {i}, {len(lv)} levels)", vlim)
+            fig.colorbar(axh.images[0], ax=axh, label="h")
+            fig.tight_layout()
+            fig.savefig(a.out + ".png", dpi=120) if i == len(lv_snaps) - 1 else None
+            fig.canvas.draw()
+            w, hh = fig.canvas.get_width_height()
+            buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            frames.append(Image.fromarray(buf.reshape(hh, w, 4)[..., :3].copy()))
+            plt.close(fig)
+        frames[0].save(a.out + ".gif", save_all=True, append_images=frames[1:],
+                       duration=300, loop=0)
+        print("wrote", a.out + ".png and .gif")
+        return
 
     snaps = [read_plotfile(p) for p in plts]   # (arr, names, ext, rects) each
     hmin = min(s[0][1].min() for s in snaps)
