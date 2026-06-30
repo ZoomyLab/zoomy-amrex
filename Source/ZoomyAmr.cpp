@@ -5,6 +5,7 @@
 #include <AMReX_FillPatchUtil.H>
 #include <AMReX_GMRES.H>
 #include "imex_solver.H"
+#include <iomanip>
 
 using namespace amrex;
 
@@ -41,9 +42,11 @@ ZoomyAmr::ZoomyAmr()
       pp.query("implicit_source", implicit_source);
       pp.query("implicit_global", implicit_global);
       pp.query("well_balanced", well_balanced);
+      pp.query("clamp_positivity", clamp_positivity);
     }
     { ParmParse pp("tagging");
       pp.query("threshold", tag_threshold);
+      pp.query("b_max", tag_b_max);
     }
     { ParmParse pp("bc");
       pp.query("x_lo", bc_x_lo);
@@ -107,11 +110,20 @@ void ZoomyAmr::InitData()
         readRasterIntoComponent(friction_file, Geom(0), Qaux[0], 1);
 
     if (max_level > 0) {
-        for (int i = 0; i < 3; ++i) {
+        // The raster IC was loaded ONLY into level 0. Any finer levels created
+        // by InitFromScratch carry the flat init_solution default, and regrid's
+        // RemakeLevel (FillPatch) would preserve that. So after each regrid we
+        // re-initialise every fine level from the (correct) coarse level via
+        // FillCoarsePatch, propagating the bathymetry + IC down the hierarchy.
+        for (int i = 0; i < 4; ++i) {
+            for (int lev = 1; lev <= finest_level; ++lev)
+                FillCoarsePatch(lev, 0.0, Q[lev], 0, Model::n_dof_q);
             int old_finest = finest_level;
             regrid(0, 0.0);
-            if (old_finest == finest_level) break;
+            if (old_finest == finest_level && i > 0) break;
         }
+        for (int lev = 1; lev <= finest_level; ++lev)
+            FillCoarsePatch(lev, 0.0, Q[lev], 0, Model::n_dof_q);
     }
 
     for (int lev = 0; lev <= finest_level; ++lev)
@@ -189,6 +201,7 @@ void ZoomyAmr::ErrorEst(int lev, TagBoxArray& tags, Real /*time*/, int /*ngrow*/
 {
     const auto& mf = Q[lev];
     const Real threshold = tag_threshold;
+    const Real bmax = tag_b_max;   // only refine cells with bed < bmax
 
     for (MFIter mfi(mf); mfi.isValid(); ++mfi) {
         const Box& bx = mfi.validbox();
@@ -196,6 +209,11 @@ void ZoomyAmr::ErrorEst(int lev, TagBoxArray& tags, Real /*time*/, int /*ngrow*/
         auto const& tag = tags.array(mfi);
 
         ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+            // Bed-based domain gate: never refine cells essentially outside the
+            // domain (the high exterior wall bed) -> they stay at the coarsest
+            // level. Inside (b < bmax), refine the flood front (|grad h|) and
+            // any wet cell so the moving water is well resolved.
+            if (Q_arr(i, j, 0, idx_b) >= bmax) return;
             Real grad = 0.0;
             Real dhdx = std::abs(Q_arr(i + 1, j, 0, idx_h) - Q_arr(i - 1, j, 0, idx_h));
             grad += dhdx * dhdx;
@@ -203,7 +221,7 @@ void ZoomyAmr::ErrorEst(int lev, TagBoxArray& tags, Real /*time*/, int /*ngrow*/
                 Real dhdy = std::abs(Q_arr(i, j + 1, 0, idx_h) - Q_arr(i, j - 1, 0, idx_h));
                 grad += dhdy * dhdy;
             }
-            if (std::sqrt(grad) > threshold)
+            if (std::sqrt(grad) > threshold || Q_arr(i, j, 0, idx_h) > h_dry)
                 tag(i, j, k) = TagBox::SET;
         });
     }
@@ -249,6 +267,7 @@ void ZoomyAmr::FillCoarsePatch(int lev, Real time, MultiFab& mf, int icomp, int 
 void ZoomyAmr::UpdateState(int lev)
 {
     auto const& p = p_mat;
+    const bool clamp = clamp_positivity;
     for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
         const Box& bx = mfi.growntilebox();
         auto Q_arr = Q[lev].array(mfi);
@@ -265,7 +284,7 @@ void ZoomyAmr::UpdateState(int lev)
             // and zero the momentum/moments of dry cells so hu/h cannot blow up
             // the wavespeed. Depth is preserved; the flux/dt division uses the
             // h_min floor. No-op for fully-wet runs (h >= h_dry everywhere).
-            if (q(idx_h, 0) < 0.0) q(idx_h, 0) = 0.0;
+            if (clamp && q(idx_h, 0) < 0.0) q(idx_h, 0) = 0.0;
             if (q(idx_h, 0) < h_dry) {
                 for (int n = 0; n < Model::n_dof_q; ++n)
                     if (n != idx_b && n != idx_h) q(n, 0) = 0.0;
@@ -415,6 +434,26 @@ Real ZoomyAmr::ComputeDt(int lev)
     return amrex::max(amrex::min(dt, dtmax), dtmin);
 }
 
+Real ZoomyAmr::ComputeTotalMass()
+{
+    Real total = 0.0;
+    for (int lev = 0; lev <= finest_level; ++lev) {
+        const Real cell_vol = Geom(lev).CellSize(0) * Geom(lev).CellSize(1);
+        MultiFab h(boxArray(lev), DistributionMap(lev), 1, 0);
+        MultiFab::Copy(h, Q[lev], idx_h, 0, 1, 0);
+        if (lev < finest_level) {
+            // zero the cells covered by the finer level so they are not
+            // double-counted (mask: uncovered=1, covered=0).
+            MultiFab mask = makeFineMask(boxArray(lev), DistributionMap(lev),
+                                         boxArray(lev + 1), refRatio(lev),
+                                         Real(1.0), Real(0.0));
+            MultiFab::Multiply(h, mask, 0, 0, 1, 0);
+        }
+        total += h.sum(0) * cell_vol;
+    }
+    return total;
+}
+
 void ZoomyAmr::Advance(int lev, Real time, Real dt)
 {
     const auto& geom = Geom(lev);
@@ -525,6 +564,9 @@ void ZoomyAmr::Evolve()
 
     Real evo_start = ParallelDescriptor::second();
 
+    const Real mass0 = ComputeTotalMass();
+    Print() << "Initial total mass = " << std::setprecision(12) << mass0 << "\n";
+
     while (time < time_end) {
         if (time >= next_plot_time) {
             WritePlotFile(plot_step, time);
@@ -538,9 +580,13 @@ void ZoomyAmr::Evolve()
         time += dt0;
         step++;
 
+        Real mass = ComputeTotalMass();
+        Real drift = (mass0 != 0.0) ? (mass - mass0) / mass0 : (mass - mass0);
         Print() << "Step " << step << " dt: " << dt0
                 << " time: " << time << "s"
-                << " levels: " << finest_level + 1 << "\n";
+                << " levels: " << finest_level + 1
+                << " mass: " << std::setprecision(14) << mass
+                << " drift: " << std::setprecision(4) << drift << "\n";
     }
 
     WritePlotFile(plot_step, time);

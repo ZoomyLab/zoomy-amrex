@@ -60,6 +60,9 @@ private:
     void Advance(int lev, amrex::Real time, amrex::Real dt);
     amrex::Real ComputeDt(int lev);
 
+    // Conservative total water mass sum_lev sum(h)*dV over uncovered cells.
+    amrex::Real ComputeTotalMass();
+
     // ---- Fill patch (ghost cells) ----
     void FillPatch(int lev, amrex::Real time,
                    amrex::MultiFab& mf, int icomp, int ncomp);
@@ -95,9 +98,15 @@ private:
                                     // false: per-cell local Newton
     bool well_balanced    = false;  // true: Audusse hydrostatic reconstruction
                                     // (lake-at-rest preserving; SWE bed slope)
+    bool clamp_positivity = true;   // clamp negative depth to 0 each stage.
+                                    // Stabilising but NOT mass-conserving; turn
+                                    // off (+ closed walls + CFL<=0.5) for an
+                                    // exactly mass-conserving run.
     amrex::Real plot_dt_interval = 0.1;
     int identifier        = 0;
     amrex::Real tag_threshold = 0.01; // gradient threshold for refinement
+    amrex::Real tag_b_max = 1.0e30;   // only refine cells with bed < tag_b_max
+                                      // (keeps the exterior wall bed coarse)
 
     // Ghost cells
     int nghost() const { return (spatial_order == 2) ? 2 : 1; }

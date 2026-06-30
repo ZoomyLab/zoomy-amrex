@@ -100,7 +100,7 @@ def build_system_model(model_name, dim, level, bc="extrap"):
 def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap",
                  implicit_source=False, implicit_global=False, friction=None, slip=None,
                  max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None,
-                 well_balanced=False):
+                 well_balanced=False, clamp_positivity=True, tag_b_max=None):
     if geom is not None:
         # Externally-supplied rectangular geometry (e.g. the Malpasset bbox).
         nx, ny = geom["nx"], geom["ny"]
@@ -150,7 +150,9 @@ solver.spatial_order   = {order}
 solver.implicit_source = {'true' if implicit_source else 'false'}
 solver.implicit_global = {'true' if implicit_global else 'false'}
 solver.well_balanced   = {'true' if well_balanced else 'false'}
+solver.clamp_positivity = {'true' if clamp_positivity else 'false'}
 tagging.threshold      = 0.02
+{f'tagging.b_max          = {tag_b_max}' if tag_b_max is not None else ''}
 """)
 
 
@@ -161,6 +163,10 @@ def main():
                     help="model dimension (SWE: horizontal=2; SME: total=3 for 2-D)")
     ap.add_argument("--level", type=int, default=0, help="SME moment level")
     ap.add_argument("--ncell", type=int, default=100)
+    ap.add_argument("--cfl", type=float, default=0.45)
+    ap.add_argument("--no-clamp", action="store_true",
+                    help="disable the (non-conservative) positivity clamp; with "
+                         "closed walls + CFL<=0.5 this gives exact mass conservation")
     ap.add_argument("--tend", type=float, default=0.1)
     ap.add_argument("--order", type=int, default=1)
     ap.add_argument("--plot-dt", type=float, default=0.02)
@@ -188,6 +194,9 @@ def main():
     ap.add_argument("--ncell-y", type=int, default=96, help="structured ny (--malpasset)")
     ap.add_argument("--wall-above", type=float, default=5.0,
                     help="exterior wall bed = reservoir surface + this (m)")
+    ap.add_argument("--pad", type=float, default=0.0,
+                    help="bbox padding (fraction of span) so the domain is fully "
+                         "ringed by wall cells -> a closed, exactly-conserving basin")
     ap.add_argument("--build-dir", default="/tmp/zoomy_amrex_run")
     ap.add_argument("--make", action="store_true")
     ap.add_argument("--run", action="store_true")
@@ -200,9 +209,11 @@ def main():
         from zoomy_amrex.malpasset import prepare_rasters
         a.model, a.dim, a.dim_mesh = "SWE", 2, 2   # structured 2-D SWE
         a.well_balanced = True                     # real bathymetry needs WB
+        if a.pad == 0.0:
+            a.pad = 0.04   # closed basin (domain ringed by wall) -> exact mass
         geom = prepare_rasters(a.malpasset, str(Path(a.build_dir) / "raster"),
                                ncell_x=a.ncell_x, ncell_y=a.ncell_y,
-                               wall_above=a.wall_above)
+                               wall_above=a.wall_above, pad_frac=a.pad)
         dem_file, release_file = geom["dem_file"], geom["release_file"]
         print(f"malpasset raster: {geom['nx']}x{geom['ny']} "
               f"prob_lo={geom['prob_lo']} prob_hi={geom['prob_hi']} "
@@ -231,11 +242,12 @@ def main():
     (ex / "GNUmakefile").write_text(
         GNUMAKEFILE.format(amrex_home=amrex_home, dim=a.dim_mesh))
     write_inputs(ex / "inputs", a.ncell, a.dim_mesh, a.tend, a.order, a.plot_dt, bc=a.bc,
-                 implicit_source=a.implicit, implicit_global=a.implicit_global,
+                 cfl=a.cfl, implicit_source=a.implicit, implicit_global=a.implicit_global,
                  friction=a.friction, slip=a.slip,
                  max_level=a.max_level, ref_ratio=a.ref_ratio,
                  geom=geom, dem_file=dem_file, release_file=release_file,
-                 well_balanced=a.well_balanced)
+                 well_balanced=a.well_balanced, clamp_positivity=not a.no_clamp,
+                 tag_b_max=(geom["wall_bed"] - 1.0) if geom is not None else None)
 
     if a.make:
         n = os.cpu_count() or 4
