@@ -399,7 +399,13 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
 
     auto do_stage = [&]() {
         UpdateState(lev);
-        FillPhysicalBC(lev, time);
+        // Coarse-fine-aware ghost fill. A refined level's ghost cells at the
+        // coarse-fine interface must be interpolated from the coarse level
+        // (FillPatch), NOT just FillBoundary (which only copies same-level
+        // ghosts). Without it, fine-boundary cells read uninitialised ghosts ->
+        // NaN -> average_down poisons the coarse level -> the refinement
+        // collapses after one regrid. FillPatch also applies the physical BC.
+        FillPatch(lev, time, Q[lev], 0, Model::n_dof_q);
         Q[lev].FillBoundary(geom.periodicity());
         Qaux[lev].FillBoundary(geom.periodicity());
 
