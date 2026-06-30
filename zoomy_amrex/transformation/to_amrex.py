@@ -111,13 +111,43 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         self.n_eq = int(getattr(sm, "n_equations", len(sm.state)))
         self.n_aux = len(sm.aux_state)
         self.dim = int(sm.dimension)
-        self.n_param = len(list(sm.parameters.keys()))
+        # Parameter list: the model's parameters, plus the time-step symbol ``dt``
+        # appended as the LAST parameter IF the operators reference it (the Chorin
+        # pressure/corrector sub-models carry it).  The driver writes dt into that
+        # slot each step ("dt rides in p(last)"), mirroring the foam ChorinDriver.
+        import sympy as sp
+        from zoomy_core.transformation.to_numpy import DT_SYMBOL
+        self._param_syms = list(sm.parameters.values())
+        self._param_names = list(sm.parameters.keys())
+        if self._uses_symbol(DT_SYMBOL):
+            self._param_syms = self._param_syms + [DT_SYMBOL]
+            self._param_names = self._param_names + ["dt"]
+        self.n_param = len(self._param_syms)
         # Symbol → accessor maps (order matters: most specific first is fine since
         # the symbol sets are disjoint).
         self.register_map("Q", list(sm.state))
         self.register_map("Qaux", list(sm.aux_state))
         self.register_map("n", list(sm.normal.values()))
-        self.register_map("p", list(sm.parameters.values()))
+        self.register_map("p", self._param_syms)
+
+    def _uses_symbol(self, sym):
+        """True if ``sym`` appears in any printed operator (flux/source/NCP/
+        update_variables/…) — used to decide whether to append the ``dt`` param."""
+        import sympy as sp
+        for attr in ("flux", "source", "nonconservative_matrix", "eigenvalues",
+                     "update_variables", "update_aux_variables", "state_update",
+                     "hydrostatic_pressure"):
+            M = getattr(self.sm, attr, None)
+            if M is None:
+                continue
+            try:
+                flat = sp.flatten(M)
+            except Exception:
+                flat = [M]
+            for e in flat:
+                if sym in sp.sympify(e).free_symbols:
+                    return True
+        return False
 
     # ── type / signature helpers ────────────────────────────────────────────
     def _t(self, n):
@@ -248,8 +278,11 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
                 '#include <AMReX_SmallMatrix.H>')
 
     def _file_header(self, bc_tags):
-        p_names = ", ".join(f'"{k}"' for k in self.sm.parameters.keys())
-        p_vals = ", ".join(str(v) for v in self.sm.parameter_values.values())
+        # parameter_names/default_parameters follow self._param_names (which may
+        # include the appended "dt" slot); dt defaults to 0 (the driver sets it).
+        pv = dict(self.sm.parameter_values)
+        p_names = ", ".join(f'"{k}"' for k in self._param_names)
+        p_vals = ", ".join(str(pv.get(k, 0.0)) for k in self._param_names)
         bc_str = ", ".join(f'"{t}"' for t in bc_tags)
         L = [
             "#pragma once",
@@ -359,9 +392,24 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             blocks.append(self._kernel("state_update", self._vec(su_list),
                                        (len(su_list), 1), ("Q", "Qaux", "p")))
 
-        # update variables / aux + jacobians
-        blocks.append(self._kernel("update_variables", self._vec(list(sm.state)),
-                                   (ns, 1), ("Q", "Qaux", "p")))
+        # update variables / aux + jacobians.  Emit the MODEL's real
+        # update_variables (state hygiene: e.g. MalpassetSWE's |u| cap + dry-
+        # momentum zeroing, or the Chorin corrector's pressure impulse), falling
+        # back to identity only when the model has none.  Previously this was
+        # hardcoded to identity, which silently dropped both.
+        uv = getattr(sm, "update_variables", None)
+        # update_variables may be square (n_state rows, e.g. SWE/SME state
+        # hygiene) or RECTANGULAR (n_eq rows, e.g. the Chorin corrector which
+        # only rewrites its e2s rows); emit it at its own length and let the
+        # driver scatter via e2s. Identity fallback when the model has none.
+        if uv is not None:
+            n_uv = int(uv.shape[0])
+            uv_expr = self._vec([uv[i, 0] for i in range(n_uv)])
+        else:
+            n_uv = ns
+            uv_expr = self._vec(list(sm.state))
+        blocks.append(self._kernel("update_variables", uv_expr,
+                                   (n_uv, 1), ("Q", "Qaux", "p")))
         uaexpr, _ = self._expr_update_aux()
         blocks.append(self._kernel("update_aux_variables", uaexpr, (na, 1),
                                    ("Q", "Qaux", "p")))
@@ -402,20 +450,25 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         sm = self.sm
         e2s = list(getattr(sm, "equation_to_state_index", range(self.n_eq)))
         def _rows(reg):
+            # (aux_row, state_index, x_order, y_order): the full spatial multi-
+            # index so the driver can FD-fill x- and y-derivatives generically
+            # (1-horizontal models carry a 1-tuple multi_index -> y_order 0).
             out = []
             for e in (reg or []):
                 mi = e.get("multi_index", (0,))
-                out.append((e["row"], e["state_index"], int(mi[0]) if mi else 0))
+                xo = int(mi[0]) if len(mi) > 0 else 0
+                yo = int(mi[1]) if len(mi) > 1 else 0
+                out.append((e["row"], e["state_index"], xo, yo))
             return out
         live = _rows(getattr(sm, "aux_registry", None))
         frozen = _rows(getattr(sm, "aux_input_registry", None))
         def _arr(name, rows):
             if not rows:
                 return (f"    static constexpr int n_{name} = 0;\n"
-                        f"    static constexpr int {name}[1][3] = {{{{0,0,0}}}};")
-            body = ", ".join(f"{{{r},{s},{o}}}" for r, s, o in rows)
+                        f"    static constexpr int {name}[1][4] = {{{{0,0,0,0}}}};")
+            body = ", ".join(f"{{{r},{s},{xo},{yo}}}" for r, s, xo, yo in rows)
             return (f"    static constexpr int n_{name} = {len(rows)};\n"
-                    f"    static constexpr int {name}[{len(rows)}][3] = {{{body}}};")
+                    f"    static constexpr int {name}[{len(rows)}][4] = {{{body}}};")
         L = [
             f"    static constexpr int n_e2s = {len(e2s)};",
             f"    static constexpr int e2s[{max(len(e2s),1)}] = {{ {', '.join(map(str, e2s)) or '0'} }};",
