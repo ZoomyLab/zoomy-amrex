@@ -50,12 +50,21 @@ def _read_mesh(msh_path):
 
 
 def prepare_rasters(msh_path, out_dir, ncell_x=180, ncell_y=96,
-                    wall_above=5.0, pad_frac=0.0):
+                    wall_above=5.0, pad_frac=0.0, subsample=4, bed_agg="min"):
     """Write ``bed.raw`` + ``depth.raw`` and return the AMReX geometry dict.
 
-    ncell_x/ncell_y  structured resolution (cell centres are sampled).
+    ncell_x/ncell_y  structured resolution.
     wall_above       exterior wall bed = max reservoir surface + this (metres).
     pad_frac         optional bounding-box padding as a fraction of each span.
+    subsample        sub-grid factor per cell for the bathymetry aggregation.
+    bed_agg          how to collapse the sub-grid bed to one cell value:
+                     "min"  -> channel-preserving (thalweg): keep the lowest
+                               point so the narrow gorge/breach stays open at
+                               coarse resolution (a dam-break would otherwise be
+                               sealed by cell-centre sampling on the rim);
+                     "mean" -> the plain cell average.
+                     The still-water *surface* (reservoir eta=100, sea eta=0) is
+                     preserved, so depth = max(0, surface - bed).
     """
     from matplotlib.tri import Triangulation, LinearTriInterpolator
 
@@ -70,23 +79,51 @@ def prepare_rasters(msh_path, out_dir, ncell_x=180, ncell_y=96,
 
     dx = (x1 - x0) / ncell_x
     dy = (y1 - y0) / ncell_y
-    xc = x0 + (np.arange(ncell_x) + 0.5) * dx
-    yc = y0 + (np.arange(ncell_y) + 0.5) * dy
-    X, Y = np.meshgrid(xc, yc)          # (ny, nx): X[j,i]=xc[i], Y[j,i]=yc[j]
+
+    # Sample on a sub-grid (subsample per cell per axis), then aggregate per
+    # cell. Sub-cell MIN of the bed keeps the thalweg/breach connected; the
+    # surface is taken from the deepest wet sub-point so the reservoir/sea
+    # lake-at-rest level is preserved.
+    s = max(1, int(subsample))
+    fx = x0 + (np.arange(ncell_x * s) + 0.5) * (dx / s)
+    fy = y0 + (np.arange(ncell_y * s) + 0.5) * (dy / s)
+    FX, FY = np.meshgrid(fx, fy)               # (ny*s, nx*s)
 
     tri = Triangulation(x, y, tris)
-    Bg = LinearTriInterpolator(tri, B)(X, Y)   # masked outside the mesh
-    Hg = LinearTriInterpolator(tri, H)(X, Y)
-    outside = np.ma.getmaskarray(Bg)
+    Bf = LinearTriInterpolator(tri, B)(FX, FY)   # masked outside the mesh
+    Hf = LinearTriInterpolator(tri, H)(FX, FY)
+    out_f = np.ma.getmaskarray(Bf)
+    Bf = np.ma.filled(Bf, np.nan)
+    Hf = np.ma.filled(Hf, np.nan)
+    eta_f = Bf + Hf                              # free surface at wet sub-points
 
-    # reservoir free surface (bed+depth) over wet nodes -> the wall must clear it
     wet = H > 1e-6
     eta_max = float((B[wet] + H[wet]).max()) if wet.any() else float(B.max())
     wall_bed = eta_max + wall_above
 
-    bed = np.where(outside, wall_bed, np.ma.filled(Bg, wall_bed)).astype(np.float64)
-    depth = np.ma.filled(Hg, 0.0).astype(np.float64)
-    depth = np.where(outside, 0.0, np.clip(depth, 0.0, None)).astype(np.float64)
+    # reshape sub-grid -> (ny, s, nx, s) and reduce over the (s, s) sub-block
+    def _blocks(a):
+        return a.reshape(ncell_y, s, ncell_x, s).transpose(0, 2, 1, 3) \
+                .reshape(ncell_y, ncell_x, s * s)
+    Bb = _blocks(Bf); etab = _blocks(eta_f); Hb = _blocks(Hf)
+    outb = _blocks(out_f.astype(float))
+
+    inside_any = outb.min(axis=2) < 0.5          # cell has >=1 interior sub-point
+    valid = ~np.isnan(Bb)
+    wet_sub = np.nan_to_num(Hb) > 1e-6
+    nvalid = valid.sum(axis=2)
+    # a cell is wet only if most of its interior sub-points are wet -> avoids
+    # over-filling reservoir/sea edge cells (which would otherwise inherit the
+    # eta=100 surface over a single wet sub-point).
+    cell_wet = inside_any & (nvalid > 0) & (wet_sub.sum(axis=2) >= 0.5 * nvalid)
+    with np.errstate(invalid="ignore"):
+        bed_in = np.nanmin(Bb, axis=2) if bed_agg == "min" else np.nanmean(Bb, axis=2)
+        surf = np.nanmax(np.where(wet_sub, etab, np.nan), axis=2)  # wet surface
+    bed = np.where(inside_any, np.where(np.isnan(bed_in), wall_bed, bed_in),
+                   wall_bed).astype(np.float64)
+    surf = np.where(np.isnan(surf), bed, surf)
+    depth = np.clip(np.where(cell_wet, surf - bed, 0.0), 0.0, None).astype(np.float64)
+    outside = ~inside_any
 
     bed_path = os.path.join(out_dir, "bed.raw")
     dep_path = os.path.join(out_dir, "depth.raw")

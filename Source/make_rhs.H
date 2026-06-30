@@ -17,11 +17,13 @@ amrex::Real minmod(amrex::Real a, amrex::Real b) {
 // ----------------------------------------------------------------------------
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
-               amrex::Array4<const amrex::Real> const& Q, 
+               amrex::Array4<const amrex::Real> const& Q,
                amrex::Array4<const amrex::Real> const& Qaux,
                const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
                amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1>& flux,
-               amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1>& fluct) // <-- Flat 1D Vector
+               amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1>& fluct, // <-- Flat 1D Vector
+               bool well_balanced = false,
+               amrex::Real* hLstar = nullptr, amrex::Real* hRstar = nullptr)
 {
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> qL, qR;
     amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> aL, aR;
@@ -52,6 +54,31 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
         }
     }
     
+    // Audusse hydrostatic reconstruction (well-balanced SWE bed slope).
+    // Reconstruct the depth from the free surface eta=h+b about the higher of
+    // the two beds, b_face=max(bL,bR): h* = max(0, eta - b_face). Momentum is
+    // rescaled to preserve the velocity, and the face bed is set equal on both
+    // sides so the generic path-conservative bed NCP term cancels (Delta b=0);
+    // the balancing bed source is added per cell in compute_cell_rhs. This
+    // makes lake-at-rest (eta=const, u=0) exact. No-op when well_balanced=false.
+    amrex::Real hLs = qL(idx_h,0), hRs = qR(idx_h,0);
+    if (well_balanced) {
+        amrex::Real bL = qL(idx_b,0), bR = qR(idx_b,0);
+        amrex::Real bf = amrex::max(bL, bR);
+        hLs = amrex::max(amrex::Real(0.0), qL(idx_h,0) + bL - bf);
+        hRs = amrex::max(amrex::Real(0.0), qR(idx_h,0) + bR - bf);
+        amrex::Real sL = (qL(idx_h,0) > h_min) ? hLs / qL(idx_h,0) : amrex::Real(0.0);
+        amrex::Real sR = (qR(idx_h,0) > h_min) ? hRs / qR(idx_h,0) : amrex::Real(0.0);
+        for (int d = 0; d < Model::dimension; ++d) {
+            qL(idx_h+1+d, 0) *= sL;
+            qR(idx_h+1+d, 0) *= sR;
+        }
+        qL(idx_h,0) = hLs;  qR(idx_h,0) = hRs;
+        qL(idx_b,0) = bf;   qR(idx_b,0) = bf;
+    }
+    if (hLstar) *hLstar = hLs;
+    if (hRstar) *hRstar = hRs;
+
     // Wet/dry desingularisation: keep the reconstructed depth strictly positive
     // so the flux/eigenvalue kernels never divide by zero at a dry/front face.
     // For fully-wet states this is a no-op (h >> h_min).
@@ -75,20 +102,23 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
 // ----------------------------------------------------------------------------
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, amrex::Array4<const amrex::Real> const& Qaux,
-                      amrex::Array4<amrex::Real> const& RHS, amrex::Real dx, amrex::Real dy, 
-                      int order, bool implicit_source, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat)
+                      amrex::Array4<amrex::Real> const& RHS, amrex::Real dx, amrex::Real dy,
+                      int order, bool implicit_source, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
+                      bool well_balanced = false)
 {
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> flux_xr, flux_xl, flux_yr, flux_yl;
-    
-    // Flat 1D Vectors
-    amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1> fluct_xr, fluct_xl, fluct_yr, fluct_yl; 
 
-    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr);
-    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl);
+    // Flat 1D Vectors
+    amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1> fluct_xr, fluct_xl, fluct_yr, fluct_yl;
+
+    // Reconstructed depths of THIS cell at each of its faces (Audusse source).
+    amrex::Real hL_xr = 0.0, hR_xl = 0.0, hL_yr = 0.0, hR_yl = 0.0, dum;
+    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr, well_balanced, &hL_xr, &dum);
+    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl, well_balanced, &dum, &hR_xl);
 
     if constexpr (Model::dimension == 2) {
-        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr);
-        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl);
+        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr, well_balanced, &hL_yr, &dum);
+        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl, well_balanced, &dum, &hR_yl);
     }
 
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> q_curr, source_term;
@@ -120,6 +150,18 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
 
         RHS(i,j,0,n) = F_x / dx + F_y / dy;
         if (!implicit_source) RHS(i,j,0,n) += source_term(n,0);
+    }
+
+    // Audusse well-balanced bed source: the hydrostatic-reconstruction
+    // counterpart of the cancelled bed NCP. For momentum component k in
+    // direction d it is (g/2/dx_d)[ (h*_right)^2 - (h*_left)^2 ], using THIS
+    // cell's depths reconstructed at its two faces. Together with the
+    // reconstructed pressure flux this is exact for lake-at-rest.
+    if (well_balanced) {
+        amrex::Real g = p_mat(0,0);
+        RHS(i,j,0,idx_h+1) += 0.5 * g * (hL_xr*hL_xr - hR_xl*hR_xl) / dx;
+        if constexpr (Model::dimension == 2)
+            RHS(i,j,0,idx_h+2) += 0.5 * g * (hL_yr*hL_yr - hR_yl*hR_yl) / dy;
     }
 
     // ---- Diffusive flux (optional, compile-time gated) ----

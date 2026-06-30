@@ -93,6 +93,8 @@ private:
     bool implicit_source  = true;
     bool implicit_global  = false;  // true: matrix-free JFNK (nonlocal-capable)
                                     // false: per-cell local Newton
+    bool well_balanced    = false;  // true: Audusse hydrostatic reconstruction
+                                    // (lake-at-rest preserving; SWE bed slope)
     amrex::Real plot_dt_interval = 0.1;
     int identifier        = 0;
     amrex::Real tag_threshold = 0.01; // gradient threshold for refinement

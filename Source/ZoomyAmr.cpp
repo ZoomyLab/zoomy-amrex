@@ -40,6 +40,7 @@ ZoomyAmr::ZoomyAmr()
       pp.query("spatial_order", spatial_order);
       pp.query("implicit_source", implicit_source);
       pp.query("implicit_global", implicit_global);
+      pp.query("well_balanced", well_balanced);
     }
     { ParmParse pp("tagging");
       pp.query("threshold", tag_threshold);
@@ -421,6 +422,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
     auto const& p = p_mat;
     int order = spatial_order;
     bool impl_src = implicit_source;
+    bool wb = well_balanced;
 
     auto do_stage = [&]() {
         UpdateState(lev);
@@ -441,7 +443,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
             ParallelFor(mfi.validbox(),
                 [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     compute_cell_rhs(i, j, Q_arr, Qaux_arr, RHS_arr,
-                                     dx[0], dx[1], order, impl_src, p);
+                                     dx[0], dx[1], order, impl_src, p, wb);
                 });
         }
 

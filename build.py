@@ -99,7 +99,8 @@ def build_system_model(model_name, dim, level, bc="extrap"):
 
 def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap",
                  implicit_source=False, implicit_global=False, friction=None, slip=None,
-                 max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None):
+                 max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None,
+                 well_balanced=False):
     if geom is not None:
         # Externally-supplied rectangular geometry (e.g. the Malpasset bbox).
         nx, ny = geom["nx"], geom["ny"]
@@ -148,6 +149,7 @@ solver.dtmax           = {tend}
 solver.spatial_order   = {order}
 solver.implicit_source = {'true' if implicit_source else 'false'}
 solver.implicit_global = {'true' if implicit_global else 'false'}
+solver.well_balanced   = {'true' if well_balanced else 'false'}
 tagging.threshold      = 0.02
 """)
 
@@ -167,6 +169,9 @@ def main():
     ap.add_argument("--bc", default="extrap", choices=("extrap", "wall"),
                     help="extrap (zero-gradient) or wall (closed reflective basin)")
     ap.add_argument("--implicit", action="store_true", help="implicit source")
+    ap.add_argument("--well-balanced", action="store_true",
+                    help="Audusse hydrostatic reconstruction (lake-at-rest "
+                         "preserving; auto-on for --malpasset)")
     ap.add_argument("--implicit-global", action="store_true",
                     help="matrix-free JFNK source solve (nonlocal-capable)")
     ap.add_argument("--friction", type=float, default=None,
@@ -194,6 +199,7 @@ def main():
     if a.malpasset:
         from zoomy_amrex.malpasset import prepare_rasters
         a.model, a.dim, a.dim_mesh = "SWE", 2, 2   # structured 2-D SWE
+        a.well_balanced = True                     # real bathymetry needs WB
         geom = prepare_rasters(a.malpasset, str(Path(a.build_dir) / "raster"),
                                ncell_x=a.ncell_x, ncell_y=a.ncell_y,
                                wall_above=a.wall_above)
@@ -228,7 +234,8 @@ def main():
                  implicit_source=a.implicit, implicit_global=a.implicit_global,
                  friction=a.friction, slip=a.slip,
                  max_level=a.max_level, ref_ratio=a.ref_ratio,
-                 geom=geom, dem_file=dem_file, release_file=release_file)
+                 geom=geom, dem_file=dem_file, release_file=release_file,
+                 well_balanced=a.well_balanced)
 
     if a.make:
         n = os.cpu_count() or 4
