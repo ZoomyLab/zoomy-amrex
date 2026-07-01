@@ -29,6 +29,7 @@
 \*---------------------------------------------------------------------------*/
 #include <AMReX.H>
 #include <AMReX_MultiFab.H>
+#include <AMReX_GMRES.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_PlotFileUtil.H>
@@ -133,31 +134,77 @@ static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
     }
 }
 
-// ── dense Gaussian elimination (small systems; single-rank pressure solve) ──
-static bool solveDense(std::vector<double>& A, std::vector<double>& b, int n)
+// ── Chorin pressure solve: matrix-free GMRES on the coupled pressure block ──
+// The pressure system is LINEAR: source(P) = A·P + R0, so the operator is applied
+// matrix-free as  A·x = source(x) - source(0)  (no FD-JVP epsilon needed).  This
+// is dimension- and mode-AGNOSTIC — the vector carries n_dof_eq pressure modes per
+// cell and A·x is a full ModelPress::source sweep (central-FD ∂P/∂²P over the
+// structured grid, any dimension) — so the same solver serves 2-D/3-D moment
+// systems and ML-VAM with no per-model code (option 2 of the Escalante fast-solve
+// discussion: MG/Krylov in space, block over the modes).  Preconditioner is
+// identity; the x-hi pressure pin makes A non-singular.
+static constexpr int NP = ModelPress::n_dof_eq;
+
+// scatter a mode-vector X (ncomp=NP) into the shared state's pressure slots e2s
+static void scatterP(MultiFab& Q, const MultiFab& X)
 {
-    for (int col = 0; col < n; ++col) {
-        int piv = col; double best = std::abs(A[col*n+col]);
-        for (int r = col+1; r < n; ++r) {
-            double v = std::abs(A[r*n+col]); if (v > best) { best = v; piv = r; }
-        }
-        if (best < 1e-30) return false;
-        if (piv != col) {
-            for (int c = 0; c < n; ++c) std::swap(A[col*n+c], A[piv*n+c]);
-            std::swap(b[col], b[piv]);
-        }
-        double d = A[col*n+col];
-        for (int r = 0; r < n; ++r) {
-            if (r == col) continue;
-            double f = A[r*n+col] / d;
-            if (f == 0.0) continue;
-            for (int c = col; c < n; ++c) A[r*n+c] -= f * A[col*n+c];
-            b[r] -= f * b[col];
-        }
+    for (MFIter mfi(Q); mfi.isValid(); ++mfi) {
+        const Box& bx = mfi.validbox();
+        auto Qa = Q.array(mfi); auto Xa = X.const_array(mfi);
+        ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+            for (int m=0;m<NP;++m) Qa(i,j,0,ModelPress::e2s[m]) = Xa(i,j,0,m);
+        });
     }
-    for (int i = 0; i < n; ++i) b[i] /= A[i*n+i];
-    return true;
 }
+
+// evaluate ModelPress::source into `out` (ncomp=NP) for the current P in Q; refills
+// the LIVE derivative aux (P-dependent) — the FROZEN input_aux stay as pre-filled.
+static void pressSource(MultiFab& Q, MultiFab& Aqs, const Geometry& geom,
+                        const BCInfo& bc, const std::vector<Real>& pv,
+                        Real dx, Real dy, MultiFab& out)
+{
+    fillBC(Q, geom, bc);
+    fill_deriv_aux(Q, Aqs, ModelPress::deriv_aux, ModelPress::n_deriv_aux, dx, dy);
+    Aqs.FillBoundary(geom.periodicity());
+    auto P = packp<ModelPress::n_parameters>(pv);
+    for (MFIter mfi(out); mfi.isValid(); ++mfi) {
+        const Box& bx = mfi.validbox();
+        auto Qa = Q.const_array(mfi); auto Aa = Aqs.const_array(mfi); auto Oa = out.array(mfi);
+        ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+            SmallMatrix<Real,NS,1> q;
+            SmallMatrix<Real,std::max(ModelPress::n_dof_qaux,1),1> a;
+            for (int n=0;n<NS;++n) q(n,0)=Qa(i,j,0,n);
+            for (int n=0;n<ModelPress::n_dof_qaux;++n) a(n,0)=Aa(i,j,0,n);
+            auto r = ModelPress::source(q,a,P);
+            for (int m=0;m<NP;++m) Oa(i,j,0,m)=r(m,0);
+        });
+    }
+}
+
+// amrex::GMRES linear operator: A·x = source(x) - R0  (R0 = source at P=0)
+struct ChorinPressOp {
+    using RT = amrex::Real;
+    MultiFab* Q=nullptr; MultiFab* Aqs=nullptr; const Geometry* geom=nullptr;
+    const BCInfo* bc=nullptr; const std::vector<Real>* pv=nullptr;
+    const MultiFab* R0=nullptr; Real dx=0, dy=0;
+    BoxArray ba; DistributionMapping dm;
+
+    MultiFab makeVecRHS() const { return MultiFab(ba, dm, NP, 0); }
+    MultiFab makeVecLHS() const { return MultiFab(ba, dm, NP, 0); }
+    void assign(MultiFab& l, MultiFab const& r) { MultiFab::Copy(l,r,0,0,NP,0); }
+    RT dotProduct(MultiFab const& a, MultiFab const& b) { return MultiFab::Dot(a,0,b,0,NP,0); }
+    void increment(MultiFab& l, MultiFab const& r, RT a) { MultiFab::Saxpy(l,a,r,0,0,NP,0); }
+    void linComb(MultiFab& l, RT a, MultiFab const& x, RT b, MultiFab const& y) { MultiFab::LinComb(l,a,x,0,b,y,0,0,NP,0); }
+    RT norm2(MultiFab const& v) { return std::sqrt(MultiFab::Dot(v,0,v,0,NP,0)); }
+    void scale(MultiFab& v, RT f) { v.mult(f,0,NP,0); }
+    void setToZero(MultiFab& v) { v.setVal(0.0); }
+    void precond(MultiFab& l, MultiFab const& r) { MultiFab::Copy(l,r,0,0,NP,0); }
+    void apply(MultiFab& Ax, MultiFab const& x) {
+        scatterP(*Q, x);
+        pressSource(*Q, *Aqs, *geom, *bc, *pv, dx, dy, Ax);   // Ax = source(x)
+        MultiFab::Subtract(Ax, *R0, 0, 0, NP, 0);             // A·x = source(x) - R0
+    }
+};
 
 int main(int argc, char* argv[])
 {
@@ -271,65 +318,29 @@ int main(int argc, char* argv[])
         }
     };
 
-    // ── pressure residual functor (fills live deriv aux, evaluates source) ──
-    // input_aux (frozen: derivatives of the predictor state) are filled ONCE.
-    auto pressureResidual = [&](MultiFab& Rout, Real dt) {
-        fillBC(Q, geom, bc);
-        fill_deriv_aux(Q, Aqs, ModelPress::deriv_aux, ModelPress::n_deriv_aux, dx, dy);
-        Aqs.FillBoundary(geom.periodicity());
-        setdt(pPress, dt); auto P = packp<ModelPress::n_parameters>(pPress);
-        for (MFIter mfi(Rout); mfi.isValid(); ++mfi) {
-            const Box& bx = mfi.validbox();
-            auto Qa = Q.const_array(mfi); auto Aa = Aqs.const_array(mfi);
-            auto Ra = Rout.array(mfi);
-            ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-                SmallMatrix<Real,NS,1> q;
-                SmallMatrix<Real,std::max(ModelPress::n_dof_qaux,1),1> a;
-                for (int n=0;n<NS;++n) q(n,0)=Qa(i,j,0,n);
-                for (int n=0;n<ModelPress::n_dof_qaux;++n) a(n,0)=Aa(i,j,0,n);
-                auto r = ModelPress::source(q,a,P);
-                for (int m=0;m<ModelPress::n_dof_eq;++m) Ra(i,j,0,m)=r(m,0);
-            });
-        }
-    };
+    // ── pressure solve: matrix-free GMRES on the coupled pressure block ─────
+    // A·P = -R0 with A·x = source(x)-source(0); R0 = source(0) is the frozen RHS.
+    // Dimension/mode-agnostic (option 2): scales to 2-D/3-D moment systems &
+    // ML-VAM with no per-model code — MG/Krylov in space, block over the modes.
+    MultiFab Pmf(ba, dm, NP, 0), R0(ba, dm, NP, 0), rhs(ba, dm, NP, 0);
+    ChorinPressOp op;
+    op.Q=&Q; op.Aqs=&Aqs; op.geom=&geom; op.bc=&bc; op.pv=&pPress;
+    op.R0=&R0; op.dx=dx; op.dy=dy; op.ba=ba; op.dm=dm;
+    GMRES<MultiFab, ChorinPressOp> gmres;
+    gmres.define(op); gmres.setVerbose(0);
     auto solvePressure = [&](Real dt) {
-        const int nP = ModelPress::n_dof_eq;
-        const long nc = domain.numPts();
-        const long N = nP * nc;
-        // frozen input_aux: derivatives of the (now predictor-updated) state
+        setdt(pPress, dt);
+        // frozen input_aux: derivatives of the (predictor-updated) state — once
         fillBC(Q, geom, bc);
         fill_deriv_aux(Q, Aqs, ModelPress::input_aux, ModelPress::n_input_aux, dx, dy);
         Aqs.FillBoundary(geom.periodicity());
-        auto scatterP = [&](const std::vector<double>& Pv) {
-            for (MFIter mfi(Q); mfi.isValid(); ++mfi) {
-                const Box& bx = mfi.validbox(); auto Qa = Q.array(mfi);
-                LoopOnCpu(bx, [&](int i,int j,int k){
-                    long c = (long)(i-domain.smallEnd(0)) + (long)ncell[0]*(j-domain.smallEnd(1));
-                    for (int m=0;m<nP;++m) Qa(i,j,0,ModelPress::e2s[m]) = Pv[m*nc + c];
-                });
-            }
-        };
-        auto gatherR = [&](MultiFab& R, std::vector<double>& out) {
-            for (MFIter mfi(R); mfi.isValid(); ++mfi) {
-                const Box& bx = mfi.validbox(); auto Ra = R.const_array(mfi);
-                LoopOnCpu(bx, [&](int i,int j,int k){
-                    long c = (long)(i-domain.smallEnd(0)) + (long)ncell[0]*(j-domain.smallEnd(1));
-                    for (int m=0;m<nP;++m) out[m*nc + c] = Ra(i,j,0,m);
-                });
-            }
-        };
-        MultiFab R(ba, dm, nP, 0);
-        std::vector<double> zero(N,0.0), R0(N), rj(N);
-        scatterP(zero); pressureResidual(R, dt); gatherR(R, R0);
-        std::vector<double> A((long)N*N, 0.0);
-        std::vector<double> ej(N, 0.0);
-        for (long jcol=0;jcol<N;++jcol) {
-            ej[jcol]=1.0; scatterP(ej); pressureResidual(R,dt); gatherR(R,rj); ej[jcol]=0.0;
-            for (long i=0;i<N;++i) A[i*N+jcol] = rj[i]-R0[i];     // matvec(e_j)
-        }
-        std::vector<double> b(N); for (long i=0;i<N;++i) b[i]=-R0[i];
-        if (!solveDense(A,b,(int)N)) { amrex::Print()<<"  pressure: singular\n"; scatterP(zero); return; }
-        scatterP(b);
+        Pmf.setVal(0.0);                                     // R0 = source(P=0)
+        scatterP(Q, Pmf);
+        pressSource(Q, Aqs, geom, bc, pPress, dx, dy, R0);
+        MultiFab::Copy(rhs, R0, 0, 0, NP, 0); rhs.mult(-1.0, 0, NP, 0);   // rhs = -R0
+        Pmf.setVal(0.0);
+        gmres.solve(Pmf, rhs, 1e-10, 0.0);                   // A·P = -R0
+        scatterP(Q, Pmf);
         fillBC(Q, geom, bc);
     };
 
