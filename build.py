@@ -214,6 +214,61 @@ def prepare_escalante_rasters(out_dir, n_inner=60, domain=(-1.5, 1.5)):
             "inflow_q_U0": 0.11197}
 
 
+def prepare_radial_rasters(out_dir, n=96, domain=(-1.5, 1.5)):
+    """Radially-symmetric extension of the Escalante bump to a 2-D horizontal
+    grid: a circular dam-break over a radial Gaussian bump.  r = sqrt(x²+y²);
+    bed b(r) = 0.20·exp(-r²/2·0.2²); IC h = max(0.34−b | 0.015, 0.015) for r<1,
+    else 0.015.  Cartesian grid, so a correct solver must KEEP the solution
+    radially symmetric — that is the 2-D verification.  Row-major idx = i + n·j."""
+    import numpy as np
+    out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    x0, x1 = domain; d = (x1 - x0) / n
+    c = x0 + (np.arange(n) + 0.5) * d
+    X, Y = np.meshgrid(c, c, indexing="xy")        # X fastest (i), Y (j)
+    r = np.sqrt(X**2 + Y**2)
+    b = 0.20 * np.exp(-(r**2) / (2 * 0.20**2))
+    h = np.maximum(np.where(r < 1.0, 0.34 - b, 0.015), 0.015)
+    bed = out / "bed2d.raw"; dep = out / "depth2d.raw"
+    b.astype(np.float64).ravel(order="C").tofile(bed)   # j-major rows of length n
+    h.astype(np.float64).ravel(order="C").tofile(dep)
+    return {"nx": n, "ny": n, "prob_lo": (x0, x0), "prob_hi": (x1, x1),
+            "dem_file": str(bed), "release_file": str(dep)}
+
+
+def write_chorin_inputs_2d(path, geom, tend, cfl, plot_dt, pin_comp,
+                           max_level=0, ref_ratio=2, g=9.81, rho=1.0):
+    """2-D radial-bump inputs: no inflow (circular dam-break); the non-hydrostatic
+    pressure modes are Dirichlet-pinned to 0 on ALL boundaries (symmetric far-field
+    reference for the elliptic solve).  AMR via amr.max_level (refine on the front /
+    bed).  pin_comp = the pressure state slots (e2s of the pressure sub-model)."""
+    nx, ny = geom["nx"], geom["ny"]
+    gx0, gy0 = geom["prob_lo"]; gx1, gy1 = geom["prob_hi"]
+    bf = 8 if max_level > 0 else 1
+    path.write_text(f"""amr.max_level     = {max_level}
+amr.n_cell        = {nx} {ny}
+amr.max_grid_size = 64
+amr.blocking_factor = {bf}
+amr.ref_ratio     = {ref_ratio}
+amr.regrid_int    = 2
+geometry.prob_lo  = {gx0} {gy0}
+geometry.prob_hi  = {gx1} {gy1}
+geometry.is_periodic = 0 0
+init.dem_file     = {geom['dem_file']}
+init.release_file = {geom['release_file']}
+pin.comp = {pin_comp[0]} {pin_comp[1]}
+pin.val  = 0.0 0.0
+pin.all  = 1
+params.g = {g}
+params.rho = {rho}
+params.nu = 0.0
+params.lambda_s = 0.0
+solver.time_end = {tend}
+solver.cfl      = {cfl}
+output.plot_dt_interval = {plot_dt}
+tagging.threshold = 0.02
+""")
+
+
 def write_chorin_inputs(path, geom, tend, cfl, plot_dt, inflow_q_U0,
                         g=9.81, rho=1.0):
     """inputs for chorin_main.cpp.  Matches run_derived.py exactly:
@@ -266,28 +321,41 @@ def build_vam(a):
         shutil.copy2(SRC / name, src / name)
     (src / "Make.package").write_text(CHORIN_MAKE_PACKAGE)
 
-    # printed split headers — IDENTICAL construction to the numpy reference
-    # thesis/cases/escalante_vam_bump/run_derived.py (verified term-by-term equal:
-    # same state, same SM_pred/press/corr operators).  dt passed explicitly so the
+    # printed split headers.  1-D (dimension=2) is the Escalante line case;
+    # dimension=3 is the 2-D horizontal radial case — SAME generic driver, the
+    # printer emits the extra q_y moments + ∂_y aux (state grows to 10). Verified
+    # term-by-term equal to run_derived.py in 1-D. dt passed explicitly so the
     # printer's DT_SYMBOL maps to p(last).
-    model = VAM(level=1, dimension=2, closures=[Newtonian(), StressFree()])
+    dim = 3 if a.vam2d else 2
+    model = VAM(level=1, dimension=dim, closures=[Newtonian(), StressFree()])
     split = model.chorin_split(sp.Symbol("dt", positive=True),
                                system_model=model.system_model)
     write_chorin_headers(split, src)
-    print(f"generated chorin headers: state={[str(s) for s in split.SM_pred.state]}")
+    state = [str(s) for s in split.SM_pred.state]
+    print(f"generated chorin headers (dim={dim}): state={state}")
 
     # case rasters + inputs (the only case-specific code)
-    geom = prepare_escalante_rasters(str(bdir / "raster"))
     amrex_home = os.environ.get("AMREX_HOME", "/opt/amrex")
     (ex / "GNUmakefile").write_text(
         GNUMAKEFILE.format(amrex_home=amrex_home, dim=2,
                            use_mpi="FALSE" if a.gpu else "TRUE",
                            use_cuda="TRUE" if a.gpu else "FALSE",
                            cuda_arch=a.cuda_arch))
-    write_chorin_inputs(ex / "inputs", geom, tend=a.tend, cfl=a.cfl,
-                        plot_dt=a.plot_dt, inflow_q_U0=geom["inflow_q_U0"])
-    print(f"escalante raster {geom['nx']}x{geom['ny']} "
-          f"x=({geom['prob_lo'][0]},{geom['prob_hi'][0]}) q_in={geom['inflow_q_U0']}")
+    if a.vam2d:
+        geom = prepare_radial_rasters(str(bdir / "raster"), n=a.ncell)
+        pin_comp = [state.index("P_0"), state.index("P_1")]   # pressure slots
+        write_chorin_inputs_2d(ex / "inputs", geom, tend=a.tend, cfl=a.cfl,
+                               plot_dt=a.plot_dt, pin_comp=pin_comp,
+                               max_level=a.max_level, ref_ratio=a.ref_ratio)
+        print(f"radial raster {geom['nx']}x{geom['ny']} on "
+              f"[{geom['prob_lo'][0]},{geom['prob_hi'][0]}]^2 pin={pin_comp} "
+              f"max_level={a.max_level}")
+    else:
+        geom = prepare_escalante_rasters(str(bdir / "raster"))
+        write_chorin_inputs(ex / "inputs", geom, tend=a.tend, cfl=a.cfl,
+                            plot_dt=a.plot_dt, inflow_q_U0=geom["inflow_q_U0"])
+        print(f"escalante raster {geom['nx']}x{geom['ny']} "
+              f"x=({geom['prob_lo'][0]},{geom['prob_hi'][0]}) q_in={geom['inflow_q_U0']}")
 
     if a.make:
         n = os.cpu_count() or 4
@@ -308,6 +376,11 @@ def main():
                     help="build the generic Chorin pressure-projection driver "
                          "(chorin_main.cpp) from VAM(level=1).chorin_split + run "
                          "the Escalante dam-break-over-bump verification case")
+    ap.add_argument("--vam2d", action="store_true",
+                    help="2-D horizontal radial extension: VAM(level=1,dimension=3) "
+                         "on a Cartesian grid, circular dam-break over a radial bump "
+                         "(implies --vam; use --ncell N for an N×N grid, --max-level "
+                         "for AMR)")
     ap.add_argument("--model", default="SWE")
     ap.add_argument("--dim", type=int, default=2,
                     help="model dimension (SWE: horizontal=2; SME: total=3 for 2-D)")
@@ -359,7 +432,7 @@ def main():
 
     from zoomy_amrex.transformation import generate_headers
 
-    if a.vam:
+    if a.vam or a.vam2d:
         return build_vam(a)
 
     geom = dem_file = release_file = None

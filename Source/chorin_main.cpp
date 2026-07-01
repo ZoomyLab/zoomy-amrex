@@ -102,10 +102,11 @@ struct BCInfo {
     int n_in = 0;
     std::vector<int> comp;       // state slots to prescribe at x-lo (inflow)
     std::vector<Real> val;
-    int n_pin = 0;               // state slots Dirichlet-pinned at x-hi (e.g. P=0)
+    int n_pin = 0;               // state slots Dirichlet-pinned (e.g. P=0)
     std::vector<int> pin_comp;   // -> the Chorin pressure reference
     std::vector<Real> pin_val;
-};
+    int pin_all = 0;             // 0: pin at x-hi only; 1: pin on ALL boundaries
+};                               //    (symmetric far-field ref for radial cases)
 static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
 {
     Q.FillBoundary(geom.periodicity());
@@ -116,7 +117,7 @@ static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
         const Box& gbx = mfi.growntilebox(Q.nGrow());
         auto a = Q.array(mfi);
         const int ncomp = NS;
-        const int nin = bc.n_in, npin = bc.n_pin;
+        const int nin = bc.n_in, npin = bc.n_pin, pinall = bc.pin_all;
         int  ic[16]; Real iv[16]; int pc[16]; Real pv[16];
         for (int m = 0; m < nin  && m < 16; ++m) { ic[m] = bc.comp[m];     iv[m] = bc.val[m]; }
         for (int m = 0; m < npin && m < 16; ++m) { pc[m] = bc.pin_comp[m]; pv[m] = bc.pin_val[m]; }
@@ -127,8 +128,9 @@ static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
             for (int n = 0; n < ncomp; ++n) a(i, j, 0, n) = a(ii, jj, 0, n);  // zeroGrad
             if (i < ilo)                                    // x-lo inflow override
                 for (int m = 0; m < nin; ++m) a(i, j, 0, ic[m]) = iv[m];
-            if (i > ihi)                                    // x-hi Dirichlet pin
-                for (int m = 0; m < npin; ++m)              //   ghost = 2*val - edge
+            const bool do_pin = pinall ? true : (i > ihi);  // all faces, or x-hi only
+            if (do_pin)                                     // Dirichlet pin ghost = 2*val-edge
+                for (int m = 0; m < npin; ++m)
                     a(i, j, 0, pc[m]) = 2.0*pv[m] - a(ii, jj, 0, pc[m]);
         });
     }
@@ -261,9 +263,10 @@ int main(int argc, char* argv[])
     { ParmParse pp("inflow"); Vector<int> c; Vector<Real> v;
       if (pp.queryarr("comp", c)) { pp.getarr("val", v); bc.n_in = c.size();
           bc.comp.assign(c.begin(), c.end()); bc.val.assign(v.begin(), v.end()); } }
-    { ParmParse pp("pin"); Vector<int> c; Vector<Real> v;       // x-hi Dirichlet pin
+    { ParmParse pp("pin"); Vector<int> c; Vector<Real> v;       // Dirichlet pressure pin
       if (pp.queryarr("comp", c)) { pp.getarr("val", v); bc.n_pin = c.size();
-          bc.pin_comp.assign(c.begin(), c.end()); bc.pin_val.assign(v.begin(), v.end()); } }
+          bc.pin_comp.assign(c.begin(), c.end()); bc.pin_val.assign(v.begin(), v.end()); }
+      pp.query("all", bc.pin_all); }
 
 
     // ── predictor explicit RHS (Rusanov flux + NCP + source) on e2s rows ────
@@ -380,12 +383,18 @@ int main(int argc, char* argv[])
                 for (int n=0;n<ModelPred::n_dof_eq;++n) q(n,0)=Qa(i,j,0,ModelPred::e2s[n]);
                 for (int n=0;n<ModelPred::n_dof_qaux;++n) a(n,0)=Aa(i,j,0,n);
                 SmallMatrix<Real,ModelPred::dimension,1> nx{}; nx(0,0)=1.0;
-                auto ev = NumericsPred::local_max_abs_eigenvalue(q,a,P,nx);
-                if (ev(0,0)>maxev) maxev=ev(0,0);
+                Real ex = NumericsPred::local_max_abs_eigenvalue(q,a,P,nx)(0,0);
+                Real inv = ex/dx;
+                if constexpr (ModelPred::dimension >= 2) {      // y-direction wavespeed
+                    SmallMatrix<Real,ModelPred::dimension,1> ny{}; ny(1,0)=1.0;
+                    Real ey = NumericsPred::local_max_abs_eigenvalue(q,a,P,ny)(0,0);
+                    inv = amrex::max(inv, ey/dy);
+                }
+                if (inv>maxev) maxev=inv;                       // maxev := max |λ|/Δ
             });
         }
         ParallelDescriptor::ReduceRealMax(maxev);
-        return (maxev>1e-14) ? cfl*amrex::min(dx,dy)/maxev : 1e-3;
+        return (maxev>1e-14) ? cfl/maxev : 1e-3;
     };
 
     // ── time loop ───────────────────────────────────────────────────────────
@@ -411,25 +420,29 @@ int main(int argc, char* argv[])
     writeplt();
     Print() << "chorin done: steps="<<step<<" t="<<time<<"\n";
 
-    // convenience: 1-D ASCII profile (x + all state slots) for verification
-    // plots without an AMReX plotfile reader (single-rank gather along j=jmid).
+    // convenience: ASCII dump (x [y] + all state slots) for verification plots
+    // without an AMReX plotfile reader.  1-D grid -> the j=jmid ray (profile.dat);
+    // 2-D grid -> the full field, all cells (field.dat, for radial-symmetry checks).
     {
         fillBC(Q, geom, bc);
         const int jmid = (domain.smallEnd(1)+domain.bigEnd(1))/2;
-        FILE* fp = (ParallelDescriptor::IOProcessor()) ? std::fopen("profile.dat","w") : nullptr;
-        if (fp) { std::fprintf(fp, "# x"); for (int n=0;n<NS;++n) std::fprintf(fp," var%d",n);
-                  std::fprintf(fp,"\n"); }
+        const bool twoD = (domain.length(1) > 1);
+        FILE* fp = (ParallelDescriptor::IOProcessor())
+                       ? std::fopen(twoD ? "field.dat" : "profile.dat", "w") : nullptr;
+        if (fp) { std::fprintf(fp, "# x%s", twoD ? " y" : "");
+                  for (int n=0;n<NS;++n) std::fprintf(fp," var%d",n); std::fprintf(fp,"\n"); }
         for (MFIter mfi(Q); mfi.isValid(); ++mfi) {
             const Box& bx = mfi.validbox(); auto a = Q.const_array(mfi);
             LoopOnCpu(bx, [&](int i,int j,int k){
-                if (j!=jmid || !fp) return;
+                if (!fp || (!twoD && j!=jmid)) return;
                 Real x = geom.ProbLo(0) + (i+0.5)*dx;
                 std::fprintf(fp, "%.10g", x);
+                if (twoD) std::fprintf(fp, " %.10g", geom.ProbLo(1) + (j+0.5)*dy);
                 for (int n=0;n<NS;++n) std::fprintf(fp, " %.10g", a(i,j,0,n));
                 std::fprintf(fp, "\n");
             });
         }
-        if (fp) { std::fclose(fp); Print() << "wrote profile.dat\n"; }
+        if (fp) { std::fclose(fp); Print() << "wrote " << (twoD?"field.dat":"profile.dat") << "\n"; }
     }
     }
     amrex::Finalize();
