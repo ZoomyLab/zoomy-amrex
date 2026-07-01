@@ -30,6 +30,8 @@
 #include <AMReX.H>
 #include <AMReX_MultiFab.H>
 #include <AMReX_GMRES.H>
+#include <AMReX_MLPoisson.H>
+#include <AMReX_MLMG.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_PlotFileUtil.H>
@@ -38,6 +40,7 @@
 #include <string>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 
 #include "ModelPred.H"
 #include "NumericsPred.H"
@@ -190,6 +193,28 @@ struct ChorinPressOp {
     const BCInfo* bc=nullptr; const std::vector<Real>* pv=nullptr;
     const MultiFab* R0=nullptr; Real dx=0, dy=0;
     BoxArray ba; DistributionMapping dm;
+    int ptype = 0;              // 0 identity, 1 Jacobi, 2 multigrid, 3 block-Jacobi
+    MultiFab Dinv;             // 1/diag(A) for Jacobi (rebuilt per solve)
+    MultiFab Binv;             // per-cell NP×NP inverse mode-block (coupling-aware)
+    Real mgscale[8] = {0};     // per-mode  1/c  so  c·∇² ≈ A  (from the diagonal)
+    Real mgsign = 1.0;         // MLPoisson sign convention (−∇² vs ∇²): flip if needed
+    int mg_vcycles = 4;
+    std::unique_ptr<amrex::MLPoisson> mlp;   // scalar-Poisson MG preconditioner
+    Box domain;
+
+    void setupMG() {
+        amrex::LPInfo info; info.setAgglomeration(true).setConsolidation(true);
+        mlp = std::make_unique<amrex::MLPoisson>(
+            amrex::Vector<amrex::Geometry>{*geom}, amrex::Vector<amrex::BoxArray>{ba},
+            amrex::Vector<amrex::DistributionMapping>{dm}, info);
+        mlp->setMaxOrder(2);
+        mlp->setDomainBC({AMREX_D_DECL(amrex::LinOpBCType::Dirichlet,   // P pinned = 0
+                                       amrex::LinOpBCType::Dirichlet,
+                                       amrex::LinOpBCType::Dirichlet)},
+                         {AMREX_D_DECL(amrex::LinOpBCType::Dirichlet,
+                                       amrex::LinOpBCType::Dirichlet,
+                                       amrex::LinOpBCType::Dirichlet)});
+    }
 
     MultiFab makeVecRHS() const { return MultiFab(ba, dm, NP, 0); }
     MultiFab makeVecLHS() const { return MultiFab(ba, dm, NP, 0); }
@@ -200,11 +225,104 @@ struct ChorinPressOp {
     RT norm2(MultiFab const& v) { return std::sqrt(MultiFab::Dot(v,0,v,0,NP,0)); }
     void scale(MultiFab& v, RT f) { v.mult(f,0,NP,0); }
     void setToZero(MultiFab& v) { v.setVal(0.0); }
-    void precond(MultiFab& l, MultiFab const& r) { MultiFab::Copy(l,r,0,0,NP,0); }
     void apply(MultiFab& Ax, MultiFab const& x) {
         scatterP(*Q, x);
         pressSource(*Q, *Aqs, *geom, *bc, *pv, dx, dy, Ax);   // Ax = source(x)
         MultiFab::Subtract(Ax, *R0, 0, 0, NP, 0);             // A·x = source(x) - R0
+    }
+    // M⁻¹ r : identity (0), Jacobi diagonal (1), or per-mode Poisson MG V-cycles (2)
+    void precond(MultiFab& l, MultiFab const& r) {
+        if (ptype == 1) {
+            MultiFab::Copy(l,r,0,0,NP,0); MultiFab::Multiply(l,Dinv,0,0,NP,0);
+        } else if (ptype == 2) {
+            if (!mlp) setupMG();
+            MultiFab rmf(ba,dm,1,0), phi(ba,dm,1,1);
+            for (int m=0;m<NP;++m) {
+                MultiFab::Copy(rmf, r, m, 0, 1, 0);
+                phi.setVal(0.0); mlp->setLevelBC(0, &phi);   // homogeneous Dirichlet
+                amrex::MLMG mlmg(*mlp);
+                mlmg.setVerbose(0); mlmg.setBottomVerbose(0);
+                mlmg.setFixedIter(mg_vcycles);               // K V-cycles as preconditioner
+                mlmg.solve({&phi}, {&rmf}, 1.e-10, 0.0);     // ∇²φ = r_m
+                MultiFab::Copy(l, phi, 0, m, 1, 0);
+                l.mult(mgscale[m], m, 1, 0);                 // A⁻¹ ≈ (1/c)(∇²)⁻¹
+            }
+        } else if (ptype == 3) {                             // point-block-Jacobi
+            for (MFIter mfi(l); mfi.isValid(); ++mfi) {
+                const Box& bx=mfi.validbox();
+                auto la=l.array(mfi); auto ra=r.const_array(mfi); auto bi=Binv.const_array(mfi);
+                ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                    for (int mo=0;mo<NP;++mo){ Real s=0.0;
+                        for (int mc=0;mc<NP;++mc) s += bi(i,j,0,mo*NP+mc)*ra(i,j,0,mc);
+                        la(i,j,0,mo)=s; }
+                });
+            }
+        } else {
+            MultiFab::Copy(l,r,0,0,NP,0);
+        }
+    }
+    // Extract diag(A) matrix-free by a 9-colour (i%3,j%3) × NP-mode probe: exact
+    // for the 5-point (radius-1) pressure stencil.  Rebuilt each solve (depth-
+    // dependent).  ~9·NP matvecs; amortised by the GMRES-iteration cut.
+    void buildDiagonal() {
+        if (ptype < 1) return;
+        if (!Dinv.ok()) Dinv.define(ba, dm, NP, 0);
+        if (ptype==3 && !Binv.ok()) Binv.define(ba, dm, NP*NP, 0);
+        MultiFab diag(ba,dm,NP,0), probe(ba,dm,NP,0), Ap(ba,dm,NP,0);
+        MultiFab Ablk; if (ptype==3) Ablk.define(ba,dm,NP*NP,0);
+        diag.setVal(0.0);
+        const int ilo=domain.smallEnd(0), jlo=domain.smallEnd(1);
+        const int pt=ptype;
+        for (int mc=0;mc<NP;++mc) for (int cx=0;cx<3;++cx) for (int cy=0;cy<3;++cy) {
+            probe.setVal(0.0);
+            for (MFIter mfi(probe); mfi.isValid(); ++mfi) {
+                const Box& bx=mfi.validbox(); auto pa=probe.array(mfi);
+                ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                    if (((i-ilo)%3)==cx && ((j-jlo)%3)==cy) pa(i,j,0,mc)=1.0; });
+            }
+            apply(Ap, probe);                                // A·e_colour (column mc)
+            auto* blk = (pt==3) ? &Ablk : nullptr;
+            for (MFIter mfi(diag); mfi.isValid(); ++mfi) {
+                const Box& bx=mfi.validbox(); auto da=diag.array(mfi); auto aa=Ap.const_array(mfi);
+                auto ba_= (pt==3)?blk->array(mfi):Array4<Real>{};
+                ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                    if (((i-ilo)%3)!=cx || ((j-jlo)%3)!=cy) return;
+                    da(i,j,0,mc)=aa(i,j,0,mc);               // diagonal (mc,mc)
+                    if (pt==3) for (int mo=0;mo<NP;++mo) ba_(i,j,0,mo*NP+mc)=aa(i,j,0,mo);
+                });
+            }
+        }
+        for (MFIter mfi(Dinv); mfi.isValid(); ++mfi) {       // Dinv = 1/diag (guarded)
+            const Box& bx=mfi.validbox(); auto di=Dinv.array(mfi); auto da=diag.const_array(mfi);
+            ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                for (int m=0;m<NP;++m){ Real d=da(i,j,0,m); di(i,j,0,m)=(std::abs(d)>1e-30)?1.0/d:1.0; } });
+        }
+        if (ptype==3) {                                      // invert the NP×NP block per cell
+            for (MFIter mfi(Binv); mfi.isValid(); ++mfi) {
+                const Box& bx=mfi.validbox(); auto bi=Binv.array(mfi); auto ab=Ablk.const_array(mfi);
+                ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                    Real A[NP*NP], I[NP*NP];
+                    for (int e=0;e<NP*NP;++e){ A[e]=ab(i,j,0,e); I[e]=0.0; }
+                    for (int d=0;d<NP;++d) I[d*NP+d]=1.0;
+                    for (int col=0;col<NP;++col){         // Gauss-Jordan (NP small)
+                        Real piv=A[col*NP+col]; if (std::abs(piv)<1e-30) piv=1e-30;
+                        Real ip=1.0/piv;
+                        for (int c=0;c<NP;++c){ A[col*NP+c]*=ip; I[col*NP+c]*=ip; }
+                        for (int r=0;r<NP;++r){ if(r==col) continue; Real f=A[r*NP+col];
+                            for (int c=0;c<NP;++c){ A[r*NP+c]-=f*A[col*NP+c]; I[r*NP+c]-=f*I[col*NP+c]; } }
+                    }
+                    for (int e=0;e<NP*NP;++e) bi(i,j,0,e)=I[e];
+                });
+            }
+        }
+        if (ptype == 2) {                                    // per-mode Laplacian scale
+            const Real ldiag = -2.0/(dx*dx) - 2.0/(dy*dy);   // ∇² discrete diagonal
+            const Real ncell = Real(domain.numPts());
+            for (int m=0;m<NP;++m) {
+                Real meandiag = diag.sum(m) / ncell;         // mean diag(A) for mode m
+                mgscale[m] = mgsign * ((std::abs(meandiag)>1e-30) ? ldiag/meandiag : 1.0);
+            }
+        }
     }
 };
 
@@ -326,11 +444,19 @@ int main(int argc, char* argv[])
     // Dimension/mode-agnostic (option 2): scales to 2-D/3-D moment systems &
     // ML-VAM with no per-model code — MG/Krylov in space, block over the modes.
     MultiFab Pmf(ba, dm, NP, 0), R0(ba, dm, NP, 0), rhs(ba, dm, NP, 0);
+    int precond_type = 0, mg_vcycles = 4;
+    Real mg_sign = 1.0;
+    { ParmParse pp("precond"); pp.query("type", precond_type); pp.query("vcycles", mg_vcycles);
+      pp.query("mgsign", mg_sign); }
     ChorinPressOp op;
     op.Q=&Q; op.Aqs=&Aqs; op.geom=&geom; op.bc=&bc; op.pv=&pPress;
     op.R0=&R0; op.dx=dx; op.dy=dy; op.ba=ba; op.dm=dm;
+    op.ptype=precond_type; op.domain=domain; op.mg_vcycles=mg_vcycles; op.mgsign=mg_sign;
+    int gmres_restart = 30;
+    { ParmParse pp("gmres"); pp.query("restart", gmres_restart); }
     GMRES<MultiFab, ChorinPressOp> gmres;
-    gmres.define(op); gmres.setVerbose(0);
+    gmres.define(op); gmres.setVerbose(0); gmres.setRestartLength(gmres_restart);
+    long presIters = 0, presSolves = 0;                      // iteration accounting
     auto solvePressure = [&](Real dt) {
         setdt(pPress, dt);
         // frozen input_aux: derivatives of the (predictor-updated) state — once
@@ -340,9 +466,11 @@ int main(int argc, char* argv[])
         Pmf.setVal(0.0);                                     // R0 = source(P=0)
         scatterP(Q, Pmf);
         pressSource(Q, Aqs, geom, bc, pPress, dx, dy, R0);
+        op.buildDiagonal();                                  // Jacobi setup (ptype 1)
         MultiFab::Copy(rhs, R0, 0, 0, NP, 0); rhs.mult(-1.0, 0, NP, 0);   // rhs = -R0
         Pmf.setVal(0.0);
         gmres.solve(Pmf, rhs, 1e-10, 0.0);                   // A·P = -R0
+        presIters += gmres.getNumIters(); ++presSolves;
         scatterP(Q, Pmf);
         fillBC(Q, geom, bc);
     };
@@ -418,7 +546,9 @@ int main(int argc, char* argv[])
         if (time >= next_plot) { writeplt(); next_plot += plot_dt; }
     }
     writeplt();
-    Print() << "chorin done: steps="<<step<<" t="<<time<<"\n";
+    Print() << "chorin done: steps="<<step<<" t="<<time
+            << "  pressure GMRES: "<<presSolves<<" solves, avg "
+            << (presSolves? double(presIters)/presSolves : 0.0) <<" iters/solve\n";
 
     // convenience: ASCII dump (x [y] + all state slots) for verification plots
     // without an AMReX plotfile reader.  1-D grid -> the j=jmid ray (profile.dat);

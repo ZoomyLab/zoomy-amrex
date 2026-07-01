@@ -258,6 +258,7 @@ init.release_file = {geom['release_file']}
 pin.comp = {pin_comp[0]} {pin_comp[1]}
 pin.val  = 0.0 0.0
 pin.all  = 1
+precond.type = 3
 params.g = {g}
 params.rho = {rho}
 params.nu = 0.0
