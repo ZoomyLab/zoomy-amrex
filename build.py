@@ -182,16 +182,18 @@ tagging.threshold      = 0.02
 """)
 
 
-CHORIN_MAKE_PACKAGE = """CEXE_sources += chorin_main.cpp
-CEXE_sources += init_solution.cpp
-
-CEXE_headers += constants.H
+_CHORIN_HEADERS = """CEXE_headers += constants.H
+CEXE_headers += chorin_common.H
 CEXE_headers += ModelPred.H
 CEXE_headers += ModelPress.H
 CEXE_headers += ModelCorr.H
 CEXE_headers += NumericsPred.H
 CEXE_headers += UserFunctions.H
 """
+CHORIN_MAKE_PACKAGE = ("CEXE_sources += chorin_main.cpp\n"
+                       "CEXE_sources += init_solution.cpp\n\n" + _CHORIN_HEADERS)
+CHORIN_AMR_MAKE_PACKAGE = ("CEXE_sources += chorin_amr.cpp\n"
+                           "CEXE_sources += init_solution.cpp\n\n" + _CHORIN_HEADERS)
 
 
 def prepare_escalante_rasters(out_dir, n_inner=60, domain=(-1.5, 1.5)):
@@ -317,10 +319,13 @@ def build_vam(a):
     src.mkdir(parents=True, exist_ok=True); ex.mkdir(parents=True, exist_ok=True)
 
     # stage ONLY the chorin driver + raster loader (NOT main.cpp/ZoomyAmr.cpp,
-    # which carry a second main() and need the SWE Model.H).
-    for name in ("chorin_main.cpp", "init_solution.cpp", "constants.H"):
+    # which carry a second main() and need the SWE Model.H). --amr swaps the
+    # single-level driver for the AmrCore multi-level one (chorin_amr.cpp).
+    driver = "chorin_amr.cpp" if a.amr else "chorin_main.cpp"
+    for name in (driver, "chorin_common.H", "init_solution.cpp", "constants.H"):
         shutil.copy2(SRC / name, src / name)
-    (src / "Make.package").write_text(CHORIN_MAKE_PACKAGE)
+    (src / "Make.package").write_text(
+        CHORIN_AMR_MAKE_PACKAGE if a.amr else CHORIN_MAKE_PACKAGE)
 
     # printed split headers.  1-D (dimension=2) is the Escalante line case;
     # dimension=3 is the 2-D horizontal radial case — SAME generic driver, the
@@ -382,6 +387,9 @@ def main():
                          "on a Cartesian grid, circular dam-break over a radial bump "
                          "(implies --vam; use --ncell N for an N×N grid, --max-level "
                          "for AMR)")
+    ap.add_argument("--amr", action="store_true",
+                    help="use the AmrCore multi-level Chorin driver (chorin_amr.cpp); "
+                         "combine with --vam2d --max-level L")
     ap.add_argument("--model", default="SWE")
     ap.add_argument("--dim", type=int, default=2,
                     help="model dimension (SWE: horizontal=2; SME: total=3 for 2-D)")
