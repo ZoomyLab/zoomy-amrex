@@ -455,9 +455,44 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         blocks.append(self._kernel("aux_boundary_conditions", abc_expr, (na, 1),
                                    ("bc_idx", "Q", "Qaux", "n", "X", "time", "dX")))
 
+        # Chorin pressure operator (REQ-94): explicit affine coefficients of the
+        # pressure system  A·P = RHS,  A = A0 + Ax∂x + Ay∂y + Axx∂xx + Ayy∂yy.
+        # Emitted ONLY on the pressure sub-model (SM_press carries pressure_operator);
+        # lets the C++ driver assemble MLABecLaplacian (β from Axx/Ayy) + a block
+        # smoother (A0) analytically instead of probing the matrix-free residual.
+        po = getattr(sm, "pressure_operator", None)
+        if po is not None:
+            try:
+                op = po()
+            except Exception:
+                op = None
+            if op is not None:
+                blocks.extend(self._pressure_op_kernels(op))
+
         blocks.append(self._chorin_meta())
         blocks.append("};\n")
         return "\n".join(blocks)
+
+    def _pressure_op_kernels(self, op):
+        """Emit pressure_{A0,Axx,Ayy,Ax,Ay} (NP×NP row-major) + pressure_rhs (NP)
+        as device functions of (Q, Qaux, p); coefficients are the frozen-state
+        fields from SM_press.pressure_operator() (REQ-94)."""
+        import sympy as sp
+        NP = len(op.P_modes)
+        def flat(M):
+            if M is None: return [sp.Integer(0)] * (NP * NP)
+            return [sp.sympify(M[k][l]) for k in range(NP) for l in range(NP)]
+        out = []
+        for name, M in (("pressure_A0", op.A0), ("pressure_Axx", op.Axx),
+                        ("pressure_Ayy", op.Ayy), ("pressure_Ax", op.Ax),
+                        ("pressure_Ay", op.Ay)):
+            out.append(self._kernel(name, self._vec(flat(M)), (NP * NP, 1),
+                                    ("Q", "Qaux", "p")))
+        rhs = [sp.sympify(op.RHS[k]) for k in range(NP)]
+        out.append(self._kernel("pressure_rhs", self._vec(rhs), (NP, 1),
+                                ("Q", "Qaux", "p")))
+        out.append(f"    static constexpr int n_press = {NP};")
+        return out
 
     def _chorin_meta(self):
         """Static metadata the Chorin C++ driver needs: which state rows this

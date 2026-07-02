@@ -31,7 +31,9 @@
 #include <AMReX_MultiFab.H>
 #include <AMReX_GMRES.H>
 #include <AMReX_MLPoisson.H>
+#include <AMReX_MLABecLaplacian.H>
 #include <AMReX_MLMG.H>
+#include <AMReX_MultiFabUtil.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_PlotFileUtil.H>
@@ -257,8 +259,85 @@ struct ChorinPressOp {
                         la(i,j,0,mo)=s; }
                 });
             }
+        } else if (ptype == 4) {                             // block-diagonal MG
+            MultiFab rmf(ba,dm,1,0), phi(ba,dm,1,1);
+            for (int m=0;m<NP;++m) {
+                MultiFab::Copy(rmf, r, m, 0, 1, 0);
+                phi.setVal(0.0); Dk[m]->setLevelBC(0, &phi);
+                amrex::MLMG mlmg(*Dk[m]);
+                mlmg.setVerbose(0); mlmg.setBottomVerbose(0);
+                mlmg.setFixedIter(mg_vcycles);
+                mlmg.solve({&phi}, {&rmf}, 1.e-10, 0.0);     // D_m φ = r_m
+                MultiFab::Copy(l, phi, 0, m, 1, 0);
+            }
         } else {
             MultiFab::Copy(l,r,0,0,NP,0);
+        }
+    }
+    // block-diagonal MG (ptype 4): one MLABecLaplacian per mode,
+    // D_m = a·A0[m][m] − ∇·(β∇),  β_x=−Axx[m][m], β_y=−Ayy[m][m] (analytic REQ-94
+    // coefficients). Reaction+anisotropic diffusion = the true diagonal block; the
+    // off-diagonal mode coupling is left to the outer GMRES.
+    std::vector<std::unique_ptr<amrex::MLABecLaplacian>> Dk;
+    void setupBlockMG() {
+        amrex::LPInfo info; info.setAgglomeration(true).setConsolidation(true);
+        Dk.clear();
+        for (int m=0;m<NP;++m) {
+            auto op = std::make_unique<amrex::MLABecLaplacian>(
+                amrex::Vector<amrex::Geometry>{*geom}, amrex::Vector<amrex::BoxArray>{ba},
+                amrex::Vector<amrex::DistributionMapping>{dm}, info);
+            op->setMaxOrder(2);
+            op->setDomainBC({AMREX_D_DECL(amrex::LinOpBCType::Dirichlet,
+                                          amrex::LinOpBCType::Dirichlet,
+                                          amrex::LinOpBCType::Dirichlet)},
+                            {AMREX_D_DECL(amrex::LinOpBCType::Dirichlet,
+                                          amrex::LinOpBCType::Dirichlet,
+                                          amrex::LinOpBCType::Dirichlet)});
+            op->setScalars(1.0, 1.0);
+            Dk.push_back(std::move(op));
+        }
+    }
+    void assembleBlockMG() {
+        if (Dk.empty()) setupBlockMG();
+        auto P = packp<ModelPress::n_parameters>(*pv);
+        MultiFab acc(ba,dm,NP,0), cxx(ba,dm,NP,1), cyy(ba,dm,NP,1);
+        for (MFIter mfi(acc); mfi.isValid(); ++mfi) {
+            const Box& bx=mfi.validbox();
+            auto qa=Q->const_array(mfi); auto aa=Aqs->const_array(mfi);
+            auto ac=acc.array(mfi); auto bx_=cxx.array(mfi); auto by_=cyy.array(mfi);
+            ParallelFor(bx, [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                SmallMatrix<Real,NS,1> q;
+                SmallMatrix<Real,std::max(ModelPress::n_dof_qaux,1),1> a;
+                for (int n=0;n<NS;++n) q(n,0)=qa(i,j,0,n);
+                for (int n=0;n<ModelPress::n_dof_qaux;++n) a(n,0)=aa(i,j,0,n);
+                auto A0=ModelPress::pressure_A0(q,a,P);
+                auto Axx=ModelPress::pressure_Axx(q,a,P);
+                auto Ayy=ModelPress::pressure_Ayy(q,a,P);
+                for (int m=0;m<NP;++m){                 // clamp ≥0 for an SPD
+                    ac(i,j,0,m)=amrex::max(A0(m*NP+m,0), 0.0);   // preconditioner operator
+                    bx_(i,j,0,m)=amrex::max(-Axx(m*NP+m,0), 1e-30);
+                    by_(i,j,0,m)=amrex::max(-Ayy(m*NP+m,0), 0.0); // 0 for 1-horizontal
+                }
+            });
+        }
+        cxx.FillBoundary(geom->periodicity()); cyy.FillBoundary(geom->periodicity());
+        for (int m=0;m<NP;++m) {
+            MultiFab am(ba,dm,1,0); MultiFab::Copy(am,acc,m,0,1,0);
+            Dk[m]->setACoeffs(0, am);
+            Array<MultiFab,AMREX_SPACEDIM> face;
+            for (int d=0;d<AMREX_SPACEDIM;++d)
+                face[d].define(amrex::convert(ba, IntVect::TheDimensionVector(d)), dm, 1, 0);
+            for (MFIter mfi(am); mfi.isValid(); ++mfi) {
+                auto fx=face[0].array(mfi); auto cx=cxx.const_array(mfi);
+                ParallelFor(mfi.nodaltilebox(0), [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                    fx(i,j,0)=0.5*(cx(i-1,j,0,m)+cx(i,j,0,m)); });
+#if (AMREX_SPACEDIM >= 2)
+                auto fy=face[1].array(mfi); auto cy=cyy.const_array(mfi);
+                ParallelFor(mfi.nodaltilebox(1), [=] AMREX_GPU_DEVICE(int i,int j,int k){
+                    fy(i,j,0)=0.5*(cy(i,j-1,0,m)+cy(i,j,0,m)); });
+#endif
+            }
+            Dk[m]->setBCoeffs(0, amrex::GetArrOfConstPtrs(face));
         }
     }
     // Extract diag(A) matrix-free by a 9-colour (i%3,j%3) × NP-mode probe: exact
@@ -466,7 +545,8 @@ int main(int argc, char* argv[])
         Pmf.setVal(0.0);                                     // R0 = source(P=0)
         scatterP(Q, Pmf);
         pressSource(Q, Aqs, geom, bc, pPress, dx, dy, R0);
-        op.buildDiagonal();                                  // Jacobi setup (ptype 1)
+        op.buildDiagonal();                                  // Jacobi/block-Jacobi setup
+        if (precond_type == 4) op.assembleBlockMG();         // block-diagonal MG coeffs
         MultiFab::Copy(rhs, R0, 0, 0, NP, 0); rhs.mult(-1.0, 0, NP, 0);   // rhs = -R0
         Pmf.setVal(0.0);
         gmres.solve(Pmf, rhs, 1e-10, 0.0);                   // A·P = -R0
