@@ -88,6 +88,17 @@ int main(int argc, char* argv[])
       if (pp.queryarr("comp", c)) { pp.getarr("val", v); bc.n_pin = c.size();
           bc.pin_comp.assign(c.begin(), c.end()); bc.pin_val.assign(v.begin(), v.end()); }
       pp.query("all", bc.pin_all); }
+    // model-driven BCs: map each domain side (bc.x_lo/x_hi/y_lo/y_hi = tag names)
+    // to the model's tag index; when the model carries tags, dispatch its own
+    // boundary_conditions (inflow/wall/extrap/pressure-pin all from the model).
+    { ParmParse pp("bc"); std::string s[4];
+      pp.query("x_lo", s[0]); pp.query("x_hi", s[1]); pp.query("y_lo", s[2]); pp.query("y_hi", s[3]);
+      auto tags = ModelPred::get_boundary_tags();
+      auto tidx = [&](const std::string& nm){ for (int t=0;t<(int)tags.size();++t) if (tags[t]==nm) return t; return -1; };
+      for (int d=0; d<4; ++d) bc.side_tag[d] = s[d].empty() ? -1 : tidx(s[d]);
+      bc.params = pPred;
+      bc.model_bc = (ModelPred::n_boundary_tags > 0) &&
+                    (bc.side_tag[0]>=0||bc.side_tag[1]>=0||bc.side_tag[2]>=0||bc.side_tag[3]>=0); }
 
 
     // ── predictor explicit RHS (Rusanov flux + NCP + source) on e2s rows ────

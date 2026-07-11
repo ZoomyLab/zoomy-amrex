@@ -87,12 +87,56 @@ struct BCInfo {
     std::vector<int> pin_comp;   // -> the Chorin pressure reference
     std::vector<Real> pin_val;
     int pin_all = 0;             // 0: pin at x-hi only; 1: pin on ALL boundaries
-};                               //    (symmetric far-field ref for radial cases)
+    // ── model-driven BCs (preferred): dispatch ModelPred::boundary_conditions ──
+    bool model_bc = false;       // if true, ignore the inflow/pin fields above and
+    int side_tag[4] = {-1,-1,-1,-1};  // use the MODEL's per-tag BC. side_tag =
+    std::vector<Real> params;    //   {x-lo,x-hi,y-lo,y-hi} tag index (-1 -> zeroGrad).
+    Real time = 0.0;
+};
+// Physical-boundary ghost fill.  Preferred path (model_bc): dispatch the model's
+// own ``boundary_conditions(bc_idx, ...)`` Piecewise (inflow / wall / extrap / the
+// pressure pin all come from the MODEL, exactly like the SWE ZoomyAmr driver).
+// Fallback (no model tags): zero-gradient + the inputs-driven inflow/pin.
 static void fillBC(MultiFab& Q, const Geometry& geom, const BCInfo& bc)
 {
     Q.FillBoundary(geom.periodicity());
     const Box& dom = geom.Domain();
     const int ilo = dom.smallEnd(0), ihi = dom.bigEnd(0);
+    const int jl = dom.smallEnd(1), jh = dom.bigEnd(1);
+    if (bc.model_bc) {                                   // ── MODEL boundary_conditions
+        auto P = packp<ModelPred::n_parameters>(bc.params);
+        const int s0=bc.side_tag[0], s1=bc.side_tag[1], s2=bc.side_tag[2], s3=bc.side_tag[3];
+        const Real t = bc.time;
+        auto plo = geom.ProbLoArray(); auto dxv = geom.CellSizeArray();
+        for (MFIter mfi(Q); mfi.isValid(); ++mfi) {
+            const Box& gbx = mfi.growntilebox(Q.nGrow());
+            auto a = Q.array(mfi);
+            ParallelFor(gbx, [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                int ii = amrex::min(amrex::max(i, ilo), ihi);
+                int jj = amrex::min(amrex::max(j, jl), jh);
+                if (i == ii && j == jj) return;          // interior
+                amrex::ignore_unused(s2, s3);
+                int bc_idx = -1; SmallMatrix<Real,ModelPred::dimension,1> nh{};
+                if (i < ilo)      { bc_idx = s0; nh(0,0) = -1.0; }
+                else if (i > ihi) { bc_idx = s1; nh(0,0) =  1.0; }
+                else if constexpr (ModelPred::dimension >= 2) {
+                    if (j < jl)      { bc_idx = s2; nh(1,0) = -1.0; }
+                    else if (j > jh) { bc_idx = s3; nh(1,0) =  1.0; }
+                }
+                if (bc_idx < 0) {                        // untagged side -> zeroGrad
+                    for (int n=0;n<NS;++n) a(i,j,0,n) = a(ii,jj,0,n); return; }
+                SmallMatrix<Real,NS,1> qint;
+                for (int n=0;n<NS;++n) qint(n,0) = a(ii,jj,0,n);
+                SmallMatrix<Real,std::max(ModelPred::n_dof_qaux,1),1> aint{};
+                SmallMatrix<Real,3,1> X;
+                X(0,0)=plo[0]+(i+0.5)*dxv[0];
+                X(1,0)=(ModelPred::dimension>=2)?plo[1]+(j+0.5)*dxv[1]:0.0; X(2,0)=0.0;
+                auto qg = ModelPred::boundary_conditions(bc_idx, qint, aint, nh, X, t, dxv[0]);
+                for (int n=0;n<NS;++n) a(i,j,0,n) = qg(n,0);
+            });
+        }
+        return;
+    }
     const int jlo = dom.smallEnd(1), jhi = dom.bigEnd(1);
     for (MFIter mfi(Q); mfi.isValid(); ++mfi) {
         const Box& gbx = mfi.growntilebox(Q.nGrow());

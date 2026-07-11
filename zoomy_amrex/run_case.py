@@ -182,7 +182,8 @@ def _write_chorin_inputs(path, geom, dim, settings, pin_comp, dem, rel):
     (gx0, gy0), (gx1, gy1) = geom["prob_lo"], geom["prob_hi"]
     tend = settings.get("time_end", 1.0)
     params = settings.get("params", {})
-    inflow = settings.get("inflow")                 # {"comp":[...],"val":[...]} or None
+    bc_sides = settings.get("bc_sides")             # {"x_lo":tag, "x_hi":tag, ...} — model BCs
+    inflow = settings.get("inflow")                 # {"comp":[...],"val":[...]} — fallback
     pin_all = int(settings.get("pin_all", 0 if inflow else 1))
     max_level = int(settings.get("max_level", 0))
     lines = [f"amr.max_level     = {max_level}",
@@ -193,11 +194,16 @@ def _write_chorin_inputs(path, geom, dim, settings, pin_comp, dem, rel):
              f"geometry.prob_lo  = {gx0} {gy0}", f"geometry.prob_hi  = {gx1} {gy1}",
              "geometry.is_periodic = 0 0",
              f"init.dem_file     = {dem}", f"init.release_file = {rel}"]
-    if inflow:
-        lines += [f"inflow.comp = {' '.join(str(c) for c in inflow['comp'])}",
-                  f"inflow.val  = {' '.join(str(v) for v in inflow['val'])}"]
-    lines += [f"pin.comp = {pin_comp[0]} {pin_comp[1]}", "pin.val  = 0.0 0.0",
-              f"pin.all  = {pin_all}", "precond.type = 3",
+    if bc_sides:                                     # MODEL boundary_conditions per side
+        for side, tag in bc_sides.items():
+            lines.append(f"bc.{side} = {tag}")
+    else:                                            # fallback: inputs inflow + numerical pin
+        if inflow:
+            lines += [f"inflow.comp = {' '.join(str(c) for c in inflow['comp'])}",
+                      f"inflow.val  = {' '.join(str(v) for v in inflow['val'])}"]
+        lines += [f"pin.comp = {pin_comp[0]} {pin_comp[1]}", "pin.val  = 0.0 0.0",
+                  f"pin.all  = {pin_all}"]
+    lines += ["precond.type = 3",
               f"params.g = {params.get('g', 9.81)}", f"params.rho = {params.get('rho', 1.0)}",
               f"params.nu = {params.get('nu', 0.0)}", f"params.lambda_s = {params.get('lambda_s', 0.0)}",
               f"solver.time_end = {tend}", f"solver.cfl      = {settings.get('cfl', 0.3)}",
