@@ -177,14 +177,14 @@ def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel):
     return ex
 
 
-def _write_chorin_inputs(path, geom, dim, settings, pin_comp, dem, rel):
+def _write_chorin_inputs(path, geom, dim, settings, dem, rel):
+    """Chorin inputs.  Boundary conditions come from the MODEL (the driver maps the
+    structured faces West/East/South/North to the model's same-named tags, no
+    parameter).  So the case just puts BCs on the model — nothing BC-related here."""
     nx, ny = geom["nx"], geom["ny"]
     (gx0, gy0), (gx1, gy1) = geom["prob_lo"], geom["prob_hi"]
     tend = settings.get("time_end", 1.0)
     params = settings.get("params", {})
-    bc_sides = settings.get("bc_sides")             # {"x_lo":tag, "x_hi":tag, ...} — model BCs
-    inflow = settings.get("inflow")                 # {"comp":[...],"val":[...]} — fallback
-    pin_all = int(settings.get("pin_all", 0 if inflow else 1))
     max_level = int(settings.get("max_level", 0))
     lines = [f"amr.max_level     = {max_level}",
              f"amr.n_cell        = {nx} {ny}",
@@ -193,17 +193,8 @@ def _write_chorin_inputs(path, geom, dim, settings, pin_comp, dem, rel):
              f"amr.ref_ratio     = 2", "amr.regrid_int    = 2",
              f"geometry.prob_lo  = {gx0} {gy0}", f"geometry.prob_hi  = {gx1} {gy1}",
              "geometry.is_periodic = 0 0",
-             f"init.dem_file     = {dem}", f"init.release_file = {rel}"]
-    if bc_sides:                                     # MODEL boundary_conditions per side
-        for side, tag in bc_sides.items():
-            lines.append(f"bc.{side} = {tag}")
-    else:                                            # fallback: inputs inflow + numerical pin
-        if inflow:
-            lines += [f"inflow.comp = {' '.join(str(c) for c in inflow['comp'])}",
-                      f"inflow.val  = {' '.join(str(v) for v in inflow['val'])}"]
-        lines += [f"pin.comp = {pin_comp[0]} {pin_comp[1]}", "pin.val  = 0.0 0.0",
-                  f"pin.all  = {pin_all}"]
-    lines += ["precond.type = 3",
+             f"init.dem_file     = {dem}", f"init.release_file = {rel}",
+             "precond.type = 3",
               f"params.g = {params.get('g', 9.81)}", f"params.rho = {params.get('rho', 1.0)}",
               f"params.nu = {params.get('nu', 0.0)}", f"params.lambda_s = {params.get('lambda_s', 0.0)}",
               f"solver.time_end = {tend}", f"solver.cfl      = {settings.get('cfl', 0.3)}",
@@ -223,11 +214,9 @@ def _run_chorin(model, sm, settings, geom, dim, bdir, dem, rel):
         _bld().CHORIN_AMR_MAKE_PACKAGE if amr else _bld().CHORIN_MAKE_PACKAGE)
     split = model.chorin_split(sp.Symbol("dt", positive=True), system_model=sm)
     write_chorin_headers(split, src)
-    state = [str(s) for s in split.SM_pred.state]
-    pin_comp = [state.index("P_0"), state.index("P_1")]
     (ex / "GNUmakefile").write_text(_bld().GNUMAKEFILE.format(
         amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda="FALSE", cuda_arch="89"))
-    _write_chorin_inputs(ex / "inputs", geom, dim, settings, pin_comp, dem, rel)
+    _write_chorin_inputs(ex / "inputs", geom, dim, settings, dem, rel)
     return ex
 
 
