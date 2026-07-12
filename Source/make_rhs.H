@@ -23,8 +23,7 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
                amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1>& flux,
                amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1>& fluct, // <-- Flat 1D Vector
                bool well_balanced = false,
-               amrex::Real* hLstar = nullptr, amrex::Real* hRstar = nullptr,
-               amrex::Real wet_eps = 0.0)
+               amrex::Real* hLstar = nullptr, amrex::Real* hRstar = nullptr)
 {
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> qL, qR;
     amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> aL, aR;
@@ -80,13 +79,10 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
     if (hLstar) *hLstar = hLs;
     if (hRstar) *hRstar = hRs;
 
-    // Floor the reconstructed depth at the model's wet_dry_eps (passed in, not a
-    // driver constant). Below it the cell is dry: the model treats it that way
-    // anyway (eigenvalue gate, hinv), and flooring keeps the depth fed to
-    // update_aux_variables (hinv) non-negative so hinv stays physical (>=0).
-    // wet_eps==0 (model without a threshold) makes this a no-op.
-    qL(idx_h,0) = amrex::max(qL(idx_h,0), wet_eps);
-    qR(idx_h,0) = amrex::max(qR(idx_h,0), wet_eps);
+    // NB: the driver NEVER floors/clamps h.  Wet/dry robustness is the MODEL's job
+    // (its update_aux_variables computes hinv = 1/max(h, wet_dry_eps) and its
+    // eigenvalues gate on max(h, wet_dry_eps)); positivity is the WB reconstruction
+    // above.  The reconstructed face depth is passed through unmodified.
 
     for(int n=0; n<Model::n_dof_qaux; ++n) {
         aL(n,0) = Qaux(iL, jL, 0, n);
@@ -107,7 +103,7 @@ AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, amrex::Array4<const amrex::Real> const& Qaux,
                       amrex::Array4<amrex::Real> const& RHS, amrex::Real dx, amrex::Real dy,
                       int order, bool implicit_source, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
-                      bool well_balanced = false, amrex::Real wet_eps = 0.0)
+                      bool well_balanced = false)
 {
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> flux_xr, flux_xl, flux_yr, flux_yl;
 
@@ -116,12 +112,12 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
 
     // Reconstructed depths of THIS cell at each of its faces (Audusse source).
     amrex::Real hL_xr = 0.0, hR_xl = 0.0, hL_yr = 0.0, hR_yl = 0.0, dum;
-    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr, well_balanced, &hL_xr, &dum, wet_eps);
-    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl, well_balanced, &dum, &hR_xl, wet_eps);
+    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr, well_balanced, &hL_xr, &dum);
+    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl, well_balanced, &dum, &hR_xl);
 
     if constexpr (Model::dimension == 2) {
-        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr, well_balanced, &hL_yr, &dum, wet_eps);
-        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl, well_balanced, &dum, &hR_yl, wet_eps);
+        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr, well_balanced, &hL_yr, &dum);
+        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl, well_balanced, &dum, &hR_yl);
     }
 
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> q_curr, source_term;

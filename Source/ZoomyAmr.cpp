@@ -74,16 +74,10 @@ ZoomyAmr::ZoomyAmr()
                 amrex::Print() << "param override: " << names[i] << " = " << v << "\n";
             }
         }
-        // The wet/dry depth threshold is a MODEL parameter (wet_dry_eps); the
-        // driver reads its value to floor the depth fed to the flux/dt kernels,
-        // consistent with how the model's own eigenvalues use max(h,wet_dry_eps).
-        // No driver-side wet/dry constant is invented.
-        for (int i = 0; i < Model::n_parameters; ++i)
-            if (names[i] == "wet_dry_eps") wet_eps = p_mat(i, 0);
     }
-    // wet_eps comes ONLY from the model's `wet_dry_eps` parameter (the 1/h
-    // desingularization threshold used by hinv + gated eigenvalues).  There is NO
-    // driver-level h-floor from settings — the driver must never regularize h.
+    // The driver never regularizes or floors h.  Wet/dry robustness lives entirely
+    // in the MODEL: its wet_dry_eps parameter desingularizes 1/h (hinv) and gates
+    // the eigenvalues via max(h, wet_dry_eps).  The driver reads no wet/dry constant.
 
     bcs.resize(Model::n_dof_q);
     for (int n = 0; n < Model::n_dof_q; ++n) {
@@ -404,7 +398,6 @@ Real ZoomyAmr::ComputeDt(int lev)
     auto dx = geom.CellSizeArray();
     Real min_dx = amrex::min(dx[0], dx[1]);
     auto const& p = p_mat;
-    const Real we = wet_eps;   // model's wet/dry depth threshold
 
     ReduceOps<ReduceOpMax> reduce_op;
     ReduceData<Real> reduce_data(reduce_op);
@@ -421,12 +414,8 @@ Real ZoomyAmr::ComputeDt(int lev)
                 for (int n = 0; n < Model::n_dof_q; ++n) q(n, 0) = Q_arr(i, j, 0, n);
                 for (int n = 0; n < Model::n_dof_qaux; ++n) a(n, 0) = Qaux_arr(i, j, 0, n);
 
-                // Floor the depth at the model's own wet_dry_eps before the
-                // eigenvalue: a cell left with h<eps (and a stale momentum from
-                // the explicit update) would read a spurious large wavespeed and
-                // collapse dt. With h<-eps gated to eps the model's eigenvalue
-                // returns 0 there, so only genuinely-wet cells set dt.
-                if (q(idx_h, 0) < we) q(idx_h, 0) = we;
+                // The driver never floors h; the model's eigenvalue is responsible
+                // for gating dry cells (it uses max(h, wet_dry_eps) internally).
                 Real max_ev = 0.0;
                 for (int dir = 0; dir < Model::dimension; ++dir) {
                     SmallMatrix<Real, Model::dimension, 1> n_hat{};
@@ -474,7 +463,6 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
     int order = spatial_order;
     bool impl_src = implicit_source;
     bool wb = well_balanced;
-    Real we = wet_eps;
 
     auto do_stage = [&]() {
         UpdateState(lev);
@@ -495,7 +483,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
             ParallelFor(mfi.validbox(),
                 [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     compute_cell_rhs(i, j, Q_arr, Qaux_arr, RHS_arr,
-                                     dx[0], dx[1], order, impl_src, p, wb, we);
+                                     dx[0], dx[1], order, impl_src, p, wb);
                 });
         }
 
