@@ -81,9 +81,9 @@ ZoomyAmr::ZoomyAmr()
         for (int i = 0; i < Model::n_parameters; ++i)
             if (names[i] == "wet_dry_eps") wet_eps = p_mat(i, 0);
     }
-    // REQ-123: a case can set a driver-level wet/dry depth floor from settings even
-    // when the model declares no `wet_dry_eps` param (plain SWE/SME).  Overrides.
-    { ParmParse pp("solver"); pp.query("wet_dry_eps", wet_eps); }
+    // wet_eps comes ONLY from the model's `wet_dry_eps` parameter (the 1/h
+    // desingularization threshold used by hinv + gated eigenvalues).  There is NO
+    // driver-level h-floor from settings — the driver must never regularize h.
 
     bcs.resize(Model::n_dof_q);
     for (int n = 0; n < Model::n_dof_q; ++n) {
@@ -113,19 +113,18 @@ void ZoomyAmr::InitData()
 {
     InitFromScratch(0.0);
 
-    // REQ-123: full-state IC — load one raster per state row (b, h, momentum,
-    // passive tracers, …) so NO row is silently dropped.  Falls back to the legacy
-    // bed/depth (comp 0/1) pair when no per-row rasters are given.
-    if (!state_rasters.empty()) {
-        for (int c = 0; c < (int)state_rasters.size() && c < Model::n_dof_q; ++c)
-            if (FileSystem::Exists(state_rasters[c]))
-                readRasterIntoComponent(state_rasters[c], Geom(0), Q[0], c);
-    } else {
-        if (!release_file.empty() && FileSystem::Exists(release_file))
-            readRasterIntoComponent(release_file, Geom(0), Q[0], 1);
-        if (!dem_file.empty() && FileSystem::Exists(dem_file))
-            readRasterIntoComponent(dem_file, Geom(0), Q[0], 0);
-    }
+    // Two-step IC.  STEP 1 (always): the model's analytic initial condition on
+    // ALL state rows (b, h, momentum, passive tracers) — supplied here as one
+    // raster per row (init.state_rasters), evaluated from model.initial_conditions.
+    // STEP 2 (overwrite): specific fields from measured rasters — the DEM bed
+    // (comp 0) and a release depth (comp 1) — layered on top of step 1.
+    for (int c = 0; c < (int)state_rasters.size() && c < Model::n_dof_q; ++c)
+        if (FileSystem::Exists(state_rasters[c]))
+            readRasterIntoComponent(state_rasters[c], Geom(0), Q[0], c);
+    if (!dem_file.empty() && FileSystem::Exists(dem_file))
+        readRasterIntoComponent(dem_file, Geom(0), Q[0], 0);          // DEM -> b
+    if (!release_file.empty() && FileSystem::Exists(release_file))
+        readRasterIntoComponent(release_file, Geom(0), Q[0], 1);      // release -> h
     if (!friction_file.empty() && FileSystem::Exists(friction_file))
         readRasterIntoComponent(friction_file, Geom(0), Qaux[0], 1);
 

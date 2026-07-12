@@ -175,13 +175,17 @@ def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
         plot_dt=settings.get("time_end", 0.1) / max(1, settings.get("output_snapshots", 10)),
         cfl=settings.get("cfl", 0.45), max_level=int(settings.get("max_level", 0)),
         geom=geom, dem_file=dem, release_file=rel,
-        # REQ-123: full-state IC (all rows), model per-side BCs on the structured
-        # faces (the SWE/AmrCore driver dispatches Model::boundary_conditions), and
-        # well-balancing + a wet/dry floor selectable from the case settings.
+        # REQ-123: full-state IC (all rows) + model per-side BCs on the structured
+        # faces (the SWE/AmrCore driver dispatches Model::boundary_conditions).
+        # Well-balancing is a scheme choice (Audusse HR); wet/dry comes from the
+        # MODEL (hinv=1/max(h,eps) + gated eigenvalues), NOT a driver h-floor — so
+        # NO wet_dry_eps is forwarded here.  clamp_positivity OFF: never clamp the
+        # state h in the driver; positivity is the WB reconstruction's job + the
+        # model's own update_variables (matches the numpy/jax path).
         state_rasters=state_rasters,
         bc_sides={"x_lo": "West", "x_hi": "East", "y_lo": "South", "y_hi": "North"},
         well_balanced=bool(settings.get("well_balanced", False)),
-        wet_dry_eps=settings.get("wet_dry_eps"))
+        clamp_positivity=False)
     return ex
 
 
@@ -247,14 +251,17 @@ def run_case(model, settings, output_dir, on_progress=None):
     bdir = out / "_build"; src = bdir / "Source"; ex_dir = bdir / "Exec"
     src.mkdir(parents=True, exist_ok=True); ex_dir.mkdir(parents=True, exist_ok=True)
 
+    # STEP 1 (always): the model's analytic IC on ALL state rows.
+    bed, dep, state_rasters = _write_ic_rasters(model, sm, geom, dim, str(bdir / "raster"))
+    # STEP 2 (overwrite): measured rasters for specific fields — a gmsh DEM +
+    # $NodeData release (b, h).  Layered on top of step 1 by the driver.
+    dem = rel = None
     msh = settings.get("mesh_msh")
     if msh and Path(msh).exists():
-        dem, rel, state_rasters = gmsh_to_rasters(msh, str(bdir / "raster"), geom)
-    else:
-        dem, rel, state_rasters = _write_ic_rasters(model, sm, geom, dim, str(bdir / "raster"))
+        dem, rel, _ = gmsh_to_rasters(msh, str(bdir / "raster"), geom)
 
     if is_chorin:
-        ex = _run_chorin(model, sm, settings, geom, dim, bdir, dem, rel)
+        ex = _run_chorin(model, sm, settings, geom, dim, bdir, dem or bed, rel or dep)
     else:
         ex = _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters)
 

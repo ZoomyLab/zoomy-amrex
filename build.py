@@ -127,7 +127,7 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
                  implicit_source=False, implicit_global=False, friction=None, slip=None,
                  max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None,
                  well_balanced=False, clamp_positivity=True, tag_b_max=None,
-                 bc_sides=None, state_rasters=None, wet_dry_eps=None):
+                 bc_sides=None, state_rasters=None):
     if geom is not None:
         # Externally-supplied rectangular geometry (e.g. the Malpasset bbox).
         nx, ny = geom["nx"], geom["ny"]
@@ -159,8 +159,6 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
         fric_block += f"init.release_file = {release_file}\n"
     if state_rasters:   # REQ-123: one raster per state row -> the driver loads all
         fric_block += "init.state_rasters = " + " ".join(state_rasters) + "\n"
-    if wet_dry_eps is not None:   # driver-level wet/dry floor (independent of model params)
-        fric_block += f"solver.wet_dry_eps = {wet_dry_eps}\n"
     # AMR: blocking_factor must divide n_cell in every mesh dimension. On DIM=3
     # with nz=1 only bf=1 is legal (and refinement in the degenerate z is moot),
     # so real adaptive refinement needs a DIM=2 mesh — then bf>=2 + ref_ratio
