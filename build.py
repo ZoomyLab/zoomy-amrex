@@ -126,7 +126,8 @@ def build_system_model(model_name, dim, level, bc="extrap"):
 def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extrap",
                  implicit_source=False, implicit_global=False, friction=None, slip=None,
                  max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None,
-                 well_balanced=False, clamp_positivity=True, tag_b_max=None):
+                 well_balanced=False, clamp_positivity=True, tag_b_max=None,
+                 bc_sides=None, state_rasters=None, wet_dry_eps=None):
     if geom is not None:
         # Externally-supplied rectangular geometry (e.g. the Malpasset bbox).
         nx, ny = geom["nx"], geom["ny"]
@@ -140,7 +141,11 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
         prob_lo = "0.0 0.0 0.0" if dim_mesh == 3 else "0.0 0.0"
     isper = "0 0 0" if dim_mesh == 3 else "0 0"
     bc_block = ""
-    if bc == "wall":  # closed basin: every side reflective
+    if bc_sides:      # per-side model BC tags (structured faces West/East/South/North)
+        for side in ("x_lo", "x_hi", "y_lo", "y_hi"):
+            if side in bc_sides:
+                bc_block += f"bc.{side} = {bc_sides[side]}\n"
+    elif bc == "wall":  # closed basin: every side reflective
         bc_block = ("bc.x_lo = wall\nbc.x_hi = wall\n"
                     "bc.y_lo = wall\nbc.y_hi = wall\n")
     fric_block = ""
@@ -152,6 +157,10 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
         fric_block += f"init.dem_file = {dem_file}\n"
     if release_file is not None:
         fric_block += f"init.release_file = {release_file}\n"
+    if state_rasters:   # REQ-123: one raster per state row -> the driver loads all
+        fric_block += "init.state_rasters = " + " ".join(state_rasters) + "\n"
+    if wet_dry_eps is not None:   # driver-level wet/dry floor (independent of model params)
+        fric_block += f"solver.wet_dry_eps = {wet_dry_eps}\n"
     # AMR: blocking_factor must divide n_cell in every mesh dimension. On DIM=3
     # with nz=1 only bf=1 is legal (and refinement in the degenerate z is moot),
     # so real adaptive refinement needs a DIM=2 mesh — then bf>=2 + ref_ratio

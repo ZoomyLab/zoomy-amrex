@@ -28,6 +28,8 @@ ZoomyAmr::ZoomyAmr()
       pp.query("dem_file", dem_file);
       pp.query("release_file", release_file);
       pp.query("friction_file", friction_file);
+      Vector<std::string> sr; if (pp.queryarr("state_rasters", sr))  // REQ-123: full-state IC
+          state_rasters.assign(sr.begin(), sr.end());
     }
     { ParmParse pp("output");
       pp.query("identifier", identifier);
@@ -79,6 +81,9 @@ ZoomyAmr::ZoomyAmr()
         for (int i = 0; i < Model::n_parameters; ++i)
             if (names[i] == "wet_dry_eps") wet_eps = p_mat(i, 0);
     }
+    // REQ-123: a case can set a driver-level wet/dry depth floor from settings even
+    // when the model declares no `wet_dry_eps` param (plain SWE/SME).  Overrides.
+    { ParmParse pp("solver"); pp.query("wet_dry_eps", wet_eps); }
 
     bcs.resize(Model::n_dof_q);
     for (int n = 0; n < Model::n_dof_q; ++n) {
@@ -108,10 +113,19 @@ void ZoomyAmr::InitData()
 {
     InitFromScratch(0.0);
 
-    if (!release_file.empty() && FileSystem::Exists(release_file))
-        readRasterIntoComponent(release_file, Geom(0), Q[0], 1);
-    if (!dem_file.empty() && FileSystem::Exists(dem_file))
-        readRasterIntoComponent(dem_file, Geom(0), Q[0], 0);
+    // REQ-123: full-state IC — load one raster per state row (b, h, momentum,
+    // passive tracers, …) so NO row is silently dropped.  Falls back to the legacy
+    // bed/depth (comp 0/1) pair when no per-row rasters are given.
+    if (!state_rasters.empty()) {
+        for (int c = 0; c < (int)state_rasters.size() && c < Model::n_dof_q; ++c)
+            if (FileSystem::Exists(state_rasters[c]))
+                readRasterIntoComponent(state_rasters[c], Geom(0), Q[0], c);
+    } else {
+        if (!release_file.empty() && FileSystem::Exists(release_file))
+            readRasterIntoComponent(release_file, Geom(0), Q[0], 1);
+        if (!dem_file.empty() && FileSystem::Exists(dem_file))
+            readRasterIntoComponent(dem_file, Geom(0), Q[0], 0);
+    }
     if (!friction_file.empty() && FileSystem::Exists(friction_file))
         readRasterIntoComponent(friction_file, Geom(0), Qaux[0], 1);
 

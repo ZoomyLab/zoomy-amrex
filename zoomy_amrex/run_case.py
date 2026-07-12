@@ -74,23 +74,23 @@ def _cell_centers(geom, dim):
 
 
 def _write_ic_rasters(model, sm, geom, dim, out_dir):
-    """Evaluate the model's analytic IC on the cell centres and write bed/depth
-    rasters (assumes zero initial momentum — dam breaks / still water / bumps)."""
+    """Evaluate the model's analytic IC on the cell centres and write ONE raster per
+    state component (b, h, momentum, passive tracers, …).  Returns (bed, depth,
+    state_rasters): bed/depth for backward-compat consumers; state_rasters is the
+    full ordered list the driver loads into every state row (REQ-123 blocker 1 —
+    a tracer / momentum row is no longer silently dropped).  Absolute paths (the
+    driver runs from Exec/)."""
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     ic = getattr(model, "initial_conditions", None) or getattr(sm, "initial_conditions", None)
     if ic is None:
-        return None, None
-    Q = ic.apply(_cell_centers(geom, dim), np.zeros((len(sm.state), geom["nx"] * geom["ny"])))
-    if len(sm.state) > IDX_H + 1 and np.abs(Q[IDX_H + 1:]).max() > 1e-12:
-        print("run_case: WARNING non-zero initial momentum not carried through the "
-              "bed/depth raster IC path")
-    bed = out / "bed.raw"; dep = out / "depth.raw"
-    Q[IDX_B].astype(np.float64).tofile(bed)
-    Q[IDX_H].astype(np.float64).tofile(dep)
-    # ABSOLUTE paths: the driver runs from Exec/, so a relative raster path would
-    # miss (the SWE driver silently falls back to its default IC; the Chorin
-    # driver aborts).  resolve() pins them regardless of the run cwd.
-    return str(bed.resolve()), str(dep.resolve())
+        return None, None, None
+    ns = len(sm.state)
+    Q = ic.apply(_cell_centers(geom, dim), np.zeros((ns, geom["nx"] * geom["ny"])))
+    paths = []
+    for c in range(ns):
+        p = out / f"ic_{c}.raw"; Q[c].astype(np.float64).tofile(p)
+        paths.append(str(p.resolve()))
+    return paths[IDX_B], paths[IDX_H], paths
 
 
 def gmsh_to_rasters(msh_path, out_dir, geom):
@@ -98,7 +98,8 @@ def gmsh_to_rasters(msh_path, out_dir, geom):
     grid — generalises ``malpasset.prepare_rasters`` (REQ-89).  Returns dem/release."""
     from .malpasset import prepare_rasters
     info = prepare_rasters(msh_path, out_dir, ncell_x=geom["nx"], ncell_y=geom["ny"])
-    return str(Path(info["dem_file"]).resolve()), str(Path(info["release_file"]).resolve())
+    return (str(Path(info["dem_file"]).resolve()),
+            str(Path(info["release_file"]).resolve()), None)   # gmsh: b/h only, extra rows 0
 
 
 # ── VTK postprocessing (always run; ParaView-ready) ─────────────────────────
@@ -160,7 +161,7 @@ def _amrex_home():
     return os.environ.get("AMREX_HOME", "/opt/amrex")
 
 
-def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel):
+def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
     src = bdir / "Source"; ex = bdir / "Exec"
     for f in _SRC.iterdir():
         if f.suffix in (".cpp", ".H") or f.name == "Make.package":
@@ -173,7 +174,14 @@ def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel):
         tend=settings.get("time_end", 0.1), order=settings.get("spatial_order", 1),
         plot_dt=settings.get("time_end", 0.1) / max(1, settings.get("output_snapshots", 10)),
         cfl=settings.get("cfl", 0.45), max_level=int(settings.get("max_level", 0)),
-        geom=geom, dem_file=dem, release_file=rel)
+        geom=geom, dem_file=dem, release_file=rel,
+        # REQ-123: full-state IC (all rows), model per-side BCs on the structured
+        # faces (the SWE/AmrCore driver dispatches Model::boundary_conditions), and
+        # well-balancing + a wet/dry floor selectable from the case settings.
+        state_rasters=state_rasters,
+        bc_sides={"x_lo": "West", "x_hi": "East", "y_lo": "South", "y_hi": "North"},
+        well_balanced=bool(settings.get("well_balanced", False)),
+        wet_dry_eps=settings.get("wet_dry_eps"))
     return ex
 
 
@@ -241,11 +249,14 @@ def run_case(model, settings, output_dir, on_progress=None):
 
     msh = settings.get("mesh_msh")
     if msh and Path(msh).exists():
-        dem, rel = gmsh_to_rasters(msh, str(bdir / "raster"), geom)
+        dem, rel, state_rasters = gmsh_to_rasters(msh, str(bdir / "raster"), geom)
     else:
-        dem, rel = _write_ic_rasters(model, sm, geom, dim, str(bdir / "raster"))
+        dem, rel, state_rasters = _write_ic_rasters(model, sm, geom, dim, str(bdir / "raster"))
 
-    ex = (_run_chorin if is_chorin else _run_swe)(model, sm, settings, geom, dim, bdir, dem, rel)
+    if is_chorin:
+        ex = _run_chorin(model, sm, settings, geom, dim, bdir, dem, rel)
+    else:
+        ex = _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters)
 
     n = os.cpu_count() or 4
     subprocess.run(["make", f"-j{n}"], cwd=ex, check=True)

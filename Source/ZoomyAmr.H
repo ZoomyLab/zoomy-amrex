@@ -125,6 +125,7 @@ public:
 
     // IO
     std::string dem_file, release_file, friction_file;
+    std::vector<std::string> state_rasters;  // REQ-123: one raster per state row (all comps)
     int plot_step = 0;
     amrex::Real next_plot_time = 0.0;
 };
