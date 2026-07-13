@@ -349,8 +349,23 @@ void ZoomyAmr::FillPhysicalBC_mf(MultiFab& Qmf, MultiFab& Qauxmf, int lev, Real 
             bool out_y = (Model::dimension == 2) && (j < dom_lo_y || j > dom_hi_y);
             if (!out_x && !out_y) return;
 
-            int i_int = amrex::max(dom_lo_x, amrex::min(dom_hi_x, i));
-            int j_int = amrex::max(dom_lo_y, amrex::min(dom_hi_y, j));
+            // REFLECT the ghost index about the domain face (not clamp to the
+            // nearest interior cell): ghost layer k must mirror interior cell
+            // (face-1-k).  A clamp fills every ghost layer from the SAME nearest
+            // cell, so the 2nd ghost layer is a wrong mirror -> the 2nd-order
+            // reconstruction at a reflective wall no longer gives exactly zero
+            // mass flux (order-1 is unaffected; it only reads the 1st layer).
+            // Reflection makes both layers true mirrors -> wall conserves mass to
+            // machine precision at 2nd order.  Only the outside coordinate is
+            // reflected; an interior coordinate is left as-is.
+            int i_int = i;
+            if (i < dom_lo_x)      i_int = 2 * dom_lo_x - 1 - i;
+            else if (i > dom_hi_x) i_int = 2 * dom_hi_x + 1 - i;
+            int j_int = j;
+            if (Model::dimension == 2) {
+                if (j < dom_lo_y)      j_int = 2 * dom_lo_y - 1 - j;
+                else if (j > dom_hi_y) j_int = 2 * dom_hi_y + 1 - j;
+            }
 
             int bc_idx = -1;
             // Force-capture the per-side BC indices in the lambda body BEFORE the
