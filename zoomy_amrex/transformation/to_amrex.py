@@ -168,25 +168,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return ",\n        ".join(tbl[a] for a in names)
 
     def _kernel(self, name, expr, shape, argnames):
-        expr = self._resolve_subs(expr)
+        # Bed/surface-trace ``Subs(f(ζ),ζ,0|1)`` nodes are resolved centrally at
+        # the SystemModel → NumericalSystemModel seam (REQ-130,
+        # numerical_system_model._resolve_boundary_traces) and guarded there, so
+        # by the time an operator reaches a printer it is Subs-free — no
+        # printer-local resolve is needed.
         body = self.convert_expression_body(expr, shape)
         return self.wrap_function_signature(name, self._args(*argnames), body, shape)
-
-    @staticmethod
-    def _resolve_subs(expr):
-        """Evaluate any ``Subs(f(ζ), ζ, 0)`` bed/surface-trace nodes BEFORE CSE so
-        the inner ζ-dependence is substituted concretely (C has no ``Subs``).  Only
-        Subs nodes are touched — opaque Galerkin brackets / Integrals are left
-        alone (they never reach the backend).  This mirrors what the numpy printer
-        gets for free via lambdify."""
-        def fix(e):
-            return sp.sympify(e).replace(
-                lambda n: isinstance(n, sp.Subs), lambda n: n.doit())
-        shape = getattr(expr, "shape", None)
-        if shape is None:
-            return fix(expr)
-        flat = [fix(e) for e in list(expr)]      # ZArray/Array -> flat sympy list
-        return sp.Array(flat).reshape(*shape)
 
     # ── expression builders ─────────────────────────────────────────────────
     def _vec(self, elements):
