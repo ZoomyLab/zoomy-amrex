@@ -596,9 +596,37 @@ def write_chorin_headers(split, out_dir):
     for sub, name in [(split.SM_pred, "ModelPred"),
                       (split.SM_press, "ModelPress"),
                       (split.SM_corr, "ModelCorr")]:
-        (out / f"{name}.H").write_text(
-            AmrexSystemModelPrinter(sub, analytical_eigenvalues=False,
-                                    wrapper_name=name).create_code())
+        # REQ-140 defense-in-depth: the splitter resolves bed/surface-trace
+        # ``Subs(f(ζ), ζ, 0|1)`` nodes at construction (core `e12393b`), but
+        # the collapse is environment-sensitive (sympy cache/hashseed governs
+        # birth-collapse), so re-resolve HERE at the printer boundary and then
+        # assert the emitted C++ is clean — an unresolved ``Subs``/``zeta``
+        # prints as an undeclared symbol and the whole case fails to build.
+        from zoomy_core.model.splitter import _resolve_subs
+        for _attr in ("flux", "nonconservative_matrix", "source",
+                      "source_explicit", "boundary_source", "mass_matrix",
+                      "eigenvalues", "update_variables",
+                      "update_aux_variables"):
+            _arr = getattr(sub, _attr, None)
+            if _arr is not None:
+                try:
+                    setattr(sub, _attr, _resolve_subs(_arr))
+                except Exception:
+                    # best-effort: some containers (ZArray) reject applyfunc
+                    # reconstruction / frozen attrs reject set.  The post-emit
+                    # assertion below is the authoritative guard.
+                    pass
+        code = AmrexSystemModelPrinter(sub, analytical_eigenvalues=False,
+                                       wrapper_name=name).create_code()
+        if "Subs(" in code or "zeta" in code:
+            bad = [ln.strip() for ln in code.splitlines()
+                   if "Subs(" in ln or "zeta" in ln][:5]
+            raise ValueError(
+                f"REQ-140: unresolved boundary trace leaked into {name}.H — "
+                f"the emitted C++ contains Subs/zeta and will not compile. "
+                f"Offending lines: {bad}. Fix the trace at its birthplace "
+                "(model derivation) or extend splitter._resolve_subs coverage.")
+        (out / f"{name}.H").write_text(code)
     # predictor flux: Audusse PositiveNonconservativeRusanov (hydrostatic
     # reconstruction = well-balanced over the bed), matching the numpy reference
     # ChorinSplitVAMSolver.  Plain Rusanov is NOT WB -> spurious pressure spike +
