@@ -136,6 +136,9 @@ class SplitSolver(_BaseSolver):
                 "SplitSolver needs a model with chorin_split (got "
                 f"{type(model).__name__}); use HyperbolicSolver for hyperbolic models")
         s = self._legacy_settings(mesh, settings)
+        # TODO(amrex-steward): the `precond` knob is DEAD — run_case.py:209
+        # hard-codes `precond.type = 3` in the inputs deck, so this value is
+        # ignored downstream. Wire precond through run_case or drop the param.
         s.update(cfl=self.cfl, params=_get(settings, "params", {}),
                  precond=self.precond)
         return run_case(model, s, self._output_dir(settings), on_progress=on_progress)
