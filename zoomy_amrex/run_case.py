@@ -206,7 +206,7 @@ def _write_chorin_inputs(path, geom, dim, settings, dem, rel):
              f"geometry.prob_lo  = {gx0} {gy0}", f"geometry.prob_hi  = {gx1} {gy1}",
              "geometry.is_periodic = 0 0",
              f"init.dem_file     = {dem}", f"init.release_file = {rel}",
-             "precond.type = 3",
+             f"precond.type = {int(settings.get('precond', 3))}",
               f"params.g = {params.get('g', 9.81)}", f"params.rho = {params.get('rho', 1.0)}",
               f"params.nu = {params.get('nu', 0.0)}", f"params.lambda_s = {params.get('lambda_s', 0.0)}",
               f"solver.time_end = {tend}", f"solver.cfl      = {settings.get('cfl', 0.3)}",
@@ -245,7 +245,14 @@ def run_case(model, settings, output_dir, on_progress=None):
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     dim, geom = _grid(settings)
     is_chorin = hasattr(model, "chorin_split")
-    sm = model.system_model if is_chorin else _nsm(model)
+    if is_chorin:
+        # A Chorin (VAM/ML-VAM) model no longer exposes a `.system_model`
+        # property; build the SystemModel the same way chorin_split does
+        # internally, so ICs/BCs on the model are carried into the split.
+        from zoomy_core.systemmodel.system_model import SystemModel
+        sm = SystemModel.from_model(model)
+    else:
+        sm = _nsm(model)
     names = [str(s) for s in sm.state]
 
     bdir = out / "_build"; src = bdir / "Source"; ex_dir = bdir / "Exec"
