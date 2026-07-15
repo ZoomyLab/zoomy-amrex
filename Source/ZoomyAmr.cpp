@@ -565,6 +565,16 @@ void ZoomyAmr::TimeStep(int lev, Real time, int iteration)
 
     dt_level[lev] = ComputeDt(lev);
 
+    // Land exactly on time_end instead of stepping past it. Without this the
+    // last coarse step overshoots by up to a full dt (a ~20% overshoot on a
+    // short run), so the final frame sits at a different time than every other
+    // backend and the run does extra work. Only level 0 needs the cap: Evolve
+    // drives it, and sub-cycled fine levels are bounded by the coarse step.
+    if (lev == 0) {
+        const amrex::Real remaining = time_end - time;
+        if (remaining > 0.0 && dt_level[lev] > remaining) dt_level[lev] = remaining;
+    }
+
     Advance(lev, time, dt_level[lev]);
     t_old[lev] = t_new[lev];
     t_new[lev] = time + dt_level[lev];
