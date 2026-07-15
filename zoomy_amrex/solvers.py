@@ -129,6 +129,12 @@ class SplitSolver(_BaseSolver):
     precond = param.Integer(
         3, bounds=(0, 4),
         doc="pressure preconditioner: 0 identity·1 Jacobi·2 MG·3 block-Jacobi·4 block-MG")
+    dt = param.Number(
+        None, allow_None=True, bounds=(0.0, None),
+        doc="fixed timestep; None (default) = adaptive CFL dt. Pinning dt breaks "
+            "the adapter feedback (dt collapse -> the dt-scaled elliptic operator "
+            "-> P blows up), so it separates a dt-adapter artefact from a real "
+            "formulation instability.")
 
     def solve(self, model, mesh, settings, on_progress=None):
         if not hasattr(model, "chorin_split"):
@@ -140,4 +146,6 @@ class SplitSolver(_BaseSolver):
         # Chorin path; `params` passes model parameters (g, rho, nu, lambda_s).
         s.update(cfl=self.cfl, params=_get(settings, "params", {}),
                  precond=self.precond)
+        if self.dt is not None:
+            s["dt"] = self.dt
         return run_case(model, s, self._output_dir(settings), on_progress=on_progress)

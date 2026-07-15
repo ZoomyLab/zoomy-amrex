@@ -212,6 +212,15 @@ def _write_chorin_inputs(path, geom, dim, settings, dem, rel):
               f"solver.time_end = {tend}", f"solver.cfl      = {settings.get('cfl', 0.3)}",
               f"output.plot_dt_interval = {tend / max(1, settings.get('output_snapshots', 10))}",
               "tagging.threshold = 0.02"]
+    # Optional FIXED timestep. The driver already supports it (chorin_main.cpp
+    # `compute_dt`: `if (dt_fixed > 0) return dt_fixed;`) but nothing wrote the
+    # input, so it was unreachable from a case. Needed to separate a dt-ADAPTER
+    # feedback from a formulation instability: compute_dt recomputes the max
+    # eigenvalue every step, so growing velocity shrinks dt, and the Chorin
+    # elliptic operator scales with dt (P = A^-1 b grows as dt -> 0) — a loop
+    # that pinning dt breaks. Omit (default) to keep the adaptive CFL dt.
+    if settings.get("dt") is not None:
+        lines.append(f"solver.dt = {float(settings['dt'])}")
     Path(path).write_text("\n".join(lines) + "\n")
 
 
