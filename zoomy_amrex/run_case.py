@@ -41,10 +41,14 @@ def _bld():
 
 
 def _nsm(model):
-    """Promote a raw Model to a NumericalSystemModel (SWE/SME) or return a system
-    model as-is.  For a Chorin model the caller uses ``model.system_model`` directly."""
+    """Promote a raw Model to a NumericalSystemModel (SWE/SME), or return an
+    already-built (Numerical)SystemModel as-is.  A Chorin model is built via
+    ``SystemModel.from_model(model)`` in the caller instead — REQ-143/164:
+    ``Model.system_model`` was deleted, so this no longer probes for it (a
+    SystemModel is identified positively by ``.state``; raw SWE/SME Models
+    have none)."""
     from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
-    if hasattr(model, "state") and not hasattr(model, "system_model"):
+    if hasattr(model, "state"):
         return model
     return to_numerical_system_model(model)
 
