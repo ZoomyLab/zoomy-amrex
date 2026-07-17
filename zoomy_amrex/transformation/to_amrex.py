@@ -128,6 +128,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         self.register_map("Qaux", list(sm.aux_state))
         self.register_map("n", list(sm.normal.values()))
         self.register_map("p", self._param_syms)
+        # REQ-185: bind the scalar time ``t`` and the length-3 position vector
+        # ``x/y/z`` so a ``source`` / ``update_aux`` referencing them lowers
+        # (same convention the BC kernel uses).  ``x/y/z`` → ``X(i, 0)``;
+        # ``time`` is a by-value scalar.  The in-scope hydrostatic models never
+        # reference them, so their bodies are unchanged.
+        self.register_map("X", list(sm._position_struct().values()))
+        self.symbol_maps.append({sm.time: "time"})
 
     def _uses_symbol(self, sym):
         """True if ``sym`` appears in any printed operator (flux/source/NCP/
@@ -161,6 +168,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             "X": f"{self._t(3)} const& X",
             "gradQ": f"{self._t(self.n_state * self.dim)} const& gradQ",
             "time": "amrex::Real const time",
+            "dt": "amrex::Real const dt",
             "dX": "amrex::Real const dX",
             "bc_idx": "const int bc_idx",
         }
