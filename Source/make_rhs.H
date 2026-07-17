@@ -12,6 +12,19 @@ amrex::Real minmod(amrex::Real a, amrex::Real b) {
     return (std::abs(a) < std::abs(b)) ? a : b;
 }
 
+// REQ-185: cell-centre position (x,y,z) for the time/space-aware source and
+// update_aux_variables operators.  z=0 (structured 2-D); mirrors the BC path.
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+amrex::SmallMatrix<amrex::Real, 3, 1> cell_center(
+        int i, int j, amrex::Real dx, amrex::Real dy,
+        amrex::Real plox, amrex::Real ploy) {
+    amrex::SmallMatrix<amrex::Real, 3, 1> X{};
+    X(0, 0) = plox + (i + 0.5) * dx;
+    X(1, 0) = (Model::dimension == 2) ? ploy + (j + 0.5) * dy : amrex::Real(0.0);
+    X(2, 0) = amrex::Real(0.0);
+    return X;
+}
+
 // ----------------------------------------------------------------------------
 // Reconstructs states at a face and evaluates numerical fluxes
 // ----------------------------------------------------------------------------
@@ -22,6 +35,8 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
                const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
                amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1>& flux,
                amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1>& fluct, // <-- Flat 1D Vector
+               amrex::Real time, amrex::Real dx, amrex::Real dy,             // REQ-185
+               amrex::Real plox, amrex::Real ploy,                          // REQ-185
                bool well_balanced = false,
                amrex::Real* hLstar = nullptr, amrex::Real* hRstar = nullptr)
 {
@@ -89,8 +104,10 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
         aR(n,0) = Qaux(iR, jR, 0, n);
     }
 
-    aL = Model::update_aux_variables(qL, aL, p_mat);
-    aR = Model::update_aux_variables(qR, aR, p_mat);
+    auto X_L = cell_center(iL, jL, dx, dy, plox, ploy);   // REQ-185
+    auto X_R = cell_center(iR, jR, dx, dy, plox, ploy);
+    aL = Model::update_aux_variables(qL, aL, p_mat, time, X_L);
+    aR = Model::update_aux_variables(qR, aR, p_mat, time, X_R);
 
     flux = Numerics::numerical_flux(qL, qR, aL, aR, p_mat, n_hat);
     fluct = Numerics::numerical_fluctuations(qL, qR, aL, aR, p_mat, n_hat);
@@ -103,6 +120,7 @@ AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, amrex::Array4<const amrex::Real> const& Qaux,
                       amrex::Array4<amrex::Real> const& RHS, amrex::Real dx, amrex::Real dy,
                       int order, bool implicit_source, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
+                      amrex::Real time, amrex::Real plox, amrex::Real ploy,   // REQ-185
                       bool well_balanced = false)
 {
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> flux_xr, flux_xl, flux_yr, flux_yl;
@@ -112,12 +130,12 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
 
     // Reconstructed depths of THIS cell at each of its faces (Audusse source).
     amrex::Real hL_xr = 0.0, hR_xl = 0.0, hL_yr = 0.0, hR_yl = 0.0, dum;
-    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr, well_balanced, &hL_xr, &dum);
-    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl, well_balanced, &dum, &hR_xl);
+    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr, time, dx, dy, plox, ploy, well_balanced, &hL_xr, &dum);
+    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl, time, dx, dy, plox, ploy, well_balanced, &dum, &hR_xl);
 
     if constexpr (Model::dimension == 2) {
-        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr, well_balanced, &hL_yr, &dum);
-        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl, well_balanced, &dum, &hR_yl);
+        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr, time, dx, dy, plox, ploy, well_balanced, &hL_yr, &dum);
+        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl, time, dx, dy, plox, ploy, well_balanced, &dum, &hR_yl);
     }
 
     amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> q_curr, source_term;
@@ -130,7 +148,8 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
     // No dry guard: the model's friction source uses pow(max(h_floor, h)) and
     // hinv, so it is finite for any depth.
     if (!implicit_source)
-        source_term = Model::source(q_curr, a_curr, p_mat);
+        source_term = Model::source(q_curr, a_curr, p_mat, time,
+                                    cell_center(i, j, dx, dy, plox, ploy));  // REQ-185
 
     for(int n=0; n<Model::n_dof_q; ++n) {
 
@@ -227,7 +246,8 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
 // ----------------------------------------------------------------------------
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, amrex::Array4<const amrex::Real> const& Qaux,
-                           amrex::Real dt, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat) 
+                           amrex::Real dt, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
+                           amrex::Real time, const amrex::SmallMatrix<amrex::Real, 3, 1>& X)   // REQ-185
 {
     constexpr int n_q = Model::n_dof_q;
     constexpr int n_a = Model::n_dof_qaux;
@@ -246,8 +266,8 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
     bool converged = false;
 
     for(int iter=0; iter<25; ++iter) {
-        a_curr = Model::update_aux_variables(q_curr, a_curr, p_mat);
-        auto S = Model::source(q_curr, a_curr, p_mat);
+        a_curr = Model::update_aux_variables(q_curr, a_curr, p_mat, time, X);   // REQ-185
+        auto S = Model::source(q_curr, a_curr, p_mat, time, X);
 
         amrex::Real res_norm = 0.0;
         amrex::SmallMatrix<amrex::Real, n_q, 1> residual;
@@ -263,7 +283,7 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
 
         auto dS_dQ = Model::source_jacobian_wrt_variables(q_curr, a_curr, p_mat);
         auto dS_dA = Model::source_jacobian_wrt_aux_variables(q_curr, a_curr, p_mat);
-        auto dA_dQ = Model::update_aux_variables_jacobian_wrt_variables(q_curr, a_curr, p_mat);
+        auto dA_dQ = Model::update_aux_variables_jacobian_wrt_variables(q_curr, a_curr, p_mat, time, X);
 
         amrex::SmallMatrix<amrex::Real, n_q, n_q> J;
         for(int r=0; r<n_q; ++r) {

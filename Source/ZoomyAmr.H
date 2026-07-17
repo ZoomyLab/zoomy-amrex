@@ -73,7 +73,7 @@ public:
                          amrex::MultiFab& mf, int icomp, int ncomp);
 
     // ---- Helpers ----
-    void UpdateState(int lev);
+    void UpdateState(int lev, amrex::Real time);
     void FillPhysicalBC(int lev, amrex::Real time);
     void WritePlotFile(int step, amrex::Real time);
 

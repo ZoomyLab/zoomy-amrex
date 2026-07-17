@@ -23,6 +23,8 @@ inline void ZoomyAmr::ComputeSourceField(amrex::MultiFab& Qin, amrex::MultiFab& 
 {
     using namespace amrex;
     const auto& geom = Geom(lev);
+    auto dx = geom.CellSizeArray();          // REQ-185
+    auto plo = geom.ProbLoArray();
     auto const& p = p_mat;
 
     // Refresh ghosts: interior exchange + physical BC dispatch.  This is what
@@ -42,8 +44,12 @@ inline void ZoomyAmr::ComputeSourceField(amrex::MultiFab& Qin, amrex::MultiFab& 
             SmallMatrix<Real, Model::n_dof_qaux, 1> a;
             for (int n = 0; n < Model::n_dof_q; ++n) q(n, 0) = Qa(i, j, 0, n);
             for (int n = 0; n < Model::n_dof_qaux; ++n) a(n, 0) = 0.0;
-            a = Model::update_aux_variables(q, a, p);
-            auto S = Model::source(q, a, p);
+            SmallMatrix<Real, 3, 1> X{};   // REQ-185
+            X(0, 0) = plo[0] + (i + 0.5) * dx[0];
+            X(1, 0) = (Model::dimension == 2) ? plo[1] + (j + 0.5) * dx[1] : Real(0.0);
+            X(2, 0) = Real(0.0);
+            a = Model::update_aux_variables(q, a, p, time, X);
+            auto S = Model::source(q, a, p, time, X);
             for (int n = 0; n < Model::n_dof_q; ++n) Sa(i, j, 0, n) = S(n, 0);
         });
     }

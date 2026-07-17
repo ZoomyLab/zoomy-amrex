@@ -278,9 +278,13 @@ void ZoomyAmr::FillCoarsePatch(int lev, Real time, MultiFab& mf, int icomp, int 
 // ==========================================================================
 //  State update and boundary conditions (same logic as original)
 // ==========================================================================
-void ZoomyAmr::UpdateState(int lev)
+void ZoomyAmr::UpdateState(int lev, Real time)
 {
     auto const& p = p_mat;
+    // REQ-185: cell position for a time/space-dependent update_aux_variables.
+    const auto& geom = Geom(lev);
+    auto dx = geom.CellSizeArray();
+    auto plo = geom.ProbLoArray();
     // MOOD (REQ-175) is the positivity mechanism when active; the non-conservative
     // clamp must stay OFF so the order-1 redo is the ONLY thing touching h<0 cells.
     const bool clamp = clamp_positivity && (positivity_method != "mood");
@@ -295,6 +299,11 @@ void ZoomyAmr::UpdateState(int lev)
             for (int n = 0; n < Model::n_dof_q; ++n) q(n, 0) = Q_arr(i, j, 0, n);
             for (int n = 0; n < Model::n_dof_qaux; ++n) a(n, 0) = Qaux_arr(i, j, 0, n);
 
+            SmallMatrix<Real, 3, 1> X{};
+            X(0, 0) = plo[0] + (i + 0.5) * dx[0];
+            X(1, 0) = (Model::dimension == 2) ? plo[1] + (j + 0.5) * dx[1] : Real(0.0);
+            X(2, 0) = Real(0.0);
+
             // All wet/dry hygiene is INHERITED from the (Numerical)SystemModel:
             // update_variables caps |momentum|/h and zeros dry-cell momentum;
             // update_aux_variables computes the KP-desingularised hinv. The
@@ -303,7 +312,7 @@ void ZoomyAmr::UpdateState(int lev)
             // conserving run.
             q = Model::update_variables(q, a, p);
             if (clamp && q(idx_h, 0) < 0.0) q(idx_h, 0) = 0.0;
-            a = Model::update_aux_variables(q, a, p);
+            a = Model::update_aux_variables(q, a, p, time, X);
 
             for (int n = 0; n < Model::n_dof_q; ++n) Q_arr(i, j, 0, n) = q(n, 0);
             for (int n = 0; n < Model::n_dof_qaux; ++n) Qaux_arr(i, j, 0, n) = a(n, 0);
@@ -477,13 +486,14 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
 {
     const auto& geom = Geom(lev);
     auto dx = geom.CellSizeArray();
+    auto plo = geom.ProbLoArray();   // REQ-185: cell position for source/aux
     auto const& p = p_mat;
     int order = spatial_order;
     bool impl_src = implicit_source;
     bool wb = well_balanced;
 
     auto do_stage = [&](int ord) {
-        UpdateState(lev);
+        UpdateState(lev, time);
         // Coarse-fine-aware ghost fill. A refined level's ghost cells at the
         // coarse-fine interface must be interpolated from the coarse level
         // (FillPatch), NOT just FillBoundary (which only copies same-level
@@ -501,7 +511,8 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
             ParallelFor(mfi.validbox(),
                 [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     compute_cell_rhs(i, j, Q_arr, Qaux_arr, RHS_arr,
-                                     dx[0], dx[1], ord, impl_src, p, wb);
+                                     dx[0], dx[1], ord, impl_src, p,
+                                     time, plo[0], plo[1], wb);   // REQ-185
                 });
         }
 
@@ -526,7 +537,11 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
                     auto Qaux_arr = Qaux[lev].const_array(mfi);
                     ParallelFor(mfi.validbox(),
                         [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-                            apply_implicit_source(i, j, Q_arr, Qaux_arr, dt, p);
+                            SmallMatrix<Real, 3, 1> X{};   // REQ-185
+                            X(0, 0) = plo[0] + (i + 0.5) * dx[0];
+                            X(1, 0) = (Model::dimension == 2) ? plo[1] + (j + 0.5) * dx[1] : Real(0.0);
+                            X(2, 0) = Real(0.0);
+                            apply_implicit_source(i, j, Q_arr, Qaux_arr, dt, p, time, X);
                         });
                 }
             }
@@ -599,7 +614,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
     // spurious huge wavespeed -> dt collapses to dtmin. Capping here uses the
     // model only (no driver wet/dry constants) and does not touch the depth, so
     // mass stays exactly conserved.
-    UpdateState(lev);
+    UpdateState(lev, time);
 }
 
 void ZoomyAmr::TimeStep(int lev, Real time, int iteration)

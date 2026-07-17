@@ -91,12 +91,18 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         "compute_derivative": _emit_user_call("compute_derivative"),
     }
 
-    def __init__(self, sm, *, analytical_eigenvalues=True, wrapper_name="Model"):
+    def __init__(self, sm, *, analytical_eigenvalues=True, wrapper_name="Model",
+                 time_position_ops=False):
         super().__init__()
         self.sm = sm
         self.model = sm  # AmrexCore signature helpers read ``self.model.*``
         self.analytical_eigenvalues = analytical_eigenvalues
         self._wrapper_name = wrapper_name
+        # REQ-185: append (time, X) to source / update_aux_variables (+ its
+        # jacobian) for the STANDARD hyperbolic Model.H only.  The Chorin split
+        # sub-models (write_chorin_headers) keep the 3-arg source — their driver
+        # carries dt via a parameter and does not thread cell time/position.
+        self._t185 = time_position_ops
         # n_state = length of the Q vector; n_eq = number of evolution equations
         # (operator rows).  Equal for square models (SWE/SME/full VAM); for a
         # Chorin split sub-model n_eq < n_state (it evolves only its own rows).
@@ -345,7 +351,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
         # source + jacobians (n_eq rows; jacobian (n_eq, n_state))
         sexpr, _ = self._expr_source()
-        blocks.append(self._kernel("source", sexpr, (ne, 1), ("Q", "Qaux", "p")))
+        # REQ-185: source gains time + position X (dt already rides in the p-slot
+        # via _uses_symbol(DT_SYMBOL), so no separate dt arg — matches the GO
+        # broadcast's "dt omitted when dt is already a model parameter").  Only on
+        # the standard hyperbolic Model.H (self._t185); Chorin sub-models keep 3-arg.
+        t185 = ("time", "X") if self._t185 else ()
+        blocks.append(self._kernel("source", sexpr, (ne, 1),
+                                   ("Q", "Qaux", "p") + t185))
         jexpr, _ = self._expr_source_jac()
         blocks.append(self._kernel("source_jacobian_wrt_variables", jexpr,
                                    (ne * ns, 1), ("Q", "Qaux", "p")))
@@ -395,14 +407,17 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         blocks.append(self._kernel("update_variables", uv_expr,
                                    (n_uv, 1), ("Q", "Qaux", "p")))
         uaexpr, _ = self._expr_update_aux()
+        # REQ-185: the algebraic aux closure gains time + position X (no dt) — on
+        # the standard hyperbolic Model.H only.
+        t185 = ("time", "X") if self._t185 else ()
         blocks.append(self._kernel("update_aux_variables", uaexpr, (na, 1),
-                                   ("Q", "Qaux", "p")))
+                                   ("Q", "Qaux", "p") + t185))
         blocks.append(self._kernel("update_variables_jacobian_wrt_variables",
                                    self._identity_flat(ns), (ns * ns, 1),
                                    ("Q", "Qaux", "p")))
         blocks.append(self._kernel("update_aux_variables_jacobian_wrt_variables",
                                    self._zeros(na * ns), (na * ns, 1),
-                                   ("Q", "Qaux", "p")))
+                                   ("Q", "Qaux", "p") + t185))
 
         # boundary conditions — the real per-tag dispatch: ``sm.boundary_conditions``
         # is a framework ``Function`` whose ``.definition`` is a Piecewise over
@@ -545,7 +560,8 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
 
     (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
     (out / "Model.H").write_text(
-        AmrexSystemModelPrinter(sm, analytical_eigenvalues=analytical_eigenvalues)
+        AmrexSystemModelPrinter(sm, analytical_eigenvalues=analytical_eigenvalues,
+                                time_position_ops=True)   # REQ-185 (hyperbolic path)
         .create_code())
     (out / "Numerics.H").write_text(AmrexNumericsPrinter(num).create_code())
     return out
