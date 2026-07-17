@@ -189,7 +189,10 @@ def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
         state_rasters=state_rasters,
         bc_sides={"x_lo": "West", "x_hi": "East", "y_lo": "South", "y_hi": "North"},
         well_balanced=bool(settings.get("well_balanced", False)),
-        clamp_positivity=False)
+        clamp_positivity=False,
+        # REQ-175: a-posteriori positivity.  "mood" redoes h<0 cells order-1 from
+        # the saved stage state (conservative); default "none".
+        positivity=str(settings.get("positivity", "none")))
     return ex
 
 
@@ -290,6 +293,16 @@ def run_case(model, settings, output_dir, on_progress=None):
     exe = next((p for p in ex.iterdir() if p.name.startswith("main") and os.access(p, os.X_OK)), None)
     if exe is None:
         raise RuntimeError("run_case: build produced no executable")
+    # Clear plotfiles from any PRIOR run in this reused Exec dir.  AMReX renames a
+    # SAME-numbered plotfile to `plt_*.old.<pid>` but leaves HIGHER-numbered ones
+    # (a longer previous run) in place — `_plotfiles_to_vtk` globs every `plt_\d+`,
+    # so those stale frames get spliced into the .h5 and show up as a spurious
+    # mass "drift" (they are a different run's dry-front states).  Wipe them so the
+    # store holds ONLY this run's snapshots.
+    for stale in ex.glob("plt_*"):
+        shutil.rmtree(stale, ignore_errors=True)
+    for stale in ex.glob("chk_*"):
+        shutil.rmtree(stale, ignore_errors=True)
     subprocess.run([f"./{exe.name}", "inputs"], cwd=ex, check=True)
     if on_progress is not None:
         on_progress(-1, settings.get("time_end", 0.1), 0.0)

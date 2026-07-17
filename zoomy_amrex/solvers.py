@@ -110,11 +110,17 @@ class HyperbolicSolver(_BaseSolver):
     order = param.Integer(1, bounds=(1, 2), doc="spatial reconstruction order")
     well_balanced = param.Boolean(
         True, doc="Audusse hydrostatic reconstruction (lake-at-rest preserving)")
+    positivity = param.Selector(
+        default="none", objects=["none", "mood"],
+        doc="a-posteriori positivity (REQ-175): 'mood' redoes only the cells that "
+            "went h<0 at order 2 with a conservative order-1 update from the saved "
+            "stage state — order-2 stays everywhere else. 'none' = no limiter. "
+            "(Only meaningful at order=2.)")
 
     def solve(self, model, mesh, settings, on_progress=None):
         s = self._legacy_settings(mesh, settings)
         s.update(cfl=self.CFL, spatial_order=self.order,
-                 well_balanced=self.well_balanced)
+                 well_balanced=self.well_balanced, positivity=self.positivity)
         return run_case(model, s, self._output_dir(settings), on_progress=on_progress)
 
 

@@ -105,6 +105,13 @@ public:
                                     // Stabilising but NOT mass-conserving; turn
                                     // off (+ closed walls + CFL<=0.5) for an
                                     // exactly mass-conserving run.
+    std::string positivity_method = "none";  // "none" | "mood" (REQ-175).  "mood"
+                                    // = a-posteriori local MOOD: after the order-2
+                                    // step, cells that went h<0 are redone by a
+                                    // conservative order-1 update from the saved
+                                    // stage state.  Supersedes the clamp (which is
+                                    // forced off) — order-2 everywhere healthy,
+                                    // order-1 only at troubled wet/dry cells.
     amrex::Real plot_dt_interval = 0.1;
     int identifier        = 0;
     amrex::Real tag_threshold = 0.01; // gradient threshold for refinement

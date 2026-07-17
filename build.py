@@ -44,7 +44,7 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
                  implicit_source=False, implicit_global=False, friction=None, slip=None,
                  max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None,
                  well_balanced=False, clamp_positivity=True, tag_b_max=None,
-                 bc_sides=None, state_rasters=None):
+                 bc_sides=None, state_rasters=None, positivity="none"):
     if geom is not None:
         # Externally-supplied rectangular geometry (e.g. the mesh bbox).
         nx, ny = geom["nx"], geom["ny"]
@@ -101,6 +101,7 @@ solver.implicit_source = {'true' if implicit_source else 'false'}
 solver.implicit_global = {'true' if implicit_global else 'false'}
 solver.well_balanced   = {'true' if well_balanced else 'false'}
 solver.clamp_positivity = {'true' if clamp_positivity else 'false'}
+solver.positivity      = {positivity}
 tagging.threshold      = 0.02
 {f'tagging.b_max          = {tag_b_max}' if tag_b_max is not None else ''}
 """)

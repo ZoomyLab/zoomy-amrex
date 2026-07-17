@@ -45,6 +45,7 @@ ZoomyAmr::ZoomyAmr()
       pp.query("implicit_global", implicit_global);
       pp.query("well_balanced", well_balanced);
       pp.query("clamp_positivity", clamp_positivity);
+      pp.query("positivity", positivity_method);
     }
     { ParmParse pp("tagging");
       pp.query("threshold", tag_threshold);
@@ -280,7 +281,9 @@ void ZoomyAmr::FillCoarsePatch(int lev, Real time, MultiFab& mf, int icomp, int 
 void ZoomyAmr::UpdateState(int lev)
 {
     auto const& p = p_mat;
-    const bool clamp = clamp_positivity;
+    // MOOD (REQ-175) is the positivity mechanism when active; the non-conservative
+    // clamp must stay OFF so the order-1 redo is the ONLY thing touching h<0 cells.
+    const bool clamp = clamp_positivity && (positivity_method != "mood");
     for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
         const Box& bx = mfi.growntilebox();
         auto Q_arr = Q[lev].array(mfi);
@@ -479,7 +482,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
     bool impl_src = implicit_source;
     bool wb = well_balanced;
 
-    auto do_stage = [&]() {
+    auto do_stage = [&](int ord) {
         UpdateState(lev);
         // Coarse-fine-aware ghost fill. A refined level's ghost cells at the
         // coarse-fine interface must be interpolated from the coarse level
@@ -498,7 +501,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
             ParallelFor(mfi.validbox(),
                 [=] AMREX_GPU_DEVICE(int i, int j, int k) {
                     compute_cell_rhs(i, j, Q_arr, Qaux_arr, RHS_arr,
-                                     dx[0], dx[1], order, impl_src, p, wb);
+                                     dx[0], dx[1], ord, impl_src, p, wb);
                 });
         }
 
@@ -530,12 +533,8 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
         }
     };
 
-    if (spatial_order == 1) {
-        do_stage();
-    } else {
-        MultiFab::Copy(Qold[lev], Q[lev], 0, 0, Model::n_dof_q, 0);
-        do_stage();
-        do_stage();
+    // Heun (SSP-RK2) combine: Q <- 0.5*Q^n + 0.5*Q**   (Q^n held in Qold).
+    auto heun = [&]() {
         for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
             auto Q_arr = Q[lev].array(mfi);
             auto Qold_arr = Qold[lev].const_array(mfi);
@@ -544,6 +543,52 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
                     for (int n = 0; n < Model::n_dof_q; ++n)
                         Q_arr(i, j, 0, n) = 0.5 * Qold_arr(i, j, 0, n) + 0.5 * Q_arr(i, j, 0, n);
                 });
+        }
+    };
+
+    if (spatial_order == 1) {
+        do_stage(1);
+    } else {
+        MultiFab::Copy(Qold[lev], Q[lev], 0, 0, Model::n_dof_q, 0);   // Qold = Q^n
+        do_stage(order);
+        do_stage(order);
+        heun();                                                       // order-2 candidate
+
+        // ---- a-posteriori MOOD positivity (REQ-175) ----
+        // If the order-2 candidate produced h<0 (or non-finite) anywhere, redo the
+        // WHOLE step at order 1 from Q^n (order-1 SSP-RK2, PCM).
+        //
+        // Why whole-step and not per-cell: amrex's order-2 is a TWO-stage SSP-RK2, so
+        // overriding only troubled cells from Q^n (dmplex's local recipe) mixes a
+        // single-stage order-1 flux into cells whose neighbours kept the two-stage
+        // order-2 flux -> the shared face fluxes no longer cancel and mass leaks
+        // (measured 14% at an over-CFL front).  A whole-step order-1 redo keeps every
+        // face flux shared between its two cells, so it is EXACTLY mass-conserving AND
+        // positivity-preserving (order-1 SSP is monotone under CFL<=1).  The cost is
+        // that a troubled step runs order-1 across the whole level, not just the
+        // front -- but troubled steps are rare (only when order-2 would go negative),
+        // and exact mass conservation is non-negotiable.  Supersedes the clamp.
+        if (positivity_method == "mood") {
+            MultiFab mask(boxArray(lev), DistributionMap(lev), 1, 0);
+            for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
+                auto qc = Q[lev].const_array(mfi);
+                auto m  = mask.array(mfi);
+                ParallelFor(mfi.validbox(),
+                    [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                        amrex::Real h = qc(i, j, 0, idx_h);
+                        // troubled: h<0, NaN (fails h>=0), or +/-inf (fails |h|<1e300)
+                        m(i, j, 0) = (!(h >= 0.0) || !(h < 1.0e300)) ? 1.0 : 0.0;
+                    });
+            }
+            const amrex::Real n_troubled = mask.sum(0);
+            if (n_troubled > 0.0) {
+                amrex::Print() << "  [MOOD] lev " << lev << " troubled cells: "
+                               << (long)n_troubled << " -> whole-step order-1 redo\n";
+                MultiFab::Copy(Q[lev], Qold[lev], 0, 0, Model::n_dof_q, 0);  // Q <- Q^n
+                do_stage(1);
+                do_stage(1);
+                heun();                                                     // order-1 SSP-RK2
+            }
         }
     }
 
