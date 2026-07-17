@@ -464,7 +464,12 @@ Real ZoomyAmr::ComputeDt(int lev)
     Real global_max_inv = amrex::get<0>(reduce_data.value(reduce_op));
     ParallelDescriptor::ReduceRealMax(global_max_inv);
 
-    if (global_max_inv < 1e-14) return 1e-3;
+    // REQ-188: a WAVE-FREE domain (all cells dry / sub-wet_dry_eps -> every gated
+    // eigenvalue is 0) imposes NO CFL constraint, so step at dtmax (the driver then
+    // clamps to the output cadence / time_end) instead of a magic 1e-3 floor. dtmax
+    // is the solver parameter. Stopgap adoption by river; core to generalize dtmax
+    // onto the NSM so every backend inherits the same dry-domain guard (REQ-188).
+    if (global_max_inv < 1e-14) return dtmax;
     Real dt = cfl / global_max_inv;
     return amrex::max(amrex::min(dt, dtmax), dtmin);
 }

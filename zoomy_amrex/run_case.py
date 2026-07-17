@@ -199,6 +199,10 @@ def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
         tend=settings.get("time_end", 0.1), order=settings.get("spatial_order", 1),
         plot_dt=settings.get("time_end", 0.1) / max(1, settings.get("output_snapshots", 10)),
         cfl=settings.get("cfl", 0.45), max_level=int(settings.get("max_level", 0)),
+        # REQ-188: dtmax caps the timestep AND is the wave-free (dry-domain) step.
+        # Defaults to tend (uncapped) when unset; a case with a dry start must set it
+        # to a sensible cadence so the dry phase steps instead of leaping to time_end.
+        dtmax=settings.get("dtmax"),
         geom=geom, dem_file=dem, release_file=rel,
         # REQ-123: full-state IC (all rows) + model per-side BCs on the structured
         # faces (the SWE/AmrCore driver dispatches Model::boundary_conditions).
