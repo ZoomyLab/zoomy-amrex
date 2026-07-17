@@ -165,14 +165,27 @@ def _amrex_home():
     return os.environ.get("AMREX_HOME", "/opt/amrex")
 
 
+def _cuda_opts():
+    """GPU build knobs from the environment (default CPU, backward-compatible).
+
+    Set ``ZOOMY_AMREX_CUDA=1`` (baked into the GPU container's %environment) to
+    compile the AMReX driver with ``USE_CUDA=TRUE`` — the whole SWE/SME device
+    path (make_rhs, MOOD, update_variables) is already ``AMREX_GPU_*``-annotated.
+    ``ZOOMY_AMREX_CUDA_ARCH`` picks the SM arch (default 89 = Ada / L40S).  The
+    GPU container still needs ``apptainer --nv`` at run time to see the device."""
+    on = os.environ.get("ZOOMY_AMREX_CUDA", "").strip().lower() in ("1", "true", "yes", "on")
+    return ("TRUE" if on else "FALSE"), os.environ.get("ZOOMY_AMREX_CUDA_ARCH", "89")
+
+
 def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
     src = bdir / "Source"; ex = bdir / "Exec"
     for f in _SRC.iterdir():
         if f.suffix in (".cpp", ".H") or f.name == "Make.package":
             shutil.copy2(f, src / f.name)
     generate_headers(sm, src)
+    _cuda, _arch = _cuda_opts()
     (ex / "GNUmakefile").write_text(_bld().GNUMAKEFILE.format(
-        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda="FALSE", cuda_arch="89"))
+        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda=_cuda, cuda_arch=_arch))
     _bld().write_inputs(
         ex / "inputs", geom["nx"], 2,
         tend=settings.get("time_end", 0.1), order=settings.get("spatial_order", 1),
@@ -242,8 +255,9 @@ def _run_chorin(model, sm, settings, geom, dim, bdir, dem, rel):
         _bld().CHORIN_AMR_MAKE_PACKAGE if amr else _bld().CHORIN_MAKE_PACKAGE)
     split = model.chorin_split(sp.Symbol("dt", positive=True), system_model=sm)
     write_chorin_headers(split, src)
+    _cuda, _arch = _cuda_opts()
     (ex / "GNUmakefile").write_text(_bld().GNUMAKEFILE.format(
-        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda="FALSE", cuda_arch="89"))
+        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda=_cuda, cuda_arch=_arch))
     _write_chorin_inputs(ex / "inputs", geom, dim, settings, dem, rel)
     return ex
 
