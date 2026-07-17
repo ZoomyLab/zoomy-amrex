@@ -174,6 +174,17 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         }
         return ",\n        ".join(tbl[a] for a in names)
 
+    def _registry_argnames(self, name):
+        """C-family argnames for operator ``name`` READ from the SystemModel's
+        declared ``Function.args`` (the single signature source in core), with
+        the ``dt`` slot dropped: amrex threads the time step through the
+        parameter vector (``_uses_symbol(DT_SYMBOL)`` appends it as ``p[last]``),
+        so a separate ``dt`` arg would duplicate it — the same 'dt already a
+        parameter' SYNTAX rule the numpy runtime applies.  The printer no longer
+        hardcodes the ``(time, X)`` tail; it spells whatever the registry
+        declares."""
+        return tuple(k for k in self._operator_arg_keys(name) if k != "dt")
+
     def _kernel(self, name, expr, shape, argnames):
         # Bed/surface-trace ``Subs(f(ζ),ζ,0|1)`` nodes are resolved centrally at
         # the SystemModel → NumericalSystemModel seam (REQ-130,
@@ -357,15 +368,15 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         blocks.append(self._kernel("right_eigenvectors", self._zeros(ns * ns),
                                    (ns * ns, 1), ("Q", "Qaux", "p", "n")))
 
-        # source + jacobians (n_eq rows; jacobian (n_eq, n_state))
+        # source + jacobians (n_eq rows; jacobian (n_eq, n_state)).
+        # REQ-185: argnames READ from the declared Function.args registry (time +
+        # position X; dt rides in the p-slot so ``_registry_argnames`` drops it).
+        # Only on the standard hyperbolic Model.H (self._t185); Chorin sub-models
+        # keep the 3-arg source (their driver threads no cell time/position).
         sexpr, _ = self._expr_source()
-        # REQ-185: source gains time + position X (dt already rides in the p-slot
-        # via _uses_symbol(DT_SYMBOL), so no separate dt arg — matches the GO
-        # broadcast's "dt omitted when dt is already a model parameter").  Only on
-        # the standard hyperbolic Model.H (self._t185); Chorin sub-models keep 3-arg.
-        t185 = ("time", "X") if self._t185 else ()
-        blocks.append(self._kernel("source", sexpr, (ne, 1),
-                                   ("Q", "Qaux", "p") + t185))
+        src_args = (self._registry_argnames("source") if self._t185
+                    else ("Q", "Qaux", "p"))
+        blocks.append(self._kernel("source", sexpr, (ne, 1), src_args))
         jexpr, _ = self._expr_source_jac()
         blocks.append(self._kernel("source_jacobian_wrt_variables", jexpr,
                                    (ne * ns, 1), ("Q", "Qaux", "p")))
@@ -415,17 +426,21 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         blocks.append(self._kernel("update_variables", uv_expr,
                                    (n_uv, 1), ("Q", "Qaux", "p")))
         uaexpr, _ = self._expr_update_aux()
-        # REQ-185: the algebraic aux closure gains time + position X (no dt) — on
-        # the standard hyperbolic Model.H only.
-        t185 = ("time", "X") if self._t185 else ()
+        # REQ-185: the algebraic aux closure (+ its jacobian) gain time +
+        # position X from the registry (no dt); standard hyperbolic Model.H only.
+        ua_args = (self._registry_argnames("update_aux_variables") if self._t185
+                   else ("Q", "Qaux", "p"))
         blocks.append(self._kernel("update_aux_variables", uaexpr, (na, 1),
-                                   ("Q", "Qaux", "p") + t185))
+                                   ua_args))
         blocks.append(self._kernel("update_variables_jacobian_wrt_variables",
                                    self._identity_flat(ns), (ns * ns, 1),
                                    ("Q", "Qaux", "p")))
+        ua_jac_args = (self._registry_argnames(
+            "update_aux_variables_jacobian_wrt_variables")
+            if self._t185 else ("Q", "Qaux", "p"))
         blocks.append(self._kernel("update_aux_variables_jacobian_wrt_variables",
                                    self._zeros(na * ns), (na * ns, 1),
-                                   ("Q", "Qaux", "p") + t185))
+                                   ua_jac_args))
 
         # boundary conditions — the real per-tag dispatch: ``sm.boundary_conditions``
         # is a framework ``Function`` whose ``.definition`` is a Piecewise over
