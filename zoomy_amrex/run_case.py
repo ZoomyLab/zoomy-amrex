@@ -47,10 +47,18 @@ def _nsm(model):
     ``Model.system_model`` was deleted, so this no longer probes for it (a
     SystemModel is identified positively by ``.state``; raw SWE/SME Models
     have none)."""
-    from zoomy_core.numerics.numerical_system_model import to_numerical_system_model
+    from zoomy_core.numerics.numerical_system_model import NumericalSystemModel
+    from zoomy_core.systemmodel.operations import gate_eigenvalues_dry
     if hasattr(model, "state"):
         return model
-    return to_numerical_system_model(model)
+    # REQ-181: the dry eigenvalue gate is no longer a core default (core@bed8721,
+    # the depth default is [desingularize_hinv()] only).  amrex opts back in so its
+    # emitted eigenvalues stay byte-identical — gate_eigenvalues_dry carries the
+    # Max(.,0) power-guard internally, so this one op == the old combined default.
+    # from_system_model auto-promotes the raw Model and runs
+    # default_operations() + extra_operations.
+    return NumericalSystemModel.from_system_model(
+        model, extra_operations=[gate_eigenvalues_dry()])
 
 
 # ── geometry / IC helpers ───────────────────────────────────────────────────

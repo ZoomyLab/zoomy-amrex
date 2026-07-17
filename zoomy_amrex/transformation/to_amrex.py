@@ -53,23 +53,16 @@ def _heaviside_real(p, x, *h0):
             f": (({xv}) < 0.0 ? amrex::Real(0.0) : amrex::Real({h0v})))")
 
 
-# Numerics printer = core's AmrexNumerics, extended only to print a singleton
-# ``ImmutableDenseNDimArray`` reaching a scalar context.  The NumericalSystemModel
-# wet/dry gate (``gate_eigenvalues_dry``) wraps each eigenvalue in
-# ``conditional(h > eps, [lambda_k], 0)`` whose true branch is a one-element
-# array; core's printer has no scalar handler for it.  We keep core untouched and
-# add the unwrap here (mirrors AmrexSystemModelPrinter._print_ImmutableDenseNDimArray).
-# Otherwise core's AmrexNumerics is used verbatim (REQ-58: real
-# local_max_abs_eigenvalue, no NumericsUser.H indirection).
+# Numerics printer = core's AmrexNumerics, extended only with the real-valued
+# ``conditional`` / ``Heaviside`` C helpers.  The NDimArray-in-scalar-context
+# unwrap that used to live here is gone: core now guarantees the lowering seam
+# hands C-family printers pure scalars (shared conditional expansion + flatten,
+# core@9f0f2fc), so a singleton array never reaches the printer.  Otherwise core's
+# AmrexNumerics is used verbatim (REQ-58: real local_max_abs_eigenvalue, no
+# NumericsUser.H indirection).
 class AmrexNumericsPrinter(AmrexNumerics):
     c_functions = {**AmrexNumerics.c_functions, "conditional": _conditional_real,
                    "Heaviside": _heaviside_real}
-
-    def _print_ImmutableDenseNDimArray(self, expr):
-        flat = list(expr)
-        if len(flat) == 1:
-            return self._print(flat[0])
-        return "{" + ", ".join(self._print(e) for e in flat) + "}"
 
 
 def _emit_user_call(name):
@@ -242,20 +235,6 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             return self._zeros(self.n_eq * self.n_aux), self.n_eq * self.n_aux
         return self._vec([J[r, c] for r in range(self.n_eq)
                           for c in range(self.n_aux)]), self.n_eq * self.n_aux
-
-    def _print_ImmutableDenseNDimArray(self, expr):
-        """Print a sympy NDimArray that reaches a *scalar* context.
-
-        ``gate_eigenvalues_dry`` wraps each eigenvalue in
-        ``conditional(h > eps, [lambda_k], 0)`` whose true branch is a
-        one-element array.  When the ``conditional`` lambda doprints that
-        branch it lands here; unwrap the singleton to its scalar.  (A genuine
-        multi-element array in scalar context would be a bug, so brace-list it
-        defensively rather than silently dropping elements.)"""
-        flat = list(expr)
-        if len(flat) == 1:
-            return self._print(flat[0])
-        return "{" + ", ".join(self._print(e) for e in flat) + "}"
 
     def _expr_update_aux(self):
         ua = getattr(self.sm, "update_aux_variables", None)
