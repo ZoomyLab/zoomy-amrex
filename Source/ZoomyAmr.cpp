@@ -423,9 +423,15 @@ Real ZoomyAmr::ComputeDt(int lev)
 {
     const auto& geom = Geom(lev);
     auto dx = geom.CellSizeArray();
-    Real min_dx = amrex::min(dx[0], dx[1]);
     auto const& p = p_mat;
 
+    // REQ-186: LOCAL per-cell, per-direction CFL.  Reduce max over (cell, dir) of
+    // |lambda_dir| / dx_dir, then dt = cfl / that — i.e. dt = min_{i,dir}(cfl *
+    // dx_dir / |lambda_dir(i)|).  This couples each cell's OWN size and wave speed
+    // instead of global_min(dx) / global_max(|lambda|); a single small or slow
+    // cell no longer shrinks dt over the whole level, and anisotropic dx / per-
+    // direction wave speeds get their tight (correct) bound.  On a uniform square
+    // grid this is identical to the old cfl*min_dx/global_max.
     ReduceOps<ReduceOpMax> reduce_op;
     ReduceData<Real> reduce_data(reduce_op);
 
@@ -443,22 +449,23 @@ Real ZoomyAmr::ComputeDt(int lev)
 
                 // The driver never floors h; the model's eigenvalue is responsible
                 // for gating dry cells (it uses max(h, wet_dry_eps) internally).
-                Real max_ev = 0.0;
+                Real max_inv = 0.0;   // max over dir of |lambda_dir| / dx_dir
                 for (int dir = 0; dir < Model::dimension; ++dir) {
                     SmallMatrix<Real, Model::dimension, 1> n_hat{};
                     n_hat(dir, 0) = 1.0;
                     auto ev = Numerics::local_max_abs_eigenvalue(q, a, p, n_hat);
-                    if (ev(0, 0) > max_ev) max_ev = ev(0, 0);
+                    Real inv = ev(0, 0) / dx[dir];
+                    if (inv > max_inv) max_inv = inv;
                 }
-                return max_ev;
+                return max_inv;
             });
     }
 
-    Real global_max = amrex::get<0>(reduce_data.value(reduce_op));
-    ParallelDescriptor::ReduceRealMax(global_max);
+    Real global_max_inv = amrex::get<0>(reduce_data.value(reduce_op));
+    ParallelDescriptor::ReduceRealMax(global_max_inv);
 
-    if (global_max < 1e-14) return 1e-3;
-    Real dt = cfl * min_dx / global_max;
+    if (global_max_inv < 1e-14) return 1e-3;
+    Real dt = cfl / global_max_inv;
     return amrex::max(amrex::min(dt, dtmax), dtmin);
 }
 
