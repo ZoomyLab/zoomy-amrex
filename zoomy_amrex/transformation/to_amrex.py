@@ -581,12 +581,27 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
         riemann = NonconservativeRusanov
     num = riemann(model=sm)
 
-    (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
-    (out / "Model.H").write_text(
+    # WRITE-IF-DIFFERENT.  These headers are regenerated on every run_case call,
+    # and an unconditional write_text() refreshes the mtime even when the emitted
+    # code is byte-identical -- which makes `make` rebuild every translation unit
+    # that includes Model.H/Numerics.H, i.e. the whole driver.  On the CUDA build
+    # that is a full nvcc/ptxas recompile (~2 min) on EVERY run, dwarfing a solve
+    # that takes 2 s (60 s sim) to 26 s (600 s sim).  Skipping the write when the
+    # content is unchanged lets make no-op, so a re-run is just the solve.
+    def _write_if_changed(path, code):
+        try:
+            if path.exists() and path.read_text() == code:
+                return
+        except OSError:
+            pass
+        path.write_text(code)
+
+    _write_if_changed(out / "UserFunctions.H", USER_FUNCTIONS_H)
+    _write_if_changed(out / "Model.H",
         AmrexSystemModelPrinter(sm, analytical_eigenvalues=analytical_eigenvalues,
                                 time_position_ops=True)   # REQ-185 (hyperbolic path)
         .create_code())
-    (out / "Numerics.H").write_text(AmrexNumericsPrinter(num).create_code())
+    _write_if_changed(out / "Numerics.H", AmrexNumericsPrinter(num).create_code())
     return out
 
 
