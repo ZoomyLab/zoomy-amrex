@@ -142,12 +142,19 @@ inline void ZoomyAmr::SolveImplicitSourceGlobal(int lev, amrex::Real dt, amrex::
         gmres.solve(delta, rhs, 1e-4, 0.0);                    // J*delta = -F
 
         MultiFab::Saxpy(Q[lev], 1.0, delta, 0, 0, ncomp, 0);   // Q += delta
-        // positivity floor on depth
-        for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
-            auto Qa = Q[lev].array(mfi);
-            ParallelFor(mfi.validbox(), [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-                if (Qa(i, j, 0, idx_h) < 1e-8) Qa(i, j, 0, idx_h) = 1e-8;
-            });
-        }
+        // REQ-200(c): the private depth floor that used to sit here
+        //     if (Qa(i,j,0,idx_h) < 1e-8) Qa(i,j,0,idx_h) = 1e-8;
+        // is REMOVED. It was not a "floor" in the safe sense -- it RAISED h, i.e.
+        // it fabricated water on every dry cell of every Newton iterate, so the
+        // implicit-source path could not conserve mass by construction. Standing
+        // mandate: h is NEVER clamped; wet_dry_eps is only ever a threshold for
+        // forming the RECIPROCAL of h.
+        // Nothing here needs replacing: dry-safety already lives in the operator,
+        // which is where core (REQ-200) argues it belongs -- the model's
+        // update_aux_variables forms hinv = 1/max(h, wet_dry_eps), so the source
+        // is finite for any depth, and guard_eigenvalue_powers (run_case.py:70)
+        // keeps Max(0, .) under the sqrt so a roundoff-negative h cannot NaN the
+        // spectrum. A call-site clamp on top of that is exactly how the fused and
+        // legacy paths came to disagree.
     }
 }

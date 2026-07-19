@@ -207,7 +207,11 @@ def _resolve_riemann(spec):
     return getattr(_rs, spec)
 
 
-def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
+def _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
+    """Build+stage the EXPLICIT HYPERBOLIC driver — for ANY hyperbolic model, not
+    just SWE. SME and non-Chorin VAM route here too; the pressure-projection
+    (Chorin) models are the only ones that go to _run_chorin instead. Was named
+    ``_run_swe``, which read as SWE-only and was misleading."""
     src = bdir / "Source"; ex = bdir / "Exec"
     # Model.H / Numerics.H / UserFunctions.H are GENERATED below by
     # generate_headers().  The repo's Source/ also carries checked-in copies of
@@ -347,7 +351,7 @@ def run_case(model, settings, output_dir, on_progress=None):
     if is_chorin:
         ex = _run_chorin(model, sm, settings, geom, dim, bdir, dem or bed, rel or dep)
     else:
-        ex = _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters)
+        ex = _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters)
 
     n = os.cpu_count() or 4
     subprocess.run(["make", f"-j{n}"], cwd=ex, check=True)
