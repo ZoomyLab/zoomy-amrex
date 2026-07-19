@@ -696,11 +696,19 @@ void ZoomyAmr::Evolve()
 
         Real mass = ComputeTotalMass();
         Real drift = (mass0 != 0.0) ? (mass - mass0) / mass0 : (mass - mass0);
-        Print() << "Step " << step << " dt: " << dt0
-                << " time: " << time << "s"
+        // REQ-207(B): std::setprecision is STICKY on the stream, so a trailing
+        // setprecision(4) for `drift` silently degraded `dt`/`time` on every
+        // subsequent line. Any conservation check that reconstructs an expected
+        // mass from the parsed log then sees a fabricated ~1e-4 "drift" that is
+        // pure formatting (this cost river a false-positive mass-leak hunt).
+        // Every field now carries its OWN precision, so the line is independent
+        // of prior stream state and cannot leak into the next step.
+        Print() << "Step " << step
+                << " dt: "   << std::setprecision(12) << dt0
+                << " time: " << std::setprecision(12) << time << "s"
                 << " levels: " << finest_level + 1
-                << " mass: " << std::setprecision(14) << mass
-                << " drift: " << std::setprecision(4) << drift << "\n";
+                << " mass: "  << std::setprecision(14) << mass
+                << " drift: " << std::setprecision(4)  << drift << "\n";
     }
 
     WritePlotFile(plot_step, time);

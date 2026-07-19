@@ -109,8 +109,21 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
     aL = Model::update_aux_variables(qL, aL, p_mat, time, X_L);
     aR = Model::update_aux_variables(qR, aR, p_mat, time, X_R);
 
-    flux = Numerics::numerical_flux(qL, qR, aL, aR, p_mat, n_hat);
-    fluct = Numerics::numerical_fluctuations(qL, qR, aL, aR, p_mat, n_hat);
+    // REQ-207(A): ONE fused face kernel instead of two silo'd calls.  Core's
+    // numerical_face (REQ-194, zoomy_core@068b3a1) emits flux + fluctuations in a
+    // single CSE scope, so shared subexpressions (eigenvalues, hinv, sqrt(g*h)) are
+    // computed once rather than once per operator: 251 -> 205 face ops (-18.3%).
+    // Packed flat as [ flux(n) | D+(n) | D-(n) | lambda_max(1) ] = (3n+1,1).
+    // The legacy numerical_flux/numerical_fluctuations names remain registered and
+    // come from the SAME cached definitions, so this is a local, no-risk swap.
+    // Slot 3n (lambda_max) is a free by-product; ComputeDt derives its own per-CELL
+    // bound, so it is deliberately NOT consumed here (that would change dt semantics).
+    auto face = Numerics::numerical_face(qL, qR, aL, aR, p_mat, n_hat);
+    for (int n = 0; n < Model::n_dof_q; ++n) {
+        flux(n, 0)                   = face(n, 0);
+        fluct(n, 0)                  = face(Model::n_dof_q + n, 0);      // D+
+        fluct(Model::n_dof_q + n, 0) = face(2 * Model::n_dof_q + n, 0);  // D-
+    }
 }
 
 // ----------------------------------------------------------------------------
