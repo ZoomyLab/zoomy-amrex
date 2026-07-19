@@ -109,21 +109,20 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
     aL = Model::update_aux_variables(qL, aL, p_mat, time, X_L);
     aR = Model::update_aux_variables(qR, aR, p_mat, time, X_R);
 
-    // REQ-207(A): ONE fused face kernel instead of two silo'd calls.  Core's
-    // numerical_face (REQ-194, zoomy_core@068b3a1) emits flux + fluctuations in a
-    // single CSE scope, so shared subexpressions (eigenvalues, hinv, sqrt(g*h)) are
-    // computed once rather than once per operator: 251 -> 205 face ops (-18.3%).
-    // Packed flat as [ flux(n) | D+(n) | D-(n) | lambda_max(1) ] = (3n+1,1).
-    // The legacy numerical_flux/numerical_fluctuations names remain registered and
-    // come from the SAME cached definitions, so this is a local, no-risk swap.
-    // Slot 3n (lambda_max) is a free by-product; ComputeDt derives its own per-CELL
-    // bound, so it is deliberately NOT consumed here (that would change dt semantics).
-    auto face = Numerics::numerical_face(qL, qR, aL, aR, p_mat, n_hat);
-    for (int n = 0; n < Model::n_dof_q; ++n) {
-        flux(n, 0)                   = face(n, 0);
-        fluct(n, 0)                  = face(Model::n_dof_q + n, 0);      // D+
-        fluct(Model::n_dof_q + n, 0) = face(2 * Model::n_dof_q + n, 0);  // D-
-    }
+    // REQ-212(a): back to the two legacy calls.  The fused numerical_face
+    // (REQ-194/207) is being REMOVED from core per a user design decision: the
+    // CSE-silo problem it addressed will instead be solved by a printer option
+    // that resolves opaque functions so CSE sees through them, with max-|lambda|
+    // becoming an extra OUTPUT of numerical_flux.
+    // The measurement agreed with dropping it -- on GPU the fusion was a
+    // PESSIMISATION, not a win: 23.18 -> 24.02 s, registers 112 -> 137, occupancy
+    // halved. The -18.3% op count never reached the clock because the packed
+    // kernel's live range blew the register budget.
+    // Safe to revert: these names never stopped being registered and come from the
+    // same cached definitions -- the A/B in 3997673 showed byte-identical dt either
+    // way (Step 1 0.0158738780034 ... Step 7 0.00676464827122).
+    flux = Numerics::numerical_flux(qL, qR, aL, aR, p_mat, n_hat);
+    fluct = Numerics::numerical_fluctuations(qL, qR, aL, aR, p_mat, n_hat);
 }
 
 // ----------------------------------------------------------------------------

@@ -106,6 +106,28 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         "compute_derivative": _emit_user_call("compute_derivative"),
     }
 
+    def _detect_has_diffusion(self):
+        """REQ-212(b): is the model's diffusion_matrix non-trivial?
+
+        This used to be hardcoded ``false``, which silently compiled out the
+        driver's diffusive path (``make_rhs.H``'s ``if constexpr
+        (Model::has_diffusion)``) for EVERY model -- a diffusive model ran as if
+        inviscid, with no warning. That path is a real implementation, not a stub,
+        so the hardcode was disabling working code.
+
+        Mirrors core's ``GenericCppModel._detect_has_diffusion``. It is duplicated
+        rather than inherited because this printer derives from ``GenericCppBase``,
+        not ``GenericCppModel`` (see the module docstring) -- if core's detection
+        gains structure, this must follow it.
+        """
+        import sympy as _sp
+        expr = getattr(self.sm, "diffusion_matrix", None)
+        if expr is None:
+            return False
+        if hasattr(expr, "__iter__"):
+            return not all(_sp.simplify(e) == 0 for e in _sp.flatten(expr))
+        return _sp.simplify(expr) != 0
+
     def __init__(self, sm, *, analytical_eigenvalues=True, wrapper_name="Model",
                  time_position_ops=False):
         super().__init__()
@@ -331,7 +353,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             f"    static constexpr int n_parameters = {self.n_param};",
             f"    static constexpr int dimension  = {self.dim};",
             f"    static constexpr int n_dof_gradQ = {self.n_state * self.dim};",
-            "    static constexpr bool has_diffusion = false;",
+            f"    static constexpr bool has_diffusion = {'true' if self._detect_has_diffusion() else 'false'};",
             f"    static constexpr int n_boundary_tags = {len(bc_tags)};",
             f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
             f"    static const std::vector<std::string> parameter_names() {{ return {{ {p_names} }}; }}",
