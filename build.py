@@ -20,6 +20,7 @@ SRC = HERE / "Source"
 
 GNUMAKEFILE = """AMREX_HOME ?= {amrex_home}
 DEBUG        = FALSE
+TINY_PROFILE = {tiny_profile}
 USE_MPI      = {use_mpi}
 USE_OMP      = FALSE
 USE_CUDA     = {use_cuda}

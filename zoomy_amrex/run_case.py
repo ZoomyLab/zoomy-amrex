@@ -48,17 +48,27 @@ def _nsm(model):
     SystemModel is identified positively by ``.state``; raw SWE/SME Models
     have none)."""
     from zoomy_core.numerics.numerical_system_model import NumericalSystemModel
-    from zoomy_core.systemmodel.operations import gate_eigenvalues_dry
+    from zoomy_core.systemmodel.operations import guard_eigenvalue_powers
     if hasattr(model, "state"):
         return model
     # REQ-181: the dry eigenvalue gate is no longer a core default (core@bed8721,
-    # the depth default is [desingularize_hinv()] only).  amrex opts back in so its
-    # emitted eigenvalues stay byte-identical — gate_eigenvalues_dry carries the
-    # Max(.,0) power-guard internally, so this one op == the old combined default.
-    # from_system_model auto-promotes the raw Model and runs
-    # default_operations() + extra_operations.
+    # the depth default is [desingularize_hinv()] only).  amrex previously opted
+    # back into the DRY-ZEROING gate_eigenvalues_dry purely so its emitted
+    # eigenvalues stayed byte-identical with the old default — but that zeroing is
+    # a POSITIVITY BUG, and amrex was the only backend using it:
+    #   dmplex/create_model.py:43-50 — "the zeroing undersizes Rusanov dissipation
+    #   between two near-dry cells and breaks the Xing-Zhang cell-mean-positivity
+    #   decomposition; the numpy/jax Malpasset reference runs this same
+    #   ev_gate=False recipe."
+    # jax / foam / firedrake opt into neither; dmplex opts into the always-safe
+    # half only.  Zeroing lambda also zeroes Rusanov's viscosity coefficient
+    # s_max = max(|lambda(qL)|,|lambda(qR)|), so every face whose two cells sit
+    # below wet_dry_eps runs as a pure CENTRAL scheme (no artificial viscosity)
+    # AND contributes nothing to the CFL reduction.  Use the always-safe half:
+    # guard_eigenvalue_powers keeps the Max(.,0) guard under sqrt(h) (no NaN on a
+    # transient negative h) without zeroing the wave speed.
     return NumericalSystemModel.from_system_model(
-        model, extra_operations=[gate_eigenvalues_dry()])
+        model, extra_operations=[guard_eigenvalue_powers()])
 
 
 # ── geometry / IC helpers ───────────────────────────────────────────────────
@@ -185,15 +195,39 @@ def _cuda_opts():
     return ("TRUE" if on else "FALSE"), os.environ.get("ZOOMY_AMREX_CUDA_ARCH", "89")
 
 
+def _resolve_riemann(spec):
+    """``settings['riemann']`` -> a ``riemann_solvers.Numerics`` subclass.
+
+    Accepts a class directly, a class name (e.g. ``"PositiveNonconservativeHLL"``),
+    or ``None`` (the printer's default ``NonconservativeRusanov``). Lets a case pick
+    a less-diffusive flux (HLL/HLLC/Roe) without editing the printer."""
+    if spec is None or isinstance(spec, type):
+        return spec
+    from zoomy_core.fvm import riemann_solvers as _rs
+    return getattr(_rs, spec)
+
+
 def _run_swe(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters):
     src = bdir / "Source"; ex = bdir / "Exec"
+    # Model.H / Numerics.H / UserFunctions.H are GENERATED below by
+    # generate_headers().  The repo's Source/ also carries checked-in copies of
+    # them (stale artefacts of whichever model was emitted last), and copying
+    # those in first meant every run did: copy stale -> generate correct ->
+    # mtime bumps -> the 3 CUDA translation units recompile.  That full nvcc
+    # rebuild dominated the wall time of every run (the solve itself is ~2 s for
+    # a 60 s sim).  Skip them: codegen is deterministic, so with the generated
+    # files left in place an unchanged re-run is a make no-op.
+    _GENERATED = {"Model.H", "Numerics.H", "UserFunctions.H"}
     for f in _SRC.iterdir():
+        if f.name in _GENERATED:
+            continue
         if f.suffix in (".cpp", ".H") or f.name == "Make.package":
             shutil.copy2(f, src / f.name)
-    generate_headers(sm, src)
+    generate_headers(sm, src, riemann=_resolve_riemann(settings.get("riemann")))
     _cuda, _arch = _cuda_opts()
     (ex / "GNUmakefile").write_text(_bld().GNUMAKEFILE.format(
-        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda=_cuda, cuda_arch=_arch))
+        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda=_cuda, cuda_arch=_arch,
+        tiny_profile=os.environ.get("ZOOMY_AMREX_TINY_PROFILE", "FALSE")))
     _bld().write_inputs(
         ex / "inputs", geom["nx"], 2,
         tend=settings.get("time_end", 0.1), order=settings.get("spatial_order", 1),
@@ -269,7 +303,8 @@ def _run_chorin(model, sm, settings, geom, dim, bdir, dem, rel):
     write_chorin_headers(split, src)
     _cuda, _arch = _cuda_opts()
     (ex / "GNUmakefile").write_text(_bld().GNUMAKEFILE.format(
-        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda=_cuda, cuda_arch=_arch))
+        amrex_home=_amrex_home(), dim=2, use_mpi="TRUE", use_cuda=_cuda, cuda_arch=_arch,
+        tiny_profile=os.environ.get("ZOOMY_AMREX_TINY_PROFILE", "FALSE")))
     _write_chorin_inputs(ex / "inputs", geom, dim, settings, dem, rel)
     return ex
 

@@ -3,6 +3,7 @@
 #include <AMReX_PlotFileUtil.H>
 #include <AMReX_MultiFabUtil.H>
 #include <AMReX_FillPatchUtil.H>
+#include <AMReX_BLProfiler.H>
 #include <AMReX_GMRES.H>
 #include "imex_solver.H"
 #include <iomanip>
@@ -246,6 +247,7 @@ void ZoomyAmr::ErrorEst(int lev, TagBoxArray& tags, Real /*time*/, int /*ngrow*/
 // ==========================================================================
 void ZoomyAmr::FillPatch(int lev, Real time, MultiFab& mf, int icomp, int ncomp)
 {
+    BL_PROFILE("ZoomyAmr::FillPatch");
     NullFill null_fill;
     if (lev == 0) {
         amrex::FillPatchSingleLevel(mf, time, {&Q[lev]}, {t_new[lev]},
@@ -280,6 +282,7 @@ void ZoomyAmr::FillCoarsePatch(int lev, Real time, MultiFab& mf, int icomp, int 
 // ==========================================================================
 void ZoomyAmr::UpdateState(int lev, Real time)
 {
+    BL_PROFILE("ZoomyAmr::UpdateState");
     auto const& p = p_mat;
     // REQ-185: cell position for a time/space-dependent update_aux_variables.
     const auto& geom = Geom(lev);
@@ -328,6 +331,7 @@ void ZoomyAmr::FillPhysicalBC(int lev, Real time)
 
 void ZoomyAmr::FillPhysicalBC_mf(MultiFab& Qmf, MultiFab& Qauxmf, int lev, Real time)
 {
+    BL_PROFILE("ZoomyAmr::FillPhysicalBC");
     const auto& geom = Geom(lev);
     const auto& domain = geom.Domain();
     const int dom_lo_x = domain.smallEnd(0), dom_hi_x = domain.bigEnd(0);
@@ -421,6 +425,7 @@ void ZoomyAmr::FillPhysicalBC_mf(MultiFab& Qmf, MultiFab& Qauxmf, int lev, Real 
 // ==========================================================================
 Real ZoomyAmr::ComputeDt(int lev)
 {
+    BL_PROFILE("ZoomyAmr::ComputeDt");
     const auto& geom = Geom(lev);
     auto dx = geom.CellSizeArray();
     auto const& p = p_mat;
@@ -476,6 +481,7 @@ Real ZoomyAmr::ComputeDt(int lev)
 
 Real ZoomyAmr::ComputeTotalMass()
 {
+    BL_PROFILE("ZoomyAmr::ComputeTotalMass");
     Real total = 0.0;
     for (int lev = 0; lev <= finest_level; ++lev) {
         const Real cell_vol = Geom(lev).CellSize(0) * Geom(lev).CellSize(1);
@@ -496,6 +502,7 @@ Real ZoomyAmr::ComputeTotalMass()
 
 void ZoomyAmr::Advance(int lev, Real time, Real dt)
 {
+    BL_PROFILE("ZoomyAmr::Advance");
     const auto& geom = Geom(lev);
     auto dx = geom.CellSizeArray();
     auto plo = geom.ProbLoArray();   // REQ-185: cell position for source/aux
@@ -707,6 +714,7 @@ void ZoomyAmr::Evolve()
 // ==========================================================================
 void ZoomyAmr::WritePlotFile(int step, Real time)
 {
+    BL_PROFILE("ZoomyAmr::WritePlotFile");
     const std::string pltfile = Concatenate(Concatenate("plt_", identifier), step, 5);
 
     Vector<std::string> var_names;
