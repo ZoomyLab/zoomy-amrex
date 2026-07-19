@@ -29,6 +29,17 @@ COMP         = gnu
 DIM          = {dim}
 
 include $(AMREX_HOME)/Tools/GNUMake/Make.defs
+
+# -fmad=false: disable nvcc's automatic fused multiply-add contraction.
+# The device eigensolver (Source/ZoomyEig.H) makes ACCEPT/REJECT decisions on
+# floating-point comparisons -- QR deflation, the pivot-collapse test, the
+# ||L R - I|| gate -- and FMA contraction changes those outcomes between the
+# host and device builds.  A face that is a Roe matrix on CPU and a +inf refusal
+# on GPU is not a rounding difference, it is a different scheme.
+ifeq ($(USE_CUDA),TRUE)
+  CXXFLAGS += -fmad=false
+endif
+
 include ../Source/Make.package
 VPATH_LOCATIONS  += ../Source
 INCLUDE_LOCATIONS += ../Source
@@ -115,6 +126,7 @@ CEXE_headers += ModelPress.H
 CEXE_headers += ModelCorr.H
 CEXE_headers += NumericsPred.H
 CEXE_headers += UserFunctions.H
+CEXE_headers += ZoomyEig.H
 """
 CHORIN_MAKE_PACKAGE = ("CEXE_sources += chorin_main.cpp\n"
                        "CEXE_sources += init_solution.cpp\n\n" + _CHORIN_HEADERS)

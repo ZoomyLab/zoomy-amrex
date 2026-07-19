@@ -221,7 +221,7 @@ def _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_raster
     # rebuild dominated the wall time of every run (the solve itself is ~2 s for
     # a 60 s sim).  Skip them: codegen is deterministic, so with the generated
     # files left in place an unchanged re-run is a make no-op.
-    _GENERATED = {"Model.H", "Numerics.H", "UserFunctions.H"}
+    _GENERATED = {"Model.H", "Numerics.H", "UserFunctions.H", "ZoomyEig.H"}
     for f in _SRC.iterdir():
         if f.name in _GENERATED:
             continue

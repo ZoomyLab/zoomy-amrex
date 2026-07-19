@@ -53,18 +53,6 @@ def _heaviside_real(p, x, *h0):
             f": (({xv}) < 0.0 ? amrex::Real(0.0) : amrex::Real({h0v})))")
 
 
-# Numerics printer = core's AmrexNumerics, extended only with the real-valued
-# ``conditional`` / ``Heaviside`` C helpers.  The NDimArray-in-scalar-context
-# unwrap that used to live here is gone: core now guarantees the lowering seam
-# hands C-family printers pure scalars (shared conditional expansion + flatten,
-# core@9f0f2fc), so a singleton array never reaches the printer.  Otherwise core's
-# AmrexNumerics is used verbatim (REQ-58: real local_max_abs_eigenvalue, no
-# NumericsUser.H indirection).
-class AmrexNumericsPrinter(AmrexNumerics):
-    c_functions = {**AmrexNumerics.c_functions, "conditional": _conditional_real,
-                   "Heaviside": _heaviside_real}
-
-
 def _emit_user_call(name):
     """Return a ``c_functions`` lambda that prints ``amrex_user::<name>(args...)``
     — an opaque call resolved by the hand-written ``UserFunctions.H`` helper."""
@@ -73,6 +61,31 @@ def _emit_user_call(name):
         return f"amrex_user::{name}({', '.join(p.doprint(a) for a in args)})"
 
     return _printer
+
+
+# Numerics printer = core's AmrexNumerics, extended only with the real-valued
+# ``conditional`` / ``Heaviside`` C helpers.  The NDimArray-in-scalar-context
+# unwrap that used to live here is gone: core now guarantees the lowering seam
+# hands C-family printers pure scalars (shared conditional expansion + flatten,
+# core@9f0f2fc), so a singleton array never reaches the printer.  Otherwise core's
+# AmrexNumerics is used verbatim (REQ-58: real local_max_abs_eigenvalue, no
+# NumericsUser.H indirection).
+#
+# The opaque kernels MUST be re-mapped here as well as on the Model printer.
+# Core's ``generic_c.py`` map emits a BARE ``eigensystem(...)`` and has no entry
+# at all for ``eigenvalues`` / ``solve`` (they fall through to the raw-name
+# fallback in ``zoomy_core/transformation/to_amrex.py::AmrexCore._print_Function``),
+# and this printer is what writes ``Numerics.H`` / ``NumericsPred.H``.  ADL cannot
+# rescue the unqualified call: every argument is ``double`` or ``int``, a
+# fundamental type with no associated namespace, so ``amrex_user`` is never
+# searched.  Without these three entries ``--model vam`` fails to compile with
+# "'eigenvalues' was not declared in this scope".
+class AmrexNumericsPrinter(AmrexNumerics):
+    c_functions = {**AmrexNumerics.c_functions, "conditional": _conditional_real,
+                   "Heaviside": _heaviside_real,
+                   "eigenvalues": _emit_user_call("eigenvalues"),
+                   "eigensystem": _emit_user_call("eigensystem"),
+                   "solve": _emit_user_call("solve")}
 
 
 class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
@@ -87,7 +100,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         **GenericCppBase.c_functions,
         "conditional": _conditional_real,
         "Heaviside": _heaviside_real,
+        "eigenvalues": _emit_user_call("eigenvalues"),
         "eigensystem": _emit_user_call("eigensystem"),
+        "solve": _emit_user_call("solve"),
         "compute_derivative": _emit_user_call("compute_derivative"),
     }
 
@@ -536,30 +551,27 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
 
 # ── user-functions helper header (opaque kernel bodies) ─────────────────────
-USER_FUNCTIONS_H = """#pragma once
-// Hand-written AMReX implementations of the opaque "kernel" placeholder
-// functions (zoomy_core.model.kernel_functions).  The code printer emits
-// `amrex_user::<name>(...)` calls; these are their device-side definitions.
-// SWE/SME with a Rusanov flux does not invoke eigensystem / compute_derivative,
-// so these are stubs until a Roe scheme or non-local aux is wired (task 0026).
-#include <AMReX_REAL.H>
-#include <AMReX_GpuQualifiers.H>
+# These are HAND-WRITTEN C++, not generated code, and they now live where C++
+# belongs: ``Source/UserFunctions.H`` (the 4 kernel entry points) and
+# ``Source/ZoomyEig.H`` (the device eigensolver they call).  They used to be a
+# Python string literal here, which meant the checked-in Source/UserFunctions.H
+# was dead — silently overwritten by this constant on every run.  A real
+# implementation was landed in the .H and had no effect at all until this
+# indirection was removed, so: ONE source of truth, and it is the .H file.
+from pathlib import Path as _Path
 
-namespace amrex_user {
+_USER_FN_SOURCES = ("UserFunctions.H", "ZoomyEig.H")
+_SOURCE_DIR = _Path(__file__).resolve().parents[2] / "Source"
 
-// Placeholder: a Roe-style eigensystem helper.  Returns its first argument.
-template <typename T>
-AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-T eigensystem(T a) noexcept { return a; }
 
-// Placeholder: non-local spatial derivative (LSQ gradient) aux.  The driver
-// supplies real gradients via Qaux; this opaque fallback returns 0.
-template <typename T>
-AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-T compute_derivative(T) noexcept { return T(0); }
+def _stage_user_functions(out, write):
+    """Copy the hand-written kernel headers into the generated *out* dir.
 
-}  // namespace amrex_user
-"""
+    ``write`` is the caller's write-if-changed helper: these files are stable
+    across runs, and refreshing their mtime would force a full rebuild of every
+    translation unit that includes them (all of them)."""
+    for name in _USER_FN_SOURCES:
+        write(out / name, (_SOURCE_DIR / name).read_text())
 
 
 def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
@@ -596,7 +608,7 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
             pass
         path.write_text(code)
 
-    _write_if_changed(out / "UserFunctions.H", USER_FUNCTIONS_H)
+    _stage_user_functions(out, _write_if_changed)
     _write_if_changed(out / "Model.H",
         AmrexSystemModelPrinter(sm, analytical_eigenvalues=analytical_eigenvalues,
                                 time_position_ops=True)   # REQ-185 (hyperbolic path)
@@ -625,7 +637,15 @@ def write_chorin_headers(split, out_dir):
     from zoomy_core.fvm.riemann_solvers import PositiveNonconservativeRusanov
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
 
-    (out / "UserFunctions.H").write_text(USER_FUNCTIONS_H)
+    def _write_if_changed(path, code):
+        try:
+            if path.exists() and path.read_text() == code:
+                return
+        except OSError:
+            pass
+        path.write_text(code)
+
+    _stage_user_functions(out, _write_if_changed)
     for sub, name in [(split.SM_pred, "ModelPred"),
                       (split.SM_press, "ModelPress"),
                       (split.SM_corr, "ModelCorr")]:
