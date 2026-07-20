@@ -33,7 +33,15 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
                amrex::Array4<const amrex::Real> const& Q,
                amrex::Array4<const amrex::Real> const& Qaux,
                const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
-               amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1>& flux,
+               // n_dof_q + 1, NOT n_dof_q: core's numerical_flux gained a
+               // trailing row carrying the face max|lambda| (zoomy_core
+               // 3060918, the REQ-212 amendment). Rows 0..n_dof_q-1 are the
+               // flux; row n_dof_q is that eigenvalue and is optional to read.
+               // Sizing this at n_dof_q made the driver fail to COMPILE
+               // against any freshly generated Numerics.H -- measured
+               // 2026-07-20: "no match for operator= (SmallMatrix<double,4,1>
+               // and SmallMatrix<double,5,1>)" at the assignment below.
+               amrex::SmallMatrix<amrex::Real, Model::n_dof_q + 1, 1>& flux,
                amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1>& fluct, // <-- Flat 1D Vector
                amrex::Real time, amrex::Real dx, amrex::Real dy,             // REQ-185
                amrex::Real plox, amrex::Real ploy,                          // REQ-185
@@ -135,7 +143,10 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
                       amrex::Real time, amrex::Real plox, amrex::Real ploy,   // REQ-185
                       bool well_balanced = false)
 {
-    amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> flux_xr, flux_xl, flux_yr, flux_yl;
+    // n_dof_q + 1 to match eval_face's out-param: row n_dof_q is the face
+    // max|lambda| that core's numerical_flux now returns. The divergence loop
+    // below reads rows 0..n_dof_q-1 only, so the extra row is inert here.
+    amrex::SmallMatrix<amrex::Real, Model::n_dof_q + 1, 1> flux_xr, flux_xl, flux_yr, flux_yl;
 
     // Flat 1D Vectors
     amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1> fluct_xr, fluct_xl, fluct_yr, fluct_yl;
