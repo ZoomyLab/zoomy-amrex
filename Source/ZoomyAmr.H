@@ -92,6 +92,12 @@ public:
     // Parameters (read from inputs)
     amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1> p_mat;
     amrex::Real time_end  = 1.0;
+    // Stop after exactly this many steps, in ADDITION to time_end; <0 disables.
+    // The backend test suite's "small twin" pattern marches a tiny mesh for
+    // exactly 2 steps, which a time-terminated loop cannot express: dt is
+    // adaptive, so no time_end pins a step count. ZoomyAmr derives from
+    // AmrCore and runs its own Evolve(), so no framework key supplies this.
+    int max_step          = -1;
     amrex::Real cfl       = 0.5;
     amrex::Real dtmin     = 1.0e-7;
     amrex::Real dtmax     = 1.0e-2;

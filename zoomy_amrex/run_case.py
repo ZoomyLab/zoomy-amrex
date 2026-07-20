@@ -241,6 +241,17 @@ def _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_raster
         # Defaults to tend (uncapped) when unset; a case with a dry start must set it
         # to a sensible cadence so the dry phase steps instead of leaping to time_end.
         dtmax=settings.get("dtmax"),
+        # max_step: stop after exactly N steps, IN ADDITION to time_end. The
+        # backend suite's small twins march 2 steps on a tiny mesh, which a
+        # time-terminated loop cannot express (dt is adaptive, so no time_end
+        # pins a step count). Unset -> -1 -> historical time-only behaviour.
+        max_step=settings.get("max_step"),
+        # dtmin: was hardcoded 1.e-7 with no knob, so any step below it was
+        # SILENTLY clamped. The user has ruled that an instability at the
+        # mandated CFL is a REPORTABLE FINDING, never met with a silent
+        # reduction — so a test asserting CFL behaviour sets this to 0 and lets
+        # the run fail honestly instead of limping on a floored dt.
+        dtmin=settings.get("dtmin"),
         geom=geom, dem_file=dem, release_file=rel,
         # REQ-123: full-state IC (all rows) + model per-side BCs on the structured
         # faces (the SWE/AmrCore driver dispatches Model::boundary_conditions).

@@ -56,7 +56,8 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
                  implicit_source=False, implicit_global=False, friction=None, slip=None,
                  max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None,
                  well_balanced=False, clamp_positivity=True, tag_b_max=None,
-                 bc_sides=None, state_rasters=None, positivity="none", dtmax=None):
+                 bc_sides=None, state_rasters=None, positivity="none", dtmax=None,
+                 max_step=None, dtmin=None):
     if geom is not None:
         # Externally-supplied rectangular geometry (e.g. the mesh bbox).
         nx, ny = geom["nx"], geom["ny"]
@@ -105,8 +106,8 @@ geometry.is_periodic = {isper}
 {bc_block}{fric_block}output.identifier       = 0
 output.plot_dt_interval = {plot_dt}
 solver.time_end        = {tend}
-solver.cfl             = {cfl}
-solver.dtmin           = 1.e-7
+{f'solver.max_step        = {max_step}' + chr(10) if max_step is not None else ''}solver.cfl             = {cfl}
+solver.dtmin           = {'1.e-7' if dtmin is None else dtmin}
 solver.dtmax           = {tend if dtmax is None else dtmax}
 solver.spatial_order   = {order}
 solver.implicit_source = {'true' if implicit_source else 'false'}

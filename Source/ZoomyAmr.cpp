@@ -38,6 +38,7 @@ ZoomyAmr::ZoomyAmr()
     }
     { ParmParse pp("solver");
       pp.query("time_end", time_end);
+      pp.query("max_step", max_step);
       pp.query("cfl", cfl);
       pp.query("dtmin", dtmin);
       pp.query("dtmax", dtmax);
@@ -681,7 +682,10 @@ void ZoomyAmr::Evolve()
     const Real mass0 = ComputeTotalMass();
     Print() << "Initial total mass = " << std::setprecision(12) << mass0 << "\n";
 
-    while (time < time_end) {
+    // max_step < 0 disables the step cap, so the default is the historical
+    // time-only loop, bit-for-bit. The final WritePlotFile below runs either
+    // way, so a step-capped run still emits its last state.
+    while (time < time_end && (max_step < 0 || step < max_step)) {
         if (time >= next_plot_time) {
             WritePlotFile(plot_step, time);
             next_plot_time += plot_dt_interval;
