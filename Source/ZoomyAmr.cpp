@@ -725,17 +725,55 @@ void ZoomyAmr::WritePlotFile(int step, Real time)
     BL_PROFILE("ZoomyAmr::WritePlotFile");
     const std::string pltfile = Concatenate(Concatenate("plt_", identifier), step, 5);
 
+    // Q AND Qaux.  Writing Q alone was a REGRESSION from the AmrCore refactor
+    // (8aaa626): the single-level driver it replaced called
+    // write_plotfiles(identifier, step, Q, Qaux, geom, time) (main.cpp:199,316
+    // at 8aaa626^) and emitted both.  write_plotfiles.cpp still carries that
+    // stitching logic but has had no caller since, so aux silently stopped
+    // being observable.
+    //
+    // CORRECTED 2026-07-20.  An earlier version of this comment claimed aux was
+    // a cross-step RECURRENCE and therefore unrecoverable.  That was WRONG, and
+    // it briefly propagated into the v6 design before the user rejected it.
+    // Qaux is BY CONTRACT a per-cell local formula in (Q, parameters):
+    // system_model.py:635-640, and the emitted kernel proves it — the generated
+    // update_aux_variables body reads only Q(1,0) and p(5,0) (the KP
+    // desingularised hinv) and never puts Qaux on a right-hand side.  Qaux sits
+    // in the signature only so the operator can return a full-length vector.
+    // The misreading came from the STALE checked-in Source/Model.H, whose
+    // placeholder body is a 4-row identity — the generated header is authority,
+    // never the repo copy.
+    //
+    // Writing aux is still right, on two honest grounds:
+    //   * it lets a test check the solver ACTUALLY HELD to that contract.
+    //     Recomputing aux in post would test the recomputation, and a solver
+    //     whose aux had drifted from f(Q,p) would still pass.
+    //   * the non-local LSQ derivative aux rows would need the mesh gradient
+    //     machinery to rebuild in post — cheap to write, expensive to redo.
+    constexpr int ncomp_plot = Model::n_dof_q + Model::n_dof_qaux;
+
     Vector<std::string> var_names;
     for (int n = 0; n < Model::n_dof_q; ++n)
         var_names.push_back(Concatenate("var", n, 1));
+    for (int n = 0; n < Model::n_dof_qaux; ++n)
+        var_names.push_back(Concatenate("aux", n, 1));
 
+    Vector<MultiFab> plot_mf(finest_level + 1);
     Vector<const MultiFab*> mf_ptrs(finest_level + 1);
     Vector<Geometry> geoms(finest_level + 1);
     Vector<int> level_steps(finest_level + 1, step);
     Vector<IntVect> ref_ratios(finest_level);
 
     for (int lev = 0; lev <= finest_level; ++lev) {
-        mf_ptrs[lev] = &Q[lev];
+        // One fab per level, since WriteMultiLevelPlotfile takes a single fab
+        // per level.  No ghost cells: a plotfile carries valid data only.
+        plot_mf[lev].define(Q[lev].boxArray(), Q[lev].DistributionMap(),
+                            ncomp_plot, 0);
+        MultiFab::Copy(plot_mf[lev], Q[lev], 0, 0, Model::n_dof_q, 0);
+        if constexpr (Model::n_dof_qaux > 0)
+            MultiFab::Copy(plot_mf[lev], Qaux[lev], 0, Model::n_dof_q,
+                           Model::n_dof_qaux, 0);
+        mf_ptrs[lev] = &plot_mf[lev];
         geoms[lev] = Geom(lev);
     }
     for (int lev = 0; lev < finest_level; ++lev)
