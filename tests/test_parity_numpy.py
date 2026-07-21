@@ -23,14 +23,20 @@ from tests import models, refs
 from tests.cases import stoker_ic
 from tests.conftest import CFL_1D, describe, march
 
-N_CELLS = 100
 DOMAIN = (0.0, 10.0)
 T_END = 0.5
 
 
 @pytest.mark.small
 @pytest.mark.amrex
-def test_amrex_numpy_parity(overwrite):
+@pytest.mark.parametrize("N_CELLS", [100, 200])
+def test_amrex_numpy_parity(overwrite, N_CELLS):
+    """Two resolutions on purpose: the ratio between them DISCRIMINATES.
+
+    If max|diff| roughly halves 100 -> 200, the backends are on different dt
+    sequences and the gap is O(dx) truncation around the shock — expected on a
+    discontinuous dam break, not a defect. If it stays flat, it is structural.
+    """
     model = models.swe(dimension=2, bc="swashes")
     sm = SystemModel.from_model(model)
     sm.initial_conditions = IC.UserFunction(function=stoker_ic)
@@ -74,6 +80,6 @@ def test_amrex_numpy_parity(overwrite):
         f"amrex and numpy disagree by {rel:.3e} relative on the same NSM — "
         "that is a divergence to investigate, not a tolerance to widen")
 
-    refs.check("parity_numpy", overwrite, Q=Qa, Qaux=Aa,
+    refs.check(f"parity_numpy_n{N_CELLS}", overwrite, Q=Qa, Qaux=Aa,
                diff=np.array([diff.max()]), rel=np.array([rel]))
-    refs.check_time("parity_numpy", elapsed, overwrite)
+    refs.check_time(f"parity_numpy_n{N_CELLS}", elapsed, overwrite)

@@ -1,5 +1,7 @@
 {
  "parity_numpy": 3.51,
+ "parity_numpy_n100": 3.571,
+ "parity_numpy_n200": 1.225,
  "ritter_dry": 1.322,
  "stoker_wet": 1.192,
  "swe_2d": 3.126,
