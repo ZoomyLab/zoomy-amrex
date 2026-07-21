@@ -372,6 +372,17 @@ def run_case(model, settings, output_dir, on_progress=None):
     else:
         ex = _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_rasters)
 
+    # Mandate 6a: the CFL law's factors come from core, never from a literal in
+    # the driver. cfl here is the pure SAFETY FACTOR (law: 0.9); the dimensional
+    # and reconstruction-degree divisors ride in the emitted constants, so a
+    # case must NOT pre-divide it (passing 0.45 for 2-D would apply d twice).
+    from zoomy_amrex._constants import write_march_constants
+    write_march_constants(
+        sm, bdir / "Source" / "MarchConstants.H",
+        cfl=float(settings.get("cfl", 0.9)),
+        dimension=dim,
+        degree=max(0, int(settings.get("spatial_order", 1)) - 1))
+
     n = os.cpu_count() or 4
     subprocess.run(["make", f"-j{n}"], cwd=ex, check=True)
     exe = next((p for p in ex.iterdir() if p.name.startswith("main") and os.access(p, os.X_OK)), None)

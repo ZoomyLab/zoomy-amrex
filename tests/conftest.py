@@ -22,7 +22,19 @@ import sys
 import numpy as np
 import pytest
 
-CFL_1D, CFL_2D = 0.9, 0.45          # user law — no augmentation, ever
+# User law: CFL 0.9 (1-D) / 0.45 (2-D), no augmentation, ever.
+#
+# BOTH ARE 0.9 HERE, and that is not a deviation — it is the law expressed
+# through core's formula instead of around it. c_cfl is a PURE SAFETY FACTOR
+# (constants.py:291, docstring "law: 0.9"), and the dimensional reduction is
+# c_cfl_dimension's job: dt = c_cfl / (d * (2k+1) * max|lambda|/dx). So in 2-D
+# the effective Courant number is 0.9/2 = 0.45 — exactly the user's number,
+# produced by the law rather than pre-divided by hand.
+#
+# Passing 0.45 here would apply the dimensional factor TWICE and silently halve
+# every 2-D step. It would also look safe, which is why it is worth a comment
+# rather than a constant.
+CFL_1D, CFL_2D = 0.9, 0.9
 ORDER_FLOOR = {1: 0.9, 2: 1.9}
 
 _HERE = pathlib.Path(__file__).resolve().parent

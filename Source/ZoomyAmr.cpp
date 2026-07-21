@@ -6,6 +6,7 @@
 #include <AMReX_BLProfiler.H>
 #include <AMReX_GMRES.H>
 #include "imex_solver.H"
+#include "MarchConstants.H"   // emitted by zoomy_amrex/_constants.py (mandate 6a)
 #include <iomanip>
 
 using namespace amrex;
@@ -488,7 +489,20 @@ Real ZoomyAmr::ComputeDt(int lev)
     // is the solver parameter. Stopgap adoption by river; core to generalize dtmax
     // onto the NSM so every backend inherits the same dry-domain guard (REQ-188).
     if (global_max_inv < 1e-14) return dtmax;
-    Real dt = cfl / global_max_inv;
+
+    // Core's CFL law, via EMITTED constants (mandate 6a) — not re-derived here.
+    //   dt = c_cfl * 2*r_in / (c_cfl_dimension * c_cfl_degree_factor * lambda)
+    // and r_in = dx/2 for a Cartesian FV cell, so with global_max_inv already
+    // equal to max(lambda_dir / dx_dir) this is
+    //   dt = c_cfl / (d * (2k+1) * global_max_inv).
+    //
+    // The two divisors were MISSING: the driver computed cfl/global_max_inv,
+    // which is correct only when d = 1 AND k = 0. Measured: 1-D order 1 was
+    // right by coincidence; 2-D order 2 was taking steps 6x larger than the
+    // law allows. `cfl` is the pure SAFETY FACTOR and is never adjusted here.
+    const Real dt_divisor = Real(ZoomyConstants::c_cfl_dimension)
+                          * Real(ZoomyConstants::c_cfl_degree_factor);
+    Real dt = cfl / (dt_divisor * global_max_inv);
     return amrex::max(amrex::min(dt, dtmax), dtmin);
 }
 
