@@ -1,9 +1,10 @@
 {
+ "parallel_2rank": 4.189,
  "parity_numpy": 3.51,
- "parity_numpy_n100": 3.571,
- "parity_numpy_n200": 1.225,
- "ritter_dry": 1.322,
- "stoker_wet": 1.192,
- "swe_2d": 3.126,
- "wb_lake": 1.22
+ "parity_numpy_n100": 1.636,
+ "parity_numpy_n200": 1.208,
+ "ritter_dry": 1.01,
+ "stoker_wet": 1.013,
+ "swe_2d": 1.307,
+ "wb_lake": 0.941
 }

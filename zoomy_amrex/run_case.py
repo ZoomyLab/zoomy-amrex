@@ -387,7 +387,17 @@ def run_case(model, settings, output_dir, on_progress=None):
         shutil.rmtree(stale, ignore_errors=True)
     for stale in ex.glob("chk_*"):
         shutil.rmtree(stale, ignore_errors=True)
-    subprocess.run([f"./{exe.name}", "inputs"], cwd=ex, check=True)
+    # mpi_ranks: launch under mpirun when >1. The driver is already MPI-linked
+    # and prints "MPI initialized with N MPI processes", but nothing could ASK
+    # for more than one rank — so the parallel path was unreachable from a case
+    # and therefore untested. The suite's 2-rank parity test asserts that the
+    # PHYSICS is rank-count invariant, which is the only claim worth making
+    # about a domain decomposition.
+    ranks = int(settings.get("mpi_ranks", 1) or 1)
+    cmd = ([f"./{exe.name}", "inputs"] if ranks <= 1 else
+           ["mpirun", "-n", str(ranks), "--oversubscribe",
+            f"./{exe.name}", "inputs"])
+    subprocess.run(cmd, cwd=ex, check=True)
     if on_progress is not None:
         on_progress(-1, settings.get("time_end", 0.1), 0.0)
 
