@@ -261,7 +261,15 @@ def _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_raster
         # state h in the driver; positivity is the WB reconstruction's job + the
         # model's own update_variables (matches the numpy/jax path).
         state_rasters=state_rasters,
-        bc_sides={"x_lo": "West", "x_hi": "East", "y_lo": "South", "y_hi": "North"},
+        # Only the sides that EXIST for this dimensionality. A 1-D model
+        # declares tags [East, West] only, so naming South/North here used to
+        # resolve them silently to tag index 0 — i.e. a 1-D run quietly got the
+        # East BC on two phantom faces. ZoomyAmr::tag_index now aborts on an
+        # undeclared tag, which is how this was found; keep the deck honest so
+        # it never has to.
+        bc_sides=({"x_lo": "West", "x_hi": "East",
+                   "y_lo": "South", "y_hi": "North"} if dim == 2 else
+                  {"x_lo": "West", "x_hi": "East"}),
         well_balanced=bool(settings.get("well_balanced", False)),
         clamp_positivity=False,
         # REQ-175: a-posteriori positivity.  "mood" redoes h<0 cells order-1 from

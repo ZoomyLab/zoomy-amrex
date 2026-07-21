@@ -342,11 +342,23 @@ void ZoomyAmr::FillPhysicalBC_mf(MultiFab& Qmf, MultiFab& Qauxmf, int lev, Real 
     // Resolve each domain side's configured BC tag name to its index in the
     // model's sorted tag list (Model::boundary_conditions is a Piecewise over
     // that index).  Empty/unknown name => tag index 0.  Done on the host once.
+    // An EMPTY name means "no BC configured for this side" and legitimately
+    // falls back to tag 0.  A NON-EMPTY name that matches nothing is a WIRING
+    // ERROR and now aborts: it used to return 0 silently, so a model whose tags
+    // are not the West/East/South/North that run_case.py hardcodes had ALL FOUR
+    // sides collapse onto tag 0 — wrong boundary conditions, no diagnostic, and
+    // a green run.  Exactly the silent-false-green class the backend suite
+    // exists to kill, so it must not live in the driver that suite runs on.
     auto tag_index = [](const std::string& name) -> int {
         if (name.empty()) return 0;
         auto tags = Model::get_boundary_tags();
         for (int t = 0; t < (int)tags.size(); ++t)
             if (tags[t] == name) return t;
+        std::string known;
+        for (auto const& t : tags) known += (known.empty() ? "" : ", ") + t;
+        amrex::Abort("boundary tag '" + name + "' is not declared by this model. "
+                     "Known tags: [" + known + "]. Check the bc.* inputs keys "
+                     "against the model's boundary_conditions tags.");
         return 0;
     };
     const int bcix_xlo = tag_index(bc_x_lo);

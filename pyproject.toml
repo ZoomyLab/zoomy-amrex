@@ -46,3 +46,13 @@ include = ["zoomy_amrex*"]
 [project.scripts]
 # If you want to run your code generator from the command line:
 # zoomy-gen-amrex = "zoomy_amrex.main:main_function"
+[tool.pytest.ini_options]
+# Per-package suite, mirroring library/zoomy_core/tests. Markers match the
+# approved shared shape: small | regression | large + the backend/area tag.
+testpaths = ["tests"]
+markers = [
+    "small: gate tier — runs on every change (default pytest)",
+    "regression: compares against blessed references in tests/refs/",
+    "large: slow regression — needs --run-large",
+    "amrex: backend/area tag, for selection only",
+]
