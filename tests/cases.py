@@ -81,7 +81,7 @@ def lake_at_rest_ic(x):
     """
     b = 0.2 * np.exp(-((x[0] - 5.0) ** 2))
     eta = 1.0
-    return np.array([b, eta - b, np.zeros_like(b), np.zeros_like(b)])
+    return np.array([b, eta - b, np.zeros_like(b)])       # 1-D: [b, h, q_0]
 
 
 def gaussian_pulse_2d(x):
