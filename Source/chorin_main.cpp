@@ -28,6 +28,7 @@
   amrex::GMRES is the drop-in scale upgrade (same residual functor).
 \*---------------------------------------------------------------------------*/
 #include "chorin_common.H"
+#include "MarchConstants.H"   // emitted by zoomy_amrex/_constants.py (mandate 6a)
 
 int main(int argc, char* argv[])
 {
@@ -237,7 +238,18 @@ int main(int argc, char* argv[])
             });
         }
         ParallelDescriptor::ReduceRealMax(maxev);
-        return (maxev>1e-14) ? cfl/maxev : 1e-3;
+        // Core's CFL law via EMITTED constants, same as ZoomyAmr::ComputeDt:
+        // dt = c_cfl / (d * (2k+1) * max|lambda|/dx). This path carried the
+        // same omission the hyperbolic driver did — cfl/maxev is correct only
+        // at d=1, k=0 — so a 2-D Chorin run stepped 2x too large, 6x at order 2.
+        const Real dt_divisor = Real(ZoomyConstants::c_cfl_dimension)
+                              * Real(ZoomyConstants::c_cfl_degree_factor);
+        // The wave-free fallback below is STILL a magic 1e-3. The hyperbolic
+        // path returns dtmax instead (REQ-188/190); this twin was never
+        // updated. Left as-is DELIBERATELY: it is filed on cid=79, core has not
+        // ruled how that value should arrive, and inventing one here is what
+        // mandate 6a forbids. The divisor fix does not depend on that ruling.
+        return (maxev>1e-14) ? cfl/(dt_divisor*maxev) : 1e-3;
     };
 
     // ── time loop ───────────────────────────────────────────────────────────
