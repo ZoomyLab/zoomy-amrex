@@ -29,7 +29,7 @@ def test_stoker_wet(overwrite):
     settings = {"dimension": 1, "domain": [0.0, 10.0], "n_cells": 100,
                 "spatial_order": 1, "output_snapshots": 1, "max_level": 0}
     t0 = time.perf_counter()
-    Q, Qaux = march(nsm, settings, key="swe1d", t_end=1.0, cfl=CFL_1D)
+    Q, Qaux = march(nsm, settings, key="swe1d_swashes", t_end=1.0, cfl=CFL_1D)
     elapsed = time.perf_counter() - t0
 
     import numpy as np

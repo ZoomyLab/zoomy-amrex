@@ -38,7 +38,13 @@ def bcs_for(kind, dimension):
     tags = TAGS_2D if dimension == 3 else TAGS_1D
 
     if kind == "periodic":
-        return BoundaryConditions([Periodic(tag=t) for t in tags])
+        raise NotImplementedError(
+            "amrex cannot run a periodic domain today: build.py:72 hardcodes "
+            "geometry.is_periodic = '0 0' with no settings key, so a model-level "
+            "Periodic BC would leave the GEOMETRY non-periodic and the run would "
+            "quietly not be periodic. Raising instead of returning something "
+            "that looks right. This blocks the periodic members of the mirror "
+            "set (vam_order2, ahs26); tracked for the driver.")
     if kind == "wall":
         return BoundaryConditions(
             [FromModel(tag=t, definition="wall") for t in tags])

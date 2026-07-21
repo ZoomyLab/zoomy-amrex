@@ -39,11 +39,12 @@ def test_lake_at_rest_over_bump(overwrite):
                 "spatial_order": 1, "output_snapshots": 1, "max_level": 0,
                 "well_balanced": True}
     t0 = time.perf_counter()
-    # key="swe1d", NOT a WB-specific key: well_balanced is a runtime deck flag,
-    # not emitted code, so this shares the build with the other 1-D SWE tests.
-    # Keying it separately cost a whole extra cold compile (34.6 s -> the suite
-    # was paying 38 s twice) for byte-identical generated source.
-    Q, Qaux = march(nsm, settings, key="swe1d", t_end=1.0, cfl=CFL_1D)
+    # key includes the BC KIND. well_balanced is indeed only a runtime deck
+    # flag, but the BOUNDARY CONDITIONS are emitted into Model.H — so this case
+    # (wall) generates different source than the swashes cases. Sharing one key
+    # across BC kinds made them thrash: each test rebuilt what the previous one
+    # had overwritten, and ritter went 2.8 s -> 14 s. Measured 2026-07-21.
+    Q, Qaux = march(nsm, settings, key="swe1d_wall", t_end=1.0, cfl=CFL_1D)
     elapsed = time.perf_counter() - t0
 
     b, h, q = Q[0], Q[1], Q[2]

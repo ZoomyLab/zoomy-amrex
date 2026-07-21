@@ -1,5 +1,6 @@
 {
- "ritter_dry": 2.829,
- "stoker_wet": 0.944,
- "wb_lake": 12.923
+ "ritter_dry": 1.322,
+ "stoker_wet": 1.192,
+ "swe_2d": 3.126,
+ "wb_lake": 1.22
 }
