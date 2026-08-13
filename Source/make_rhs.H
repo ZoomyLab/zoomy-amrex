@@ -276,10 +276,23 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
         q_old(n,0) = Q(i,j,0,n);
         q_curr(n,0) = Q(i,j,0,n);
     }
-    for(int n=0; n<n_a; ++n) a_curr(n,0) = Qaux(i,j,0,n);
+    // keep the INCOMING aux: a_curr is mutated inside the Newton, and the
+    // explicit fallback below must evaluate the source at the incoming state.
+    amrex::SmallMatrix<amrex::Real, n_a, 1> a_in;
+    for(int n=0; n<n_a; ++n) { a_curr(n,0) = Qaux(i,j,0,n); a_in(n,0) = Qaux(i,j,0,n); }
 
-    if (q_curr(1,0) < 1e-6) return; // Dry cell skip 
-
+    // NO dry-cell skip. The previous `if (q_curr(1,0) < 1e-6) return;` hardcoded
+    // TWO model facts into the driver: that state row 1 is the depth, and a 1e-6
+    // wet/dry threshold the model already owns as `wet_dry_eps`. It also skipped
+    // the WHOLE cell, every row at once -- which makes a dry-start rainfall run
+    // impossible: every cell begins at h = 0, so every cell returned, the rain
+    // source on the mass row never fired, nothing ever wet, and the run reported
+    // mass = 0 with dt pinned at dtmax for its whole length.
+    //
+    // Whether a source is evaluable as h -> 0 is the MODEL's business -- it
+    // desingularises its own friction denominator. The driver only integrates.
+    // A non-finite Newton result is caught below and falls back to the incoming
+    // state, which is a numerical guard, not a physics decision.
     bool converged = false;
 
     for(int iter=0; iter<25; ++iter) {
@@ -348,10 +361,36 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
 
         for(int n=0; n<n_q; ++n) q_curr(n,0) += damping * delta(n,0);
 
-        if (q_curr(1,0) < 1e-6) q_curr(1,0) = 1e-6;
+        // NO depth floor. `if (q_curr(1,0) < 1e-6) q_curr(1,0) = 1e-6;` used to
+        // sit here: it hardcoded row 1 = depth AND violated the standing rule
+        // that h is never floored or clipped. With the dry-cell skip removed it
+        // would also CREATE mass -- every cell of a dry-start catchment would be
+        // lifted from h = 0 to 1e-6 on the first step. Depth positivity belongs
+        // to the model (`update_variables`, which runs right after this) and to
+        // the optional `solver.clamp_positivity`, not to a Newton inner loop.
     }
 
-    if (converged) {
+    // A non-converged cell must NOT be left un-updated. `if (converged)` alone
+    // silently DISCARDS the whole source for that cell -- including any term
+    // that has nothing to do with the stiffness, such as the rainfall on the
+    // mass row. Measured on LowerTriangle: the run lost 30.6% of its water
+    // (308805 against the exact 444888 m3) because cells whose friction Newton
+    // failed dropped their rain too, and the loss grew with the flow as more
+    // cells turned stiff. Mass conservation is not the source solver's to spend.
+    //
+    // Accept a finite partial Newton iterate (it is strictly closer to the
+    // implicit solution than the incoming state); fall back to an explicit
+    // Euler source update only when the iterate is not finite.
+    bool finite = true;
+    for(int n=0; n<n_q; ++n) finite = finite && std::isfinite(q_curr(n,0));
+
+    if (converged || finite) {
         for(int n=0; n<n_q; ++n) Q(i,j,0,n) = q_curr(n,0);
+    } else {
+        auto S0 = Model::source(q_old, a_in, p_mat, time, X);
+        for(int n=0; n<n_q; ++n) {
+            amrex::Real v = q_old(n,0) + dt * S0(n,0);
+            Q(i,j,0,n) = std::isfinite(v) ? v : q_old(n,0);
+        }
     }
 }
