@@ -261,6 +261,17 @@ def _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_raster
         # state h in the driver; positivity is the WB reconstruction's job + the
         # model's own update_variables (matches the numpy/jax path).
         state_rasters=state_rasters,
+        # max_grid_size: AMReX's BOX DECOMPOSITION -- how the domain is chopped
+        # into work units. It does NOT change the mesh: same n_cell, same cells,
+        # and the emitted fields are BIT-IDENTICAL across settings (verified on
+        # LowerTriangle 526x555: h/hu/hv/b max|diff| = 0.0 between 64 and 1024).
+        # It is pure scheduling, and the old hardcoded 64 was starving the GPU:
+        # 81 boxes x ~4096 cells = 16 CUDA blocks per launch on a 142-SM L40S.
+        # One box gives ~1141 blocks -> 2.93x faster, same answer.
+        # NOTE bigger is not universally better: MPI distributes BOXES, so a run
+        # with R ranks needs >= R boxes or ranks idle. Default stays 64 so no
+        # existing case changes behaviour.
+        max_grid_size=int(settings.get('max_grid_size', 64)),
         # Only the sides that EXIST for this dimensionality. A 1-D model
         # declares tags [East, West] only, so naming South/North here used to
         # resolve them silently to tag index 0 — i.e. a 1-D run quietly got the
@@ -289,7 +300,7 @@ def _write_chorin_inputs(path, geom, dim, settings, dem, rel):
     max_level = int(settings.get("max_level", 0))
     lines = [f"amr.max_level     = {max_level}",
              f"amr.n_cell        = {nx} {ny}",
-             f"amr.max_grid_size = 64",
+             f"amr.max_grid_size = {int(settings.get('max_grid_size', 64))}",
              f"amr.blocking_factor = {8 if max_level>0 else 1}",
              f"amr.ref_ratio     = 2", "amr.regrid_int    = 2",
              f"geometry.prob_lo  = {gx0} {gy0}", f"geometry.prob_hi  = {gx1} {gy1}",

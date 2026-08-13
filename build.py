@@ -57,7 +57,7 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
                  max_level=0, ref_ratio=2, geom=None, dem_file=None, release_file=None,
                  well_balanced=False, clamp_positivity=True, tag_b_max=None,
                  bc_sides=None, state_rasters=None, positivity="none", dtmax=None,
-                 max_step=None, dtmin=None):
+                 max_step=None, dtmin=None, max_grid_size=64):
     if geom is not None:
         # Externally-supplied rectangular geometry (e.g. the mesh bbox).
         nx, ny = geom["nx"], geom["ny"]
@@ -96,7 +96,7 @@ def write_inputs(path, ncell, dim_mesh, tend, order, plot_dt, cfl=0.45, bc="extr
     bf = 2 if (max_level > 0 and dim_mesh == 2) else 1
     path.write_text(f"""amr.max_level     = {max_level}
 amr.n_cell        = {ncell_line}
-amr.max_grid_size = 64
+amr.max_grid_size = {max_grid_size}
 amr.blocking_factor = {bf}
 amr.ref_ratio     = {ref_ratio}
 amr.regrid_int    = 2
