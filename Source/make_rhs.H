@@ -259,8 +259,33 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
 }
 
 // ----------------------------------------------------------------------------
-// Local Newton-Raphson Solver for the Implicit Source Term
+// Point-implicit (linearly-implicit) source update — ONE step, no iteration
 // ----------------------------------------------------------------------------
+// Solves the linearisation of the backward-Euler source update about the
+// incoming state:
+//
+//     (I - dt*J) dq = dt*S(q_old),    J = dS/dQ + (dS/dA)(dA/dQ)
+//     q_new = q_old + dq
+//
+// i.e. exactly ONE Newton iteration started from q_old — the standard
+// point-implicit update. Unconditionally stable for the stiff LINEAR part of
+// the source, which is what matters here: Manning friction is stiff on thin
+// films, tt = dt*g*n^2*|u|/h^(4/3) reaching 6.2 at p99 on LowerTriangle.
+// Explicit forward Euler multiplies the momentum by (1 - tt) — by -5.2 there —
+// so it REVERSES and amplifies the flow instead of damping it, and the wet/dry
+// momentum cap then pins those cells at Froude ~3.5 forever.
+//
+// A CONSTANT source is reproduced EXACTLY by this update, which is why rainfall
+// needs no separate explicit path: rain does not depend on the state, so its
+// Jacobian row is zero, the mass row of (I - dt*J) is the identity row, and the
+// step returns dh = dt*r_o to machine precision.
+//
+// Replaces a 25-iteration Newton with damping and a convergence test. That loop
+// lost 30.6% of the catchment's water (308805 against the exact 444888 m3): the
+// damping heuristic halved the update on ALL rows including mass, so rainfall
+// accumulation was under-relaxed and never caught up, and a non-converged cell
+// had its entire source discarded. One fixed-cost solve has no damping, no
+// convergence test and no discard path, so none of those failure modes exist.
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, amrex::Array4<const amrex::Real> const& Qaux,
                            amrex::Real dt, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
@@ -269,128 +294,76 @@ void apply_implicit_source(int i, int j, amrex::Array4<amrex::Real> const& Q, am
     constexpr int n_q = Model::n_dof_q;
     constexpr int n_a = Model::n_dof_qaux;
 
-    amrex::SmallMatrix<amrex::Real, n_q, 1> q_old, q_curr;
-    amrex::SmallMatrix<amrex::Real, n_a, 1> a_curr;
-
-    for(int n=0; n<n_q; ++n) {
-        q_old(n,0) = Q(i,j,0,n);
-        q_curr(n,0) = Q(i,j,0,n);
-    }
-    // keep the INCOMING aux: a_curr is mutated inside the Newton, and the
-    // explicit fallback below must evaluate the source at the incoming state.
+    amrex::SmallMatrix<amrex::Real, n_q, 1> q_old;
     amrex::SmallMatrix<amrex::Real, n_a, 1> a_in;
-    for(int n=0; n<n_a; ++n) { a_curr(n,0) = Qaux(i,j,0,n); a_in(n,0) = Qaux(i,j,0,n); }
+    for(int n=0; n<n_q; ++n) q_old(n,0) = Q(i,j,0,n);
+    for(int n=0; n<n_a; ++n) a_in(n,0)  = Qaux(i,j,0,n);
 
-    // NO dry-cell skip. The previous `if (q_curr(1,0) < 1e-6) return;` hardcoded
-    // TWO model facts into the driver: that state row 1 is the depth, and a 1e-6
-    // wet/dry threshold the model already owns as `wet_dry_eps`. It also skipped
-    // the WHOLE cell, every row at once -- which makes a dry-start rainfall run
-    // impossible: every cell begins at h = 0, so every cell returned, the rain
-    // source on the mass row never fired, nothing ever wet, and the run reported
-    // mass = 0 with dt pinned at dtmax for its whole length.
-    //
-    // Whether a source is evaluable as h -> 0 is the MODEL's business -- it
+    // NO dry-cell skip and NO depth floor. Both used to live here, and both
+    // hardcoded model facts into the driver: that state row 1 is the depth, and
+    // a 1e-6 wet/dry threshold the model already owns as wet_dry_eps. The skip
+    // made a dry-start rainfall run impossible — every cell begins at h = 0, so
+    // every cell returned, the rain source never fired, and mass stayed exactly
+    // 0 for the whole run. The floor broke the standing never-floor-h rule and,
+    // once the skip was gone, would have created mass in every dry cell.
+    // Whether a source is evaluable as h -> 0 is the MODEL's business; it
     // desingularises its own friction denominator. The driver only integrates.
-    // A non-finite Newton result is caught below and falls back to the incoming
-    // state, which is a numerical guard, not a physics decision.
-    bool converged = false;
+    auto S     = Model::source(q_old, a_in, p_mat, time, X);
+    auto dS_dQ = Model::source_jacobian_wrt_variables(q_old, a_in, p_mat);
+    auto dS_dA = Model::source_jacobian_wrt_aux_variables(q_old, a_in, p_mat);
+    auto dA_dQ = Model::update_aux_variables_jacobian_wrt_variables(q_old, a_in, p_mat, time, X);
 
-    for(int iter=0; iter<25; ++iter) {
-        a_curr = Model::update_aux_variables(q_curr, a_curr, p_mat, time, X);   // REQ-185
-        auto S = Model::source(q_curr, a_curr, p_mat, time, X);
-
-        amrex::Real res_norm = 0.0;
-        amrex::SmallMatrix<amrex::Real, n_q, 1> residual;
-        for(int n=0; n<n_q; ++n) {
-            residual(n,0) = q_curr(n,0) - q_old(n,0) - dt * S(n,0);
-            res_norm += residual(n,0) * residual(n,0);
+    amrex::SmallMatrix<amrex::Real, n_q, n_q> A;
+    amrex::SmallMatrix<amrex::Real, n_q, 1> rhs;
+    for(int r=0; r<n_q; ++r) {
+        rhs(r,0) = dt * S(r,0);
+        for(int c=0; c<n_q; ++c) {
+            amrex::Real term = dS_dQ(r*n_q + c, 0);
+            for(int k=0; k<n_a; ++k) term += dS_dA(r*n_a + k, 0) * dA_dQ(k*n_q + c, 0);
+            A(r,c) = (r == c ? 1.0 : 0.0) - dt * term;
         }
-        
-        if (std::sqrt(res_norm) < 1e-5) { 
-            converged = true; 
-            break; 
+    }
+
+    // Gaussian elimination with partial pivoting on the cell-local n_q x n_q
+    // system (n_q = 4 for SWE, so this is small and fully unrolled).
+    bool ok = true;
+    for(int k=0; k<n_q && ok; ++k) {
+        int piv = k;
+        amrex::Real best = std::abs(A(k,k));
+        for(int r=k+1; r<n_q; ++r)
+            if (std::abs(A(r,k)) > best) { best = std::abs(A(r,k)); piv = r; }
+        if (!(best > 0.0) || !std::isfinite(best)) { ok = false; break; }
+        if (piv != k) {
+            for(int c=k; c<n_q; ++c) { amrex::Real t = A(k,c); A(k,c) = A(piv,c); A(piv,c) = t; }
+            amrex::Real t = rhs(k,0); rhs(k,0) = rhs(piv,0); rhs(piv,0) = t;
         }
-
-        auto dS_dQ = Model::source_jacobian_wrt_variables(q_curr, a_curr, p_mat);
-        auto dS_dA = Model::source_jacobian_wrt_aux_variables(q_curr, a_curr, p_mat);
-        auto dA_dQ = Model::update_aux_variables_jacobian_wrt_variables(q_curr, a_curr, p_mat, time, X);
-
-        amrex::SmallMatrix<amrex::Real, n_q, n_q> J;
-        for(int r=0; r<n_q; ++r) {
-            for(int c=0; c<n_q; ++c) {
-                amrex::Real term = dS_dQ(r*n_q + c, 0);
-                for(int k=0; k<n_a; ++k) term += dS_dA(r*n_a + k, 0) * dA_dQ(k*n_q + c, 0);
-                J(r,c) = (r == c ? 1.0 : 0.0) - dt * term;
-            }
+        for(int r=k+1; r<n_q; ++r) {
+            amrex::Real f = A(r,k) / A(k,k);
+            for(int c=k; c<n_q; ++c) A(r,c) -= f * A(k,c);
+            rhs(r,0) -= f * rhs(k,0);
         }
+    }
 
-        amrex::SmallMatrix<amrex::Real, n_q, 1> delta;
-        for(int r=0; r<n_q; ++r) residual(r,0) = -residual(r,0);
-
-        bool singular = false;
-        for(int k=0; k<n_q; ++k) {
-            int max_row = k;
-            amrex::Real max_val = std::abs(J(k,k));
-            for(int r=k+1; r<n_q; ++r) {
-                if (std::abs(J(r,k)) > max_val) { max_val = std::abs(J(r,k)); max_row = r; }
-            }
-            if (max_val < 1e-14 || std::isnan(max_val)) { singular = true; break; }
-            
-            if (max_row != k) {
-                for(int c=k; c<n_q; ++c) { amrex::Real tmp = J(k,c); J(k,c) = J(max_row,c); J(max_row,c) = tmp; }
-                amrex::Real tmp = residual(k,0); residual(k,0) = residual(max_row,0); residual(max_row,0) = tmp;
-            }
-            for(int r=k+1; r<n_q; ++r) {
-                amrex::Real factor = J(r,k) / J(k,k);
-                for(int c=k; c<n_q; ++c) J(r,c) -= factor * J(k,c);
-                residual(r,0) -= factor * residual(k,0);
-            }
-        }
-        if (singular) break;
-
+    if (ok) {
+        amrex::SmallMatrix<amrex::Real, n_q, 1> dq;
         for(int r=n_q-1; r>=0; --r) {
             amrex::Real sum = 0.0;
-            for(int c=r+1; c<n_q; ++c) sum += J(r,c) * delta(c,0);
-            delta(r,0) = (residual(r,0) - sum) / J(r,r);
+            for(int c=r+1; c<n_q; ++c) sum += A(r,c) * dq(c,0);
+            dq(r,0) = (rhs(r,0) - sum) / A(r,r);
+            if (!std::isfinite(dq(r,0))) { ok = false; break; }
         }
-
-        amrex::Real damping = 1.0;
-        if (std::abs(delta(1,0)) > 0.5 * q_curr(1,0)) {
-            damping = 0.5;
+        if (ok) {
+            for(int n=0; n<n_q; ++n) Q(i,j,0,n) = q_old(n,0) + dq(n,0);
+            return;
         }
-
-        for(int n=0; n<n_q; ++n) q_curr(n,0) += damping * delta(n,0);
-
-        // NO depth floor. `if (q_curr(1,0) < 1e-6) q_curr(1,0) = 1e-6;` used to
-        // sit here: it hardcoded row 1 = depth AND violated the standing rule
-        // that h is never floored or clipped. With the dry-cell skip removed it
-        // would also CREATE mass -- every cell of a dry-start catchment would be
-        // lifted from h = 0 to 1e-6 on the first step. Depth positivity belongs
-        // to the model (`update_variables`, which runs right after this) and to
-        // the optional `solver.clamp_positivity`, not to a Newton inner loop.
     }
 
-    // A non-converged cell must NOT be left un-updated. `if (converged)` alone
-    // silently DISCARDS the whole source for that cell -- including any term
-    // that has nothing to do with the stiffness, such as the rainfall on the
-    // mass row. Measured on LowerTriangle: the run lost 30.6% of its water
-    // (308805 against the exact 444888 m3) because cells whose friction Newton
-    // failed dropped their rain too, and the loss grew with the flow as more
-    // cells turned stiff. Mass conservation is not the source solver's to spend.
-    //
-    // Accept a finite partial Newton iterate (it is strictly closer to the
-    // implicit solution than the incoming state); fall back to an explicit
-    // Euler source update only when the iterate is not finite.
-    bool finite = true;
-    for(int n=0; n<n_q; ++n) finite = finite && std::isfinite(q_curr(n,0));
-
-    if (converged || finite) {
-        for(int n=0; n<n_q; ++n) Q(i,j,0,n) = q_curr(n,0);
-    } else {
-        auto S0 = Model::source(q_old, a_in, p_mat, time, X);
-        for(int n=0; n<n_q; ++n) {
-            amrex::Real v = q_old(n,0) + dt * S0(n,0);
-            Q(i,j,0,n) = std::isfinite(v) ? v : q_old(n,0);
-        }
+    // Singular or non-finite linearisation: fall back to the EXPLICIT source.
+    // A numerical guard, not a physics decision — and it still applies the
+    // source, so mass is never silently dropped the way the old
+    // `if (converged)` gate dropped it.
+    for(int n=0; n<n_q; ++n) {
+        amrex::Real v = q_old(n,0) + dt * S(n,0);
+        Q(i,j,0,n) = std::isfinite(v) ? v : q_old(n,0);
     }
 }
