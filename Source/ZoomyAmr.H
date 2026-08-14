@@ -118,14 +118,30 @@ public:
                                     // stage state.  Supersedes the clamp (which is
                                     // forced off) — order-2 everywhere healthy,
                                     // order-1 only at troubled wet/dry cells.
-    // INSTRUMENTATION ONLY (solver.profile_split).  0 = the shipping fused RHS
-    // kernel, untouched.  1 = the SAME arithmetic run as two kernels (face pass
-    // -> face MultiFab -> cell assembly pass) so the face/flux and the assembly
-    // cost each get their own host-side BL_PROFILE region.  BL_PROFILE cannot be
-    // used inside a device lambda, so cutting the kernel is the only way to
-    // MEASURE that split; it costs an extra round-trip of the face data through
-    // global memory, so a split-path timing is an UPPER bound on the fused cost.
-    int profile_split     = 0;
+    // solver.face_based_rhs — DEFAULT ON.
+    //   1 = FACE-BASED RHS: a face pass solves each face ONCE into a face
+    //       MultiFab, then a cell pass differences them and adds the source.
+    //   0 = the older cell-centric kernel, which assembles each cell from its
+    //       own four faces and therefore solves every interior face TWICE.
+    //
+    // On LowerTriangle (526x555) the mesh has 584,941 faces; the cell-centric
+    // path performs 1,167,720 evaluations per step, a measured 1.996x. Face
+    // based pays one extra round-trip of the face data through global memory
+    // and still wins: evolution 4.031 -> 3.221 s (1.24x) on an L40S, with the
+    // SAME trajectory -- 3330 steps, mass 444888, and all 3330 step lines
+    // byte-identical between the two paths.
+    //
+    // Keeping the cell-centric path is worthwhile: it is the reference the
+    // face-based one is validated against, and it needs no face scratch.
+    //
+    // ⚠ The face scratch carries 3*n_dof_q + 2 components — flux, D+ and D-,
+    // and the two Audusse depths — so it PROVISIONS for a non-conservative
+    // product. But every validation so far ran a scheme with
+    // Numerics::fluctuations_are_zero == true, i.e. the D± halves were zero.
+    // A model with a surviving NCP (SME moment coupling, two-layer) should be
+    // checked against the cell-centric path before this default is trusted
+    // there.
+    int face_based_rhs    = 1;
     amrex::Real plot_dt_interval = 0.1;
     int identifier        = 0;
     amrex::Real tag_threshold = 0.01; // gradient threshold for refinement

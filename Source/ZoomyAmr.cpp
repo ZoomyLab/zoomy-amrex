@@ -49,7 +49,8 @@ ZoomyAmr::ZoomyAmr()
       pp.query("well_balanced", well_balanced);
       pp.query("clamp_positivity", clamp_positivity);
       pp.query("positivity", positivity_method);
-      pp.query("profile_split", profile_split);
+      pp.query("face_based_rhs", face_based_rhs);
+      pp.query("profile_split", face_based_rhs);   // legacy alias
     }
     { ParmParse pp("tagging");
       pp.query("threshold", tag_threshold);
@@ -545,17 +546,17 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
     bool impl_src = implicit_source;
     bool wb = well_balanced;
 
-    // INSTRUMENTATION (solver.profile_split=1): face-flux scratch for the
-    // two-pass RHS.  Allocated ONCE per Advance so the per-stage timings are not
-    // polluted by arena traffic; not allocated at all on the default path.
+    // Face-flux scratch for the FACE-BASED RHS (solver.face_based_rhs, default
+    // ON).  Allocated ONCE per Advance so per-stage timings are not polluted by
+    // arena traffic; not allocated at all on the cell-centric path.
     Vector<MultiFab> Fface;
-    if (profile_split) {
+    if (face_based_rhs) {
         Fface.resize(Model::dimension);
         for (int d = 0; d < Model::dimension; ++d)
             Fface[d].define(amrex::convert(boxArray(lev), IntVect::TheDimensionVector(d)),
                             DistributionMap(lev), n_face_comp, 0);
     }
-    const int prof_split = profile_split;
+    const int prof_split = face_based_rhs;
 
     auto do_stage = [&](int ord) {
         UpdateState(lev, time);
@@ -573,7 +574,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
 
         if (!prof_split) {
             // Shipping path: ONE fused kernel.  Its internal face/cell split is
-            // not observable from the host -- that is what profile_split=1 is for.
+            // not observable from the host -- that is what face_based_rhs=0 vs 1 shows.
             BL_PROFILE_VAR("ZoomyAmr::Advance::RHS_fused", zprof_rhs);
             for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
                 auto Q_arr = Q[lev].const_array(mfi);
