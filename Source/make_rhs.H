@@ -131,75 +131,45 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
 }
 
 // ----------------------------------------------------------------------------
-// Calculates the total explicit RHS for a single cell
+// Shared RHS arithmetic — ONE definition, used by BOTH the fused kernel
+// (compute_cell_rhs) and the profile-split two-pass kernels below, so the two
+// paths cannot drift apart.
 // ----------------------------------------------------------------------------
+
+// Conservative flux difference + path-conservative fluctuations along one axis.
+// D+ lives at index [n], D- at [n_dof_q + n]: cell i receives D- from its right
+// face and D+ from its left face.
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
-void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, amrex::Array4<const amrex::Real> const& Qaux,
-                      amrex::Array4<amrex::Real> const& RHS, amrex::Real dx, amrex::Real dy,
-                      int order, bool implicit_source, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
-                      amrex::Real time, amrex::Real plox, amrex::Real ploy,   // REQ-185
-                      bool well_balanced = false)
+amrex::Real face_divergence(amrex::Real f_r, amrex::Real f_l,
+                            amrex::Real dminus_r, amrex::Real dplus_l)
 {
-    amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> flux_xr, flux_xl, flux_yr, flux_yl;
+    return - (f_r - f_l) - dminus_r - dplus_l;
+}
 
-    // Flat 1D Vectors
-    amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1> fluct_xr, fluct_xl, fluct_yr, fluct_yl;
+// Audusse well-balanced bed source: the hydrostatic-reconstruction counterpart
+// of the cancelled bed NCP. For momentum component k in direction d it is
+// (g/2/dx_d)[ (h*_right)^2 - (h*_left)^2 ], using THIS cell's depths
+// reconstructed at its two faces. Together with the reconstructed pressure flux
+// this is exact for lake-at-rest.
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void add_wb_bed_source(int i, int j, amrex::Array4<amrex::Real> const& RHS,
+                       amrex::Real hL_xr, amrex::Real hR_xl,
+                       amrex::Real hL_yr, amrex::Real hR_yl,
+                       amrex::Real g, amrex::Real dx, amrex::Real dy)
+{
+    RHS(i,j,0,idx_h+1) += 0.5 * g * (hL_xr*hL_xr - hR_xl*hR_xl) / dx;
+    if constexpr (Model::dimension == 2)
+        RHS(i,j,0,idx_h+2) += 0.5 * g * (hL_yr*hL_yr - hR_yl*hR_yl) / dy;
+}
 
-    // Reconstructed depths of THIS cell at each of its faces (Audusse source).
-    amrex::Real hL_xr = 0.0, hR_xl = 0.0, hL_yr = 0.0, hR_yl = 0.0, dum;
-    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr, time, dx, dy, plox, ploy, well_balanced, &hL_xr, &dum);
-    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl, time, dx, dy, plox, ploy, well_balanced, &dum, &hR_xl);
-
-    if constexpr (Model::dimension == 2) {
-        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr, time, dx, dy, plox, ploy, well_balanced, &hL_yr, &dum);
-        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl, time, dx, dy, plox, ploy, well_balanced, &dum, &hR_yl);
-    }
-
-    amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> q_curr, source_term;
-    amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> a_curr;
-
-    for(int n=0; n<Model::n_dof_q; ++n) q_curr(n,0) = Q(i,j,0,n);
-    for(int n=0; n<Model::n_dof_qaux; ++n) a_curr(n,0) = Qaux(i,j,0,n);
-
-    for(int n=0; n<Model::n_dof_q; ++n) source_term(n,0) = 0.0;
-    // No dry guard: the model's friction source uses pow(max(h_floor, h)) and
-    // hinv, so it is finite for any depth.
-    if (!implicit_source)
-        source_term = Model::source(q_curr, a_curr, p_mat, time,
-                                    cell_center(i, j, dx, dy, plox, ploy));  // REQ-185
-
-    for(int n=0; n<Model::n_dof_q; ++n) {
-
-        // D+ is at index [n]. D- is offset by [n_dof_q + n]
-        // Cell `i` receives D- from the right face, and D+ from the left face!
-        amrex::Real F_x = - (flux_xr(n,0) - flux_xl(n,0))
-                          - fluct_xr(Model::n_dof_q + n, 0) // D-
-                          - fluct_xl(n, 0);                 // D+
-
-        amrex::Real F_y = 0.0;
-        if constexpr (Model::dimension == 2) {
-            F_y = - (flux_yr(n,0) - flux_yl(n,0))
-                  - fluct_yr(Model::n_dof_q + n, 0)         // D-
-                  - fluct_yl(n, 0);                         // D+
-        }
-
-        RHS(i,j,0,n) = F_x / dx + F_y / dy;
-        if (!implicit_source) RHS(i,j,0,n) += source_term(n,0);
-    }
-
-    // Audusse well-balanced bed source: the hydrostatic-reconstruction
-    // counterpart of the cancelled bed NCP. For momentum component k in
-    // direction d it is (g/2/dx_d)[ (h*_right)^2 - (h*_left)^2 ], using THIS
-    // cell's depths reconstructed at its two faces. Together with the
-    // reconstructed pressure flux this is exact for lake-at-rest.
-    if (well_balanced) {
-        amrex::Real g = p_mat(0,0);
-        RHS(i,j,0,idx_h+1) += 0.5 * g * (hL_xr*hL_xr - hR_xl*hR_xl) / dx;
-        if constexpr (Model::dimension == 2)
-            RHS(i,j,0,idx_h+2) += 0.5 * g * (hL_yr*hL_yr - hR_yl*hR_yl) / dy;
-    }
-
-    // ---- Diffusive flux (optional, compile-time gated) ----
+// ---- Diffusive flux (optional, compile-time gated) ----
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void add_diffusive_flux(int i, int j, amrex::Array4<const amrex::Real> const& Q,
+                        amrex::Array4<const amrex::Real> const& Qaux,
+                        amrex::Array4<amrex::Real> const& RHS,
+                        amrex::Real dx, amrex::Real dy,
+                        const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat)
+{
     if constexpr (Model::has_diffusion) {
         constexpr int n_q = Model::n_dof_q;
         constexpr int dim = Model::dimension;
@@ -256,6 +226,176 @@ void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, a
                 RHS(i, j, 0, v) += (Fd_yr(v, 0) - Fd_yl(v, 0)) / dy;
         }
     }
+}
+
+// ----------------------------------------------------------------------------
+// Calculates the total explicit RHS for a single cell
+// ----------------------------------------------------------------------------
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void compute_cell_rhs(int i, int j, amrex::Array4<const amrex::Real> const& Q, amrex::Array4<const amrex::Real> const& Qaux,
+                      amrex::Array4<amrex::Real> const& RHS, amrex::Real dx, amrex::Real dy,
+                      int order, bool implicit_source, const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
+                      amrex::Real time, amrex::Real plox, amrex::Real ploy,   // REQ-185
+                      bool well_balanced = false)
+{
+    amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> flux_xr, flux_xl, flux_yr, flux_yl;
+
+    // Flat 1D Vectors
+    amrex::SmallMatrix<amrex::Real, 2 * Model::n_dof_q, 1> fluct_xr, fluct_xl, fluct_yr, fluct_yl;
+
+    // Reconstructed depths of THIS cell at each of its faces (Audusse source).
+    amrex::Real hL_xr = 0.0, hR_xl = 0.0, hL_yr = 0.0, hR_yl = 0.0, dum;
+    eval_face(i, j, i+1, j, 0, order, Q, Qaux, p_mat, flux_xr, fluct_xr, time, dx, dy, plox, ploy, well_balanced, &hL_xr, &dum);
+    eval_face(i-1, j, i, j, 0, order, Q, Qaux, p_mat, flux_xl, fluct_xl, time, dx, dy, plox, ploy, well_balanced, &dum, &hR_xl);
+
+    if constexpr (Model::dimension == 2) {
+        eval_face(i, j, i, j+1, 1, order, Q, Qaux, p_mat, flux_yr, fluct_yr, time, dx, dy, plox, ploy, well_balanced, &hL_yr, &dum);
+        eval_face(i, j-1, i, j, 1, order, Q, Qaux, p_mat, flux_yl, fluct_yl, time, dx, dy, plox, ploy, well_balanced, &dum, &hR_yl);
+    }
+
+    amrex::SmallMatrix<amrex::Real, Model::n_dof_q, 1> q_curr, source_term;
+    amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> a_curr;
+
+    for(int n=0; n<Model::n_dof_q; ++n) q_curr(n,0) = Q(i,j,0,n);
+    for(int n=0; n<Model::n_dof_qaux; ++n) a_curr(n,0) = Qaux(i,j,0,n);
+
+    for(int n=0; n<Model::n_dof_q; ++n) source_term(n,0) = 0.0;
+    // No dry guard: the model's friction source uses pow(max(h_floor, h)) and
+    // hinv, so it is finite for any depth.
+    if (!implicit_source)
+        source_term = Model::source(q_curr, a_curr, p_mat, time,
+                                    cell_center(i, j, dx, dy, plox, ploy));  // REQ-185
+
+    for(int n=0; n<Model::n_dof_q; ++n) {
+
+        amrex::Real F_x = face_divergence(flux_xr(n,0), flux_xl(n,0),
+                                          fluct_xr(Model::n_dof_q + n, 0),
+                                          fluct_xl(n, 0));
+
+        amrex::Real F_y = 0.0;
+        if constexpr (Model::dimension == 2) {
+            F_y = face_divergence(flux_yr(n,0), flux_yl(n,0),
+                                  fluct_yr(Model::n_dof_q + n, 0),
+                                  fluct_yl(n, 0));
+        }
+
+        RHS(i,j,0,n) = F_x / dx + F_y / dy;
+        if (!implicit_source) RHS(i,j,0,n) += source_term(n,0);
+    }
+
+    if (well_balanced)
+        add_wb_bed_source(i, j, RHS, hL_xr, hR_xl, hL_yr, hR_yl, p_mat(0,0), dx, dy);
+
+    add_diffusive_flux(i, j, Q, Qaux, RHS, dx, dy, p_mat);
+}
+
+// ============================================================================
+// PROFILE-SPLIT PATH (solver.profile_split = 1) — INSTRUMENTATION ONLY
+// ============================================================================
+// `compute_cell_rhs` above is a single fused device kernel, so its internal
+// face/flux vs cell/assembly split cannot be timed: BL_PROFILE is host-side and
+// does not exist inside device code.  To MEASURE that split the kernel is cut in
+// two, each half launched from its own host-side BL_PROFILE region:
+//
+//   pass 1  compute_face_data     -> face fluxes/fluctuations/h* into a face MF
+//   pass 2  assemble_cell_rhs     -> reads the face MF, assembles the cell RHS
+//
+// Both passes call the SAME eval_face / face_divergence / add_wb_bed_source /
+// add_diffusive_flux as the fused kernel, so the arithmetic has one definition
+// and the two paths cannot drift.  The split is NOT free — it adds a full
+// round-trip of the face data through global memory that the fused kernel keeps
+// in registers — so the split-path total is an UPPER bound on the fused cost and
+// must be reported alongside the unsplit number.
+//
+// Face-MF component layout (per direction):
+//   [0, n_q)            numerical flux
+//   [n_q, 3*n_q)        numerical fluctuations, flat (D+ then D-)
+//   3*n_q               h*_L   reconstructed depth of the LEFT  cell at this face
+//   3*n_q + 1           h*_R   reconstructed depth of the RIGHT cell at this face
+static constexpr int n_face_comp = 3 * Model::n_dof_q + 2;
+
+// Pass 1: one face per thread.  (i,j) indexes the face nodal in `dir`, i.e. the
+// face between cell (i-1,j) and (i,j) for dir=0.
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void compute_face_data(int i, int j, int dir, int order,
+                       amrex::Array4<const amrex::Real> const& Q,
+                       amrex::Array4<const amrex::Real> const& Qaux,
+                       amrex::Array4<amrex::Real> const& F,
+                       const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
+                       amrex::Real time, amrex::Real dx, amrex::Real dy,
+                       amrex::Real plox, amrex::Real ploy, bool well_balanced)
+{
+    constexpr int n_q = Model::n_dof_q;
+    amrex::SmallMatrix<amrex::Real, n_q, 1> flux;
+    amrex::SmallMatrix<amrex::Real, 2 * n_q, 1> fluct;
+    amrex::Real hLs = 0.0, hRs = 0.0;
+
+    const int iL = (dir == 0) ? i - 1 : i;
+    const int jL = (dir == 1) ? j - 1 : j;
+    eval_face(iL, jL, i, j, dir, order, Q, Qaux, p_mat, flux, fluct,
+              time, dx, dy, plox, ploy, well_balanced, &hLs, &hRs);
+
+    for (int n = 0; n < n_q; ++n)       F(i, j, 0, n)         = flux(n, 0);
+    for (int n = 0; n < 2 * n_q; ++n)   F(i, j, 0, n_q + n)   = fluct(n, 0);
+    F(i, j, 0, 3 * n_q)     = hLs;
+    F(i, j, 0, 3 * n_q + 1) = hRs;
+}
+
+// Pass 2: one cell per thread.  Cell (i,j)'s left x-face is Fx(i,j), its right
+// x-face is Fx(i+1,j) (AMReX face indexing), and likewise in y.
+AMREX_GPU_DEVICE AMREX_FORCE_INLINE
+void assemble_cell_rhs(int i, int j,
+                       amrex::Array4<const amrex::Real> const& Q,
+                       amrex::Array4<const amrex::Real> const& Qaux,
+                       amrex::Array4<const amrex::Real> const& Fx,
+                       amrex::Array4<const amrex::Real> const& Fy,
+                       amrex::Array4<amrex::Real> const& RHS,
+                       amrex::Real dx, amrex::Real dy, bool implicit_source,
+                       const amrex::SmallMatrix<amrex::Real, Model::n_parameters, 1>& p_mat,
+                       amrex::Real time, amrex::Real plox, amrex::Real ploy,
+                       bool well_balanced)
+{
+    constexpr int n_q = Model::n_dof_q;
+
+    amrex::SmallMatrix<amrex::Real, n_q, 1> q_curr, source_term;
+    amrex::SmallMatrix<amrex::Real, Model::n_dof_qaux, 1> a_curr;
+
+    for(int n=0; n<n_q; ++n) q_curr(n,0) = Q(i,j,0,n);
+    for(int n=0; n<Model::n_dof_qaux; ++n) a_curr(n,0) = Qaux(i,j,0,n);
+
+    for(int n=0; n<n_q; ++n) source_term(n,0) = 0.0;
+    if (!implicit_source)
+        source_term = Model::source(q_curr, a_curr, p_mat, time,
+                                    cell_center(i, j, dx, dy, plox, ploy));
+
+    for(int n=0; n<n_q; ++n) {
+        amrex::Real F_x = face_divergence(Fx(i+1, j, 0, n), Fx(i, j, 0, n),
+                                          Fx(i+1, j, 0, n_q + n_q + n),   // D- right
+                                          Fx(i,   j, 0, n_q + n));        // D+ left
+
+        amrex::Real F_y = 0.0;
+        if constexpr (Model::dimension == 2) {
+            F_y = face_divergence(Fy(i, j+1, 0, n), Fy(i, j, 0, n),
+                                  Fy(i, j+1, 0, n_q + n_q + n),
+                                  Fy(i, j,   0, n_q + n));
+        }
+
+        RHS(i,j,0,n) = F_x / dx + F_y / dy;
+        if (!implicit_source) RHS(i,j,0,n) += source_term(n,0);
+    }
+
+    if (well_balanced) {
+        const amrex::Real hL_xr = Fx(i+1, j, 0, 3*n_q);      // this cell, right face
+        const amrex::Real hR_xl = Fx(i,   j, 0, 3*n_q + 1);  // this cell, left  face
+        amrex::Real hL_yr = 0.0, hR_yl = 0.0;
+        if constexpr (Model::dimension == 2) {
+            hL_yr = Fy(i, j+1, 0, 3*n_q);
+            hR_yl = Fy(i, j,   0, 3*n_q + 1);
+        }
+        add_wb_bed_source(i, j, RHS, hL_xr, hR_xl, hL_yr, hR_yl, p_mat(0,0), dx, dy);
+    }
+
+    add_diffusive_flux(i, j, Q, Qaux, RHS, dx, dy, p_mat);
 }
 
 // ----------------------------------------------------------------------------

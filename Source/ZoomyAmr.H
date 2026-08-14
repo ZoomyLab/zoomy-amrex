@@ -118,6 +118,14 @@ public:
                                     // stage state.  Supersedes the clamp (which is
                                     // forced off) — order-2 everywhere healthy,
                                     // order-1 only at troubled wet/dry cells.
+    // INSTRUMENTATION ONLY (solver.profile_split).  0 = the shipping fused RHS
+    // kernel, untouched.  1 = the SAME arithmetic run as two kernels (face pass
+    // -> face MultiFab -> cell assembly pass) so the face/flux and the assembly
+    // cost each get their own host-side BL_PROFILE region.  BL_PROFILE cannot be
+    // used inside a device lambda, so cutting the kernel is the only way to
+    // MEASURE that split; it costs an extra round-trip of the face data through
+    // global memory, so a split-path timing is an UPPER bound on the fused cost.
+    int profile_split     = 0;
     amrex::Real plot_dt_interval = 0.1;
     int identifier        = 0;
     amrex::Real tag_threshold = 0.01; // gradient threshold for refinement

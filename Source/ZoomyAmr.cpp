@@ -49,6 +49,7 @@ ZoomyAmr::ZoomyAmr()
       pp.query("well_balanced", well_balanced);
       pp.query("clamp_positivity", clamp_positivity);
       pp.query("positivity", positivity_method);
+      pp.query("profile_split", profile_split);
     }
     { ParmParse pp("tagging");
       pp.query("threshold", tag_threshold);
@@ -109,7 +110,12 @@ ZoomyAmr::ZoomyAmr()
 // ==========================================================================
 void ZoomyAmr::InitData()
 {
+    BL_PROFILE("ZoomyAmr::InitData");
+    BL_PROFILE_VAR("ZoomyAmr::InitData::MakeGrids", zprof_grids);
     InitFromScratch(0.0);
+    BL_PROFILE_VAR_STOP(zprof_grids);
+
+    BL_PROFILE_VAR("ZoomyAmr::InitData::ReadRasters", zprof_rast);
 
     // Two-step IC.  STEP 1 (always): the model's analytic initial condition on
     // ALL state rows (b, h, momentum, passive tracers) — supplied here as one
@@ -125,6 +131,7 @@ void ZoomyAmr::InitData()
         readRasterIntoComponent(release_file, Geom(0), Q[0], 1);      // release -> h
     if (!friction_file.empty() && FileSystem::Exists(friction_file))
         readRasterIntoComponent(friction_file, Geom(0), Qaux[0], 1);
+    BL_PROFILE_VAR_STOP(zprof_rast);
 
     if (max_level > 0) {
         // The raster IC was loaded ONLY into level 0. Any finer levels created
@@ -538,6 +545,18 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
     bool impl_src = implicit_source;
     bool wb = well_balanced;
 
+    // INSTRUMENTATION (solver.profile_split=1): face-flux scratch for the
+    // two-pass RHS.  Allocated ONCE per Advance so the per-stage timings are not
+    // polluted by arena traffic; not allocated at all on the default path.
+    Vector<MultiFab> Fface;
+    if (profile_split) {
+        Fface.resize(Model::dimension);
+        for (int d = 0; d < Model::dimension; ++d)
+            Fface[d].define(amrex::convert(boxArray(lev), IntVect::TheDimensionVector(d)),
+                            DistributionMap(lev), n_face_comp, 0);
+    }
+    const int prof_split = profile_split;
+
     auto do_stage = [&](int ord) {
         UpdateState(lev, time);
         // Coarse-fine-aware ghost fill. A refined level's ghost cells at the
@@ -547,21 +566,65 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
         // NaN -> average_down poisons the coarse level -> the refinement
         // collapses after one regrid. FillPatch also applies the physical BC.
         FillPatch(lev, time, Q[lev], 0, Model::n_dof_q);
+        BL_PROFILE_VAR("ZoomyAmr::Advance::GhostFill", zprof_ghost);
         Q[lev].FillBoundary(geom.periodicity());
         Qaux[lev].FillBoundary(geom.periodicity());
+        BL_PROFILE_VAR_STOP(zprof_ghost);
 
-        for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
-            auto Q_arr = Q[lev].const_array(mfi);
-            auto Qaux_arr = Qaux[lev].const_array(mfi);
-            auto RHS_arr = Qtmp[lev].array(mfi);
-            ParallelFor(mfi.validbox(),
-                [=] AMREX_GPU_DEVICE(int i, int j, int k) {
-                    compute_cell_rhs(i, j, Q_arr, Qaux_arr, RHS_arr,
-                                     dx[0], dx[1], ord, impl_src, p,
-                                     time, plo[0], plo[1], wb);   // REQ-185
-                });
+        if (!prof_split) {
+            // Shipping path: ONE fused kernel.  Its internal face/cell split is
+            // not observable from the host -- that is what profile_split=1 is for.
+            BL_PROFILE_VAR("ZoomyAmr::Advance::RHS_fused", zprof_rhs);
+            for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
+                auto Q_arr = Q[lev].const_array(mfi);
+                auto Qaux_arr = Qaux[lev].const_array(mfi);
+                auto RHS_arr = Qtmp[lev].array(mfi);
+                ParallelFor(mfi.validbox(),
+                    [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                        compute_cell_rhs(i, j, Q_arr, Qaux_arr, RHS_arr,
+                                         dx[0], dx[1], ord, impl_src, p,
+                                         time, plo[0], plo[1], wb);   // REQ-185
+                    });
+            }
+            BL_PROFILE_VAR_STOP(zprof_rhs);
+        } else {
+            // Instrumented path: the SAME arithmetic, cut into a face pass and a
+            // cell pass so each is timed on the host.
+            BL_PROFILE_VAR("ZoomyAmr::Advance::RHS_face", zprof_face);
+            for (int d = 0; d < Model::dimension; ++d) {
+                for (MFIter mfi(Fface[d]); mfi.isValid(); ++mfi) {
+                    auto Q_arr = Q[lev].const_array(mfi);
+                    auto Qaux_arr = Qaux[lev].const_array(mfi);
+                    auto F_arr = Fface[d].array(mfi);
+                    const int dir = d;
+                    ParallelFor(mfi.validbox(),
+                        [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                            compute_face_data(i, j, dir, ord, Q_arr, Qaux_arr, F_arr,
+                                              p, time, dx[0], dx[1], plo[0], plo[1], wb);
+                        });
+                }
+            }
+            BL_PROFILE_VAR_STOP(zprof_face);
+
+            BL_PROFILE_VAR("ZoomyAmr::Advance::RHS_assemble", zprof_asm);
+            for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
+                auto Q_arr = Q[lev].const_array(mfi);
+                auto Qaux_arr = Qaux[lev].const_array(mfi);
+                auto Fx_arr = Fface[0].const_array(mfi);
+                auto Fy_arr = (Model::dimension == 2) ? Fface[Model::dimension - 1].const_array(mfi)
+                                                      : Fface[0].const_array(mfi);
+                auto RHS_arr = Qtmp[lev].array(mfi);
+                ParallelFor(mfi.validbox(),
+                    [=] AMREX_GPU_DEVICE(int i, int j, int k) {
+                        assemble_cell_rhs(i, j, Q_arr, Qaux_arr, Fx_arr, Fy_arr, RHS_arr,
+                                          dx[0], dx[1], impl_src, p, time,
+                                          plo[0], plo[1], wb);
+                    });
+            }
+            BL_PROFILE_VAR_STOP(zprof_asm);
         }
 
+        BL_PROFILE_VAR("ZoomyAmr::Advance::ConsUpdate", zprof_upd);
         for (MFIter mfi(Q[lev]); mfi.isValid(); ++mfi) {
             auto Q_arr = Q[lev].array(mfi);
             auto RHS_arr = Qtmp[lev].const_array(mfi);
@@ -571,8 +634,10 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
                         Q_arr(i, j, 0, n) += dt * RHS_arr(i, j, 0, n);
                 });
         }
+        BL_PROFILE_VAR_STOP(zprof_upd);
 
         if (impl_src) {
+            BL_PROFILE_VAR("ZoomyAmr::Advance::ImplicitSource", zprof_src);
             if (implicit_global) {
                 // General matrix-free Newton-Krylov backward-Euler source solve
                 // (nonlocal-capable). Q[lev] currently holds the post-flux Qexp.
@@ -591,6 +656,7 @@ void ZoomyAmr::Advance(int lev, Real time, Real dt)
                         });
                 }
             }
+            BL_PROFILE_VAR_STOP(zprof_src);
         }
     };
 
@@ -699,6 +765,7 @@ void ZoomyAmr::TimeStep(int lev, Real time, int iteration)
 // ==========================================================================
 void ZoomyAmr::Evolve()
 {
+    BL_PROFILE("ZoomyAmr::Evolve");
     Real time = 0.0;
     int step = 0;
     next_plot_time = 0.0;
