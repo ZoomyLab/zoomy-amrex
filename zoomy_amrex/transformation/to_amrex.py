@@ -330,6 +330,59 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         p_names = ", ".join(f'"{k}"' for k in self._param_names)
         p_vals = ", ".join(str(pv.get(k, 0.0)) for k in self._param_names)
         bc_str = ", ".join(f'"{t}"' for t in bc_tags)
+        # ── the model's own STATE ROW MAP ───────────────────────────────────
+        # The driver must never infer "which row is the y-momentum" from the
+        # state ORDER.  Contiguity after ``h`` holds only for the four-row SWE
+        # state ``[b, h, q_x_0, q_y_0]``; SME(level=N, dimension=3) lays out
+        # ``[b, h, q_x_0..q_x_N, q_y_0..q_y_N]``, so ``idx_h + 2`` is q_x_1.
+        # READ from the SystemModel (the ONE answer-holder); a printer
+        # translates, it never decides.
+        #
+        #   idx_b / idx_h        bathymetry / depth rows, -1 when absent
+        #   depth_scaled_rows    every row carrying one factor of the depth
+        #                        (q = h * intensive) — exactly the rows the
+        #                        Audusse hydrostatic reconstruction must
+        #                        rescale by h*/h so the reconstructed pair is
+        #                        a STATE (q* = h* u).  Rescaling only some of
+        #                        them lets a face with h* = 0 export mass.
+        #   discharge_rows[d]    the row whose value IS the mass flux in
+        #                        direction d — the row that carries the
+        #                        bed-slope force and therefore receives the
+        #                        Audusse well-balancing source.  -1 where the
+        #                        system has no unique such row (multilayer);
+        #                        ZoomyAmr refuses solver.well_balanced then.
+        #                        Padded to two entries so the driver's
+        #                        `if constexpr (dimension == 2)` branch stays
+        #                        in bounds on a 1-D model, where it is dead.
+        #
+        # The two lists are published as constexpr ACCESSORS, not as static
+        # member arrays: nvcc rejects a `static constexpr int a[N]` member
+        # subscripted from device code ("identifier is undefined in device
+        # code") because the array is an object needing device storage, while
+        # a function-local constexpr array inside an inlined accessor folds to
+        # an immediate.
+        names = [str(s) for s in self.sm.state]
+        scaled = list(self.sm.depth_scaled_state_indices) or [-1]
+        discharge = list(self.sm.discharge_state_indices)
+        discharge = discharge + [-1] * (2 - len(discharge))
+        row_map = [
+            f"    static constexpr int idx_b = "
+            f"{names.index('b') if 'b' in names else -1};",
+            f"    static constexpr int idx_h = "
+            f"{names.index('h') if 'h' in names else -1};",
+            f"    static constexpr int n_depth_scaled_rows = "
+            f"{len(self.sm.depth_scaled_state_indices)};",
+            "    AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE",
+            "    static constexpr int depth_scaled_row(int m) noexcept {",
+            f"        constexpr int rows[{len(scaled)}] = "
+            f"{{ {', '.join(str(i) for i in scaled)} }};",
+            "        return rows[m]; }",
+            "    AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE",
+            "    static constexpr int discharge_row(int d) noexcept {",
+            f"        constexpr int rows[{len(discharge)}] = "
+            f"{{ {', '.join(str(i) for i in discharge)} }};",
+            "        return rows[d]; }",
+        ]
         L = [
             "#pragma once",
             self.get_includes(),
@@ -354,6 +407,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
             f"    static constexpr int dimension  = {self.dim};",
             f"    static constexpr int n_dof_gradQ = {self.n_state * self.dim};",
             f"    static constexpr bool has_diffusion = {'true' if self._detect_has_diffusion() else 'false'};",
+            *row_map,
             f"    static constexpr int n_boundary_tags = {len(bc_tags)};",
             f"    static const std::vector<std::string> get_boundary_tags() {{ return {{ {bc_str} }}; }}",
             f"    static const std::vector<std::string> parameter_names() {{ return {{ {p_names} }}; }}",

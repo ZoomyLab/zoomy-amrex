@@ -5,6 +5,14 @@
 #include "Numerics.H"
 #include "constants.H"
 
+// constants.H states idx_b/idx_h as driver literals; the MODEL publishes its
+// own row map.  There must be exactly one truth -- pin them together at
+// compile time instead of letting the driver's guess drift.
+static_assert(idx_b == Model::idx_b && idx_h == Model::idx_h,
+              "constants.H idx_b/idx_h disagree with the model's own row map "
+              "(Model::idx_b / Model::idx_h) -- the driver is indexing a state "
+              "layout the model does not have.");
+
 // Simple MinMod Limiter for 2nd-order TVD stability
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 amrex::Real minmod(amrex::Real a, amrex::Real b) {
@@ -76,11 +84,21 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
     
     // Audusse hydrostatic reconstruction (well-balanced SWE bed slope).
     // Reconstruct the depth from the free surface eta=h+b about the higher of
-    // the two beds, b_face=max(bL,bR): h* = max(0, eta - b_face). Momentum is
-    // rescaled to preserve the velocity, and the face bed is set equal on both
-    // sides so the generic path-conservative bed NCP term cancels (Delta b=0);
-    // the balancing bed source is added per cell in compute_cell_rhs. This
-    // makes lake-at-rest (eta=const, u=0) exact. No-op when well_balanced=false.
+    // the two beds, b_face=max(bL,bR): h* = max(0, eta - b_face). Every
+    // DEPTH-WEIGHTED row is rescaled by h*/h to preserve the intensive
+    // quantity it carries, and the face bed is set equal on both sides so the
+    // generic path-conservative bed NCP term cancels (Delta b=0); the
+    // balancing bed source is added per cell in compute_cell_rhs. This makes
+    // lake-at-rest (eta=const, u=0) exact. No-op when well_balanced=false.
+    //
+    // WHICH rows are depth-weighted is the MODEL's statement, read from its
+    // emitted row map -- never `idx_h + 1 + d`. That guess is the four-row SWE
+    // layout [b, h, q_x_0, q_y_0]; SME(level=N) is [b, h, q_x_0..q_x_N,
+    // q_y_0..q_y_N], so it skipped q_y_0 and every moment row. The Audusse
+    // positivity proof needs q* = h* u on EVERY such row: a partially rescaled
+    // pair (h* = 0, q_y_0 != 0) is not a state, and the h-row flux in y IS
+    // q_y_0, so an empty reconstructed cell exported mass. Measured on the
+    // LowerTriangle catchment at level 2: min h = -0.170 m.
     amrex::Real hLs = qL(idx_h,0), hRs = qR(idx_h,0);
     if (well_balanced) {
         amrex::Real bL = qL(idx_b,0), bR = qR(idx_b,0);
@@ -89,9 +107,10 @@ void eval_face(int iL, int jL, int iR, int jR, int dir, int order,
         hRs = amrex::max(amrex::Real(0.0), qR(idx_h,0) + bR - bf);
         amrex::Real sL = (qL(idx_h,0) > amrex::Real(0)) ? hLs / qL(idx_h,0) : amrex::Real(0.0);
         amrex::Real sR = (qR(idx_h,0) > amrex::Real(0)) ? hRs / qR(idx_h,0) : amrex::Real(0.0);
-        for (int d = 0; d < Model::dimension; ++d) {
-            qL(idx_h+1+d, 0) *= sL;
-            qR(idx_h+1+d, 0) *= sR;
+        for (int m = 0; m < Model::n_depth_scaled_rows; ++m) {
+            const int n = Model::depth_scaled_row(m);
+            qL(n, 0) *= sL;
+            qR(n, 0) *= sR;
         }
         qL(idx_h,0) = hLs;  qR(idx_h,0) = hRs;
         qL(idx_b,0) = bf;   qR(idx_b,0) = bf;
@@ -147,19 +166,28 @@ amrex::Real face_divergence(amrex::Real f_r, amrex::Real f_l,
 }
 
 // Audusse well-balanced bed source: the hydrostatic-reconstruction counterpart
-// of the cancelled bed NCP. For momentum component k in direction d it is
+// of the cancelled bed NCP. For the discharge row of direction d it is
 // (g/2/dx_d)[ (h*_right)^2 - (h*_left)^2 ], using THIS cell's depths
 // reconstructed at its two faces. Together with the reconstructed pressure flux
 // this is exact for lake-at-rest.
+//
+// The receiving row is the MODEL's direction-d discharge row, read from its
+// emitted row map. `idx_h + 1 + d` is the four-row SWE layout: on
+// SME(level>=1) `idx_h + 2` is q_x_1, so the y bed force was fed to the first
+// x-moment while q_y_0 received none at all -- a bed varying only in y excited
+// q_x_1 to 3.9 m2/s FROM REST (diagnostic_positivity/wb_orientation_probe.py).
+// Model::discharge_row(d) < 0 means the system has no unique discharge row
+// (multilayer); ZoomyAmr refuses the well-balanced path for such a model at
+// setup, so the rows are valid here.
 AMREX_GPU_DEVICE AMREX_FORCE_INLINE
 void add_wb_bed_source(int i, int j, amrex::Array4<amrex::Real> const& RHS,
                        amrex::Real hL_xr, amrex::Real hR_xl,
                        amrex::Real hL_yr, amrex::Real hR_yl,
                        amrex::Real g, amrex::Real dx, amrex::Real dy)
 {
-    RHS(i,j,0,idx_h+1) += 0.5 * g * (hL_xr*hL_xr - hR_xl*hR_xl) / dx;
+    RHS(i,j,0,Model::discharge_row(0)) += 0.5 * g * (hL_xr*hL_xr - hR_xl*hR_xl) / dx;
     if constexpr (Model::dimension == 2)
-        RHS(i,j,0,idx_h+2) += 0.5 * g * (hL_yr*hL_yr - hR_yl*hR_yl) / dy;
+        RHS(i,j,0,Model::discharge_row(1)) += 0.5 * g * (hL_yr*hL_yr - hR_yl*hR_yl) / dy;
 }
 
 // ---- Diffusive flux (optional, compile-time gated) ----

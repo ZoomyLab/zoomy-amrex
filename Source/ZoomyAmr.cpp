@@ -85,6 +85,21 @@ ZoomyAmr::ZoomyAmr()
     // in the MODEL: its wet_dry_eps parameter desingularizes 1/h (hinv) and gates
     // the eigenvalues via max(h, wet_dry_eps).  The driver reads no wet/dry constant.
 
+    // The Audusse well-balanced path is written on the model's own row map
+    // (Model::depth_scaled_row / Model::discharge_row).  A system whose mass
+    // flux is not a single state row per direction -- a multilayer model, whose
+    // mass flux is the SUM of the layer discharges -- publishes -1 and has no
+    // depth-averaged bed source at all.  Refuse it HERE, once, rather than
+    // indexing -1 inside a device kernel.
+    if (well_balanced) {
+        for (int d = 0; d < Model::dimension; ++d)
+            AMREX_ALWAYS_ASSERT_WITH_MESSAGE(
+                Model::discharge_row(d) >= 0,
+                "solver.well_balanced needs one discharge row per direction, "
+                "but this model publishes none (Model::discharge_row(d) < 0): "
+                "its mass flux is not a single state row.");
+    }
+
     bcs.resize(Model::n_dof_q);
     for (int n = 0; n < Model::n_dof_q; ++n) {
         for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
