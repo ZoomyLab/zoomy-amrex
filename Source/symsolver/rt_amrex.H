@@ -35,6 +35,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -217,19 +218,59 @@ struct Field
     int ng() const { return face ? 0 : (*mf)[0].nGrow(); }
 };
 
+// Storage is recycled: a dead Field's MultiFabs go to a pool and the next
+// Field of the same shape takes them (no allocation, and no upload of the
+// device table of Array4s: FabArray::arrays() builds it once per MultiFab
+// with a blocking copy).  close_pool() empties it before amrex::Finalize.
+using MFs = std::vector<amrex::MultiFab>;
+struct Pooled { MFs* mf; amrex::BoxArray ba; amrex::DistributionMapping dm; };
+inline std::map<std::tuple<int, bool, int>, std::vector<Pooled>>& pool()
+{
+    static auto* p = new std::map<std::tuple<int, bool, int>, std::vector<Pooled>>();
+    return *p;
+}
+inline bool& pool_open() { static bool o = true; return o; }
+inline void close_pool()
+{
+    pool_open() = false;
+    for (auto& kv : pool())
+        for (auto& e : kv.second) delete e.mf;
+    pool().clear();
+}
+
 inline Field make_like(const amrex::BoxArray& ba, const amrex::DistributionMapping& dm,
                        int nq, bool face, int ng)
 {
     BL_PROFILE("zs::make_like");
     Field F;
     F.nq = nq; F.face = face;
-    F.mf = std::make_shared<std::vector<amrex::MultiFab>>();
-    for (int d = 0; d < (face ? AMREX_SPACEDIM : 1); ++d)
+    const auto key = std::make_tuple(std::max(nq, 1), face, face ? 0 : ng);
+    MFs* m = nullptr;
+    auto& free = pool()[key];
+    for (size_t k = 0; k < free.size(); ++k)
+        if (free[k].ba == ba && free[k].dm == dm)
+        {
+            m = free[k].mf;
+            free.erase(free.begin() + long(k));
+            break;
+        }
+    if (!m)
     {
-        const amrex::BoxArray b = face ? amrex::convert(ba, IntVect::TheDimensionVector(d)) : ba;
-        F.mf->emplace_back(b, dm, std::max(nq, 1), face ? 0 : ng);
-        F.mf->back().setVal(0.0);
+        m = new MFs();
+        for (int d = 0; d < (face ? AMREX_SPACEDIM : 1); ++d)
+        {
+            const amrex::BoxArray b = face ? amrex::convert(ba, IntVect::TheDimensionVector(d)) : ba;
+            m->emplace_back(b, dm, std::max(nq, 1), face ? 0 : ng);
+        }
     }
+#ifdef ZS_ZERO_INIT
+    for (auto& x : *m) x.setVal(0.0);      // debugging: no block reads unset entries
+#endif
+    F.mf = std::shared_ptr<MFs>(m, [key, ba, dm](MFs* p)
+    {
+        if (pool_open()) pool()[key].push_back(Pooled{p, ba, dm});
+        else delete p;
+    });
     return F;
 }
 inline Field cells_of(const Mesh& M, int nq) { return make_like(M.ba, M.dm, nq, false, M.NG); }
@@ -463,6 +504,7 @@ Field take(const Field& Q, const std::tuple<I...>& rows)
 inline Field zeros(int n, const Mesh& M)
 {
     Field Z = cells_of(M, n);
+    Z[0].setVal(0.0);
     Z.ngv = M.NG;
     return Z;
 }
@@ -1372,6 +1414,7 @@ inline Field linsolve_impl(std::function<Field(Field)> op, const Field& b, const
     gm.setRestartLength(o.ls_restart);
     gm.setMaxIters(o.ls_restart*o.ls_maxiter);
     Field x = cells_of(M, b.nq);
+    x[0].setVal(0.0);
     amrex::MultiFab rhs(M.ba, M.dm, b.nq, 0);
     amrex::MultiFab::Copy(rhs, b[0], 0, 0, b.nq, 0);
     const double nb = L.norm2(rhs);

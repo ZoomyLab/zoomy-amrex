@@ -72,6 +72,7 @@ void dump(const std::string& path, double time, const zs::Field& F, const zs::Me
 int main(int argc, char* argv[])
 {
     amrex::Initialize(argc, argv);
+    amrex::ExecOnFinalize(zs::close_pool);
     {
         amrex::ParmParse pp("zs");
         amrex::Vector<int> n_cell, branch(4, 0);
@@ -130,7 +131,13 @@ int main(int argc, char* argv[])
         Qaux = std::get<0>(zs::initial_aux(Q, Qaux, p, std::cref(M), 0L));
         amrex::ParallelDescriptor::Barrier();
         const auto t0 = std::chrono::steady_clock::now();
-        const auto res = zs::march(Q, Qaux, p, time_end, std::cref(M));
+        // the blocks synchronise where they read results on the host
+        // (reductions, halo exchange, output); no sync after every copy
+        const auto res = [&]
+        {
+            amrex::Gpu::NoSyncRegion no_sync;
+            return zs::march(Q, Qaux, p, time_end, std::cref(M));
+        }();
         amrex::Gpu::streamSynchronize();
         amrex::ParallelDescriptor::Barrier();
         const double wall = std::chrono::duration<double>(
