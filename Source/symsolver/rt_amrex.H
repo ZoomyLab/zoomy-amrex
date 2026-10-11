@@ -220,6 +220,7 @@ struct Field
 inline Field make_like(const amrex::BoxArray& ba, const amrex::DistributionMapping& dm,
                        int nq, bool face, int ng)
 {
+    BL_PROFILE("zs::make_like");
     Field F;
     F.nq = nq; F.face = face;
     F.mf = std::make_shared<std::vector<amrex::MultiFab>>();
@@ -272,6 +273,7 @@ struct Max
 template<class F>
 Field zip(const Field& a, const Field& b, F f)
 {
+    BL_PROFILE("zs::zip");
     Field r = like(a, std::max(a.nq, b.nq));
     r.ngv = std::min(a.ngv, b.ngv);
     const int na = a.nq, nb = b.nq;
@@ -294,6 +296,7 @@ Field zip(const Field& a, const Field& b, F f)
 template<class F>
 Field zip(const Field& a, Real s, F f, bool left)
 {
+    BL_PROFILE("zs::zip");
     Field r = like(a, a.nq);
     r.ngv = a.ngv;
     for (int d = 0; d < r.ncomp(); ++d)
@@ -343,6 +346,7 @@ template<class T, if_num<T> = 0> Field minimum(T s, const Field& a) { return zip
 // the copies of the neighbouring boxes' cells (any rank); a number passes
 inline Field halo(const Field& X, const Mesh& M)
 {
+    BL_PROFILE("zs::halo");
     if (X.face || X.ngv >= X.ng()) return X;
     X[0].FillBoundary(M.geom.periodicity());   // ghosts only: no value changes
     Field Y = X;
@@ -355,6 +359,7 @@ inline Field need(const Field& X, int n, const Mesh& M) { return X.ngv >= n ? X 
 // ── reductions (valid region, all ranks; NaN propagates) ────────────────────
 inline double reduce_ext(const Field& F, bool want_min)
 {
+    BL_PROFILE("zs::reduce_ext");
     double best = want_min ? std::numeric_limits<double>::infinity()
                            : -std::numeric_limits<double>::infinity();
     bool nan = false;
@@ -391,6 +396,7 @@ inline double reduce_min(const Field& F) { return reduce_ext(F, true); }
 inline double reduce_max(const Field& F) { return reduce_ext(F, false); }
 inline bool reduce_any(const Field& F)
 {
+    BL_PROFILE("zs::reduce_any");
     const int nq = F.nq;
     bool any = false;
     for (int d = 0; d < F.ncomp(); ++d)
@@ -424,6 +430,7 @@ template<class... I> Rows rows_of(const std::tuple<I...>& t)
 template<class... I, class V>
 Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 {
+    BL_PROFILE("zs::put");
     const Rows R = rows_of(rows);
     Field out = like(Q, Q.nq);
     out.ngv = Q.ngv;
@@ -443,6 +450,7 @@ Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 template<class... I>
 Field take(const Field& Q, const std::tuple<I...>& rows)
 {
+    BL_PROFILE("zs::take");
     const Rows R = rows_of(rows);
     Field out = like(Q, R.n);
     out.ngv = Q.ngv;
@@ -463,6 +471,7 @@ inline Field zeros(int n, const Mesh& M)
 template<class... I>
 Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
 {
+    BL_PROFILE("zs::clean_round_off");
     const Rows R = rows_of(rows);
     Field out = like(Q, Q.nq);
     out.ngv = Q.ngv;
@@ -502,6 +511,7 @@ template<class T, if_num<T> = 0> int ngv_of(T) { return 1 << 20; }
 template<class A, class B>
 Field select(const Field& m, const A& a, const B& b)
 {
+    BL_PROFILE("zs::select");
     Field out = like(m, std::max({m.nq, rows_n(a), rows_n(b)}));
     out.ngv = std::min({m.ngv, ngv_of(a), ngv_of(b)});
     for (int d = 0; d < m.ncomp(); ++d)
@@ -523,6 +533,7 @@ template<class K, class P, class T1, class T2>
 Field cells(K k, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
             const Mesh& M)
 {
+    BL_PROFILE("zs::cells");
     Field out = cells_of(M, K::n_out);
     out.ngv = std::min(Q.ngv, A.ngv);
     const Real time = time_, dt = dt_;
@@ -555,6 +566,7 @@ auto call_pointwise(const K& k, const X& x, const A& a, const P& p)
 template<class K, class P>
 Field pointwise(K k, const Field& X, const Field& A, const P& p)
 {
+    BL_PROFILE("zs::pointwise");
     Field out = like(X, K::n_out);
     out.ngv = std::min(X.ngv, A.ngv);
     const int nq = X.nq, na = A.nq;
@@ -588,6 +600,7 @@ template<class K, class P>
 Field face_kernel(K k, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
                   const P& p, const Mesh& M)
 {
+    BL_PROFILE("zs::face_kernel");
     Field out = faces_of(M, K::n_out);
     const Geo g = M.g;
     const int nq = QL.nq, na = AL.nq;
@@ -622,6 +635,7 @@ auto faces(K k, const Field& QL, const Field& QR, const Field& AL, const Field& 
 // owner and other cell aux per face (the inner cell twice at a boundary face)
 inline std::tuple<Field, Field> face_aux(const Field& Qaux_, const Mesh& M)
 {
+    BL_PROFILE("zs::face_aux");
     const Field Qaux = need(Qaux_, 1, M);
     Field L = faces_of(M, Qaux.nq), R = faces_of(M, Qaux.nq);
     const Geo g = M.g;
@@ -647,6 +661,7 @@ inline std::tuple<Field, Field> face_aux(const Field& Qaux_, const Mesh& M)
 template<class K, class P>
 Field face_wavespeed(K k, const Field& Q_, const Field& A_, const P& p, const Mesh& M)
 {
+    BL_PROFILE("zs::face_wavespeed");
     const Field Q = need(Q_, 1, M), A = need(A_, 1, M);
     Field out = faces_of(M, 1);
     const Geo g = M.g;
@@ -696,6 +711,7 @@ inline Field face_inradius(const Mesh& M)
 template<class K, class P, class T>
 Field bc_cells(K bc, const Field& Q, const Field& A, const P& p, T time_, const Mesh& M)
 {
+    BL_PROFILE("zs::bc_cells");
     Field out = cells_of(M, Q.nq);
     out.ngv = std::min(Q.ngv, A.ngv);
     const Geo g = M.g;
@@ -727,6 +743,7 @@ Field bc_cells(K bc, const Field& Q, const Field& A, const P& p, T time_, const 
 // the inner cell's values in every out-of-domain ghost cell across a face
 inline Field inner_cells(const Field& A, const Mesh& M)
 {
+    BL_PROFILE("zs::inner_cells");
     Field out = cells_of(M, A.nq);
     out.ngv = A.ngv;
     const Geo g = M.g;
@@ -762,6 +779,7 @@ template<class K, class P, class T>
 Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
                       const Field& A, const P& p, T time_, const Mesh& M)
 {
+    BL_PROFILE("zs::boundary_traces");
     Field out = like(QR, QR.nq);
     const Geo g = M.g;
     const Real time = time_;
@@ -796,6 +814,7 @@ Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
 // owner and other cell value per face; the boundary value on a boundary face
 inline std::tuple<Field, Field> cell_traces(const Field& Q_, const Field& Qb, const Mesh& M)
 {
+    BL_PROFILE("zs::cell_traces");
     const Field Q = need(Q_, 1, M);
     Field L = faces_of(M, Q.nq), R = faces_of(M, Q.nq);
     const Geo g = M.g;
@@ -847,6 +866,7 @@ Real lsq(const Geo& g, const A& u, const B& ub, int mode, int i, int j, int n, i
 // LSQ gradient of every row (row 2 q + a: d/dx_a of row q)
 inline Field gradient(const Field& W_, const Field& Wb, const Mesh& M)
 {
+    BL_PROFILE("zs::gradient");
     const Field W = need(W_, M.R, M);
     Field G = cells_of(M, 2*W.nq);
     const int gr = std::max(0, std::min(W.ngv, Wb.ngv) - M.R);
@@ -886,10 +906,11 @@ Real limit(Limiter L, Real delta, Real dmin, Real dmax, Real ev2)
 }
 
 // Limiter factors of ``rows``, 1 elsewhere; bounds from the face neighbours
-// and the boundary ghosts 2 Wb - W
+// and the boundary ghosts Wb (at the ghost position, as in gradient)
 inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Field& Wb,
                              const Field& G, const Mesh& M)
 {
+    BL_PROFILE("zs::limiter_factors");
     const Field W = need(W_, 1, M);
     Field phi = cells_of(M, W.nq);
     const int gr = std::max(0, std::min({W.ngv - 1, G.ngv, Wb.ngv}));
@@ -913,7 +934,7 @@ inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Fie
         {
             const int ii = i + di[f], jj = j + dj[f];
             const Real v = inside(g, ii, jj) ? w[bx](ii, jj, 0, n)
-                                             : 2.0*wb[bx](ii, jj, 0, n) - u;
+                                             : wb[bx](ii, jj, 0, n);
             lo = v < lo ? v : lo;
             hi = v > hi ? v : hi;
         }
@@ -947,6 +968,7 @@ template<class P>
 std::tuple<Field, Field> extrapolate(const Field& W_, const Field& Wb, const Field& G_,
                                      const P& phi_, const Mesh& M)
 {
+    BL_PROFILE("zs::extrapolate");
     const Field W = need(W_, 1, M), G = need(G_, 1, M);
     Field L = faces_of(M, W.nq), R = faces_of(M, W.nq);
     const Geo g = M.g;
@@ -981,6 +1003,7 @@ std::tuple<Field, Field> extrapolate(const Field& W_, const Field& Wb, const Fie
 // where it is the other cell
 inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
 {
+    BL_PROFILE("zs::divergence");
     Field out = cells_of(M, Wm.nq);
     const Geo g = M.g;
     auto o = out[0].arrays();
@@ -1003,6 +1026,7 @@ template<class K, class P>
 Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
                   const Field& A, const P& p, const Mesh& M)
 {
+    BL_PROFILE("zs::edge_source");
     Field out = cells_of(M, Q.nq);
     const Geo g = M.g;
     const int nq = Q.nq, na = A.nq;
@@ -1044,6 +1068,7 @@ template<class S>
 Field derivative_aux_impl(const S& spec, const Field& Q_, const Field& Qaux,
                           const Mesh& M, const Field* Qb, const Rows rows)
 {
+    BL_PROFILE("zs::derivative_aux_impl");
     const Field Q = need(Q_, M.R, M);
     const int gr = std::max(0, std::min(Q.ngv, Qb ? Qb->ngv : Q.ngv) - M.R);
     Field out = like(Qaux, Qaux.nq);
@@ -1086,6 +1111,7 @@ Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mes
 template<class K, class P>
 Field inadmissible(K k, const Field& Q, const Field& A, const P& p)
 {
+    BL_PROFILE("zs::inadmissible");
     Field out = like(Q, 1);
     out.ngv = std::min(Q.ngv, A.ngv);
     const int nq = Q.nq, na = A.nq;
@@ -1114,6 +1140,7 @@ inline double norm2(const Field& a)
 // x + h e_k (h = sqrt(eps) max(1, |x_k|)) and h
 inline std::pair<Field, Field> perturb(const Field& x, int kk)
 {
+    BL_PROFILE("zs::perturb");
     Field xk = like(x, x.nq), h = like(x, 1);
     xk.ngv = h.ngv = x.ngv;
     auto o = xk[0].arrays(); auto oh = h[0].arrays();
@@ -1135,6 +1162,7 @@ inline std::pair<Field, Field> perturb(const Field& x, int kk)
 inline Field newton_update(const Field& x, const Field& r, const std::vector<Field>& cols,
                            const std::vector<Field>& hs)
 {
+    BL_PROFILE("zs::newton_update");
     const int n = x.nq;
     AMREX_ALWAYS_ASSERT(n <= MAXR);
     amrex::MultiFab J(x[0].boxArray(), x[0].DistributionMap(), n*n, 0), H(
@@ -1254,6 +1282,7 @@ struct LinOp
 
 inline void LinOp::blocks()
 {
+    BL_PROFILE("zs::LinOp::blocks");
     const int n = nq, S = M->R + 1;
     AMREX_ALWAYS_ASSERT(n <= MAXR);
     amrex::MultiFab A(M->ba, M->dm, n*n, 0);
@@ -1313,6 +1342,7 @@ inline void LinOp::blocks()
 
 inline void LinOp::precond(amrex::MultiFab& l, const amrex::MultiFab& r)
 {
+    BL_PROFILE("zs::LinOp::precond");
     const int n = nq;
     auto la = l.arrays();
     auto ra = r.const_arrays();
@@ -1332,6 +1362,7 @@ inline void LinOp::precond(amrex::MultiFab& l, const amrex::MultiFab& r)
 
 inline Field linsolve_impl(std::function<Field(Field)> op, const Field& b, const Mesh& M)
 {
+    BL_PROFILE("zs::linsolve_impl");
     const auto& o = implicit();
     LinOp L;
     L.op = std::move(op); L.M = &M; L.nq = b.nq;
@@ -1371,10 +1402,14 @@ Field linsolve(F op, const Field& b)
 }
 
 // ── control ─────────────────────────────────────────────────────────────────
+// iterations of every run-time loop (the time loop of a hyperbolic march:
+// its steps)
+inline long& loop_iterations() { static long n = 0; return n; }
+
 template<class C, class B, class S>
 S while_loop(C c, B b, S s)
 {
-    while (std::apply(c, s)) s = std::apply(b, s);
+    while (std::apply(c, s)) { s = std::apply(b, s); ++loop_iterations(); }
     return s;
 }
 

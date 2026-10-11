@@ -135,7 +135,8 @@ int main(int argc, char* argv[])
         amrex::ParallelDescriptor::Barrier();
         const double wall = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
-        amrex::Print() << "symAmrex: march wall time " << wall << " s\n";
+        amrex::Print() << "symAmrex: march wall time " << wall << " s\n"
+                       << "symAmrex: loop iterations (steps) " << zs::loop_iterations() << "\n";
         dump(out + "/final.bin", std::get<0>(res), std::get<1>(res), M);
         amrex::Print() << "symAmrex: t = " << std::get<0>(res) << "\n";
     }

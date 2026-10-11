@@ -70,6 +70,8 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
     gpu = param.Boolean(default=False, doc="CUDA build (one GPU per rank).")
     max_grid_size = param.Integer(default=None, allow_None=True,
                                   doc="AMReX box size; None: about 2 boxes per rank.")
+    tiny_profile = param.Boolean(default=False,
+                                 doc="AMReX TinyProfiler build (a tree of its own).")
     build_only = param.Boolean(default=False,
                                doc="run() only builds (and caches) the binary.")
 
@@ -110,13 +112,13 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         tmp.unlink()
         for f in APP:
             files[Path(f).name] = (SRC / f).read_text()
-        h = hashlib.sha256(str(self.gpu).encode())
+        h = hashlib.sha256(f"{self.gpu}{self.tiny_profile}".encode())
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
         binary = CACHE / "bin" / h.hexdigest()[:16] / "symAmrex.ex"
         if binary.exists():
             return binary
-        tree = CACHE / ("gpu" if self.gpu else "cpu")
+        tree = CACHE / (("gpu" if self.gpu else "cpu") + ("_tp" if self.tiny_profile else ""))
         (tree / "Source").mkdir(parents=True, exist_ok=True)
         (tree / "Exec").mkdir(parents=True, exist_ok=True)
         with open(tree / ".lock", "w") as lock:
@@ -128,7 +130,7 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
             (tree / "Source" / "Make.package").write_text(
                 "CEXE_sources += symAmrex.cpp\nCEXE_headers += rt_amrex.H Kernels.H "
                 "Solver.H UserFunctions.H ZoomyEig.H\n")
-            (tree / "Exec" / "GNUmakefile").write_text(_gnumakefile(self.gpu))
+            (tree / "Exec" / "GNUmakefile").write_text(_gnumakefile(self.gpu, self.tiny_profile))
             r = _apptainer(self.gpu, f"cd {tree}/Exec && taskset -c {BUILD_CPUS} "
                            f"make -j32 > make.log 2>&1; rc=$?; tail -30 make.log; "
                            f"exit $rc", capture_output=True, text=True)
@@ -172,7 +174,8 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
             f"{1e30 if self.time_end is None else self.time_end!r}\n"
             f"zs.branch = {' '.join(map(str, branches(mesh, nsm)))}\n"
             f"zs.lsq = lsq.txt\nzs.q0 = q0.bin\nzs.qaux0 = qaux0.bin\nzs.out = out\n"
-            "amrex.the_arena_init_size = 1073741824\namrex.verbose = 0\n")
+            "amrex.the_arena_init_size = 1073741824\namrex.verbose = 0\n"
+            "tiny_profiler.device_synchronize_around_region = 1\n")
         launch = (f"mpirun --oversubscribe --bind-to none -n {self.ranks} "
                   if self.ranks > 1 or self.gpu else "")
         cpus = "" if self.gpu else f"taskset -c {RUN_CPUS} "
@@ -184,6 +187,8 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         self.log = log
         self.wall = next((float(ln.split()[-2]) for ln in log.splitlines()
                           if "march wall time" in ln), None)
+        self.steps = next((int(ln.split()[-1]) for ln in log.splitlines()
+                           if "loop iterations" in ln), None)
         snaps = sorted((case / "out").glob("[0-9]*.bin"), key=lambda f: int(f.stem))
         self.snapshots = [_read(f, grid) for f in snaps]
         return _read(case / "out" / "final.bin", grid)
@@ -344,11 +349,11 @@ def _read(path, grid):
     return float(time), out
 
 
-def _gnumakefile(gpu):
+def _gnumakefile(gpu, tiny_profile=False):
     import importlib.util
     spec = importlib.util.spec_from_file_location("_zoomy_amrex_build", ROOT / "build.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod.GNUMAKEFILE.format(amrex_home="/opt/amrex", dim=2, use_mpi="TRUE",
                                   use_cuda="TRUE" if gpu else "FALSE", cuda_arch="89",
-                                  tiny_profile="FALSE")
+                                  tiny_profile="TRUE" if tiny_profile else "FALSE")
