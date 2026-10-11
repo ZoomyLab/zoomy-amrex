@@ -28,7 +28,7 @@ from zoomy_core.mesh import LSQMesh, ensure_lsq_mesh
 from zoomy_core.model.boundary_conditions import boundary_face_branches
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
-from zoomy_core.symsolver.program import chorin_program, hyperbolic_program
+from zoomy_core.symsolver.program import chorin_program, chorin_systems, hyperbolic_program
 from zoomy_amrex.symkernels import write_kernels
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -223,11 +223,7 @@ class SymbolicChorinSolverAmrex(SymbolicHyperbolicSolverAmrex):
         return max(s.resolved_lsq_degree() for s in (nsm, self.press, self.corr))
 
     def run(self, mesh, systems, Q0, workdir, Qaux0=None):
-        named = []
-        for sm in systems:
-            named.append(sm if isinstance(sm, NumericalSystemModel)
-                         else NumericalSystemModel.from_system_model(sm))
-        pred, self.press, self.corr = named
+        pred, self.press, self.corr = chorin_systems(*systems)
         self._nc = int(mesh.n_inner_cells)
         return super().run(mesh, pred, Q0, workdir, Qaux0)
 
