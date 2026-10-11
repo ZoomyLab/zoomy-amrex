@@ -9,3 +9,4 @@ __pycache__
 *.egg-info
 **/tmp_build_dir
 
+.symcache/
