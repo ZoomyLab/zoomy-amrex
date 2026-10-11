@@ -45,9 +45,9 @@ void load(const std::string& path, zs::Field& F, const zs::Mesh& M)
         auto h = host.array();
         amrex::LoopOnCpu(b, nq, [&](int i, int j, int, int n)
         { h(i, j, 0, n) = v[(size_t(n)*ny + j)*nx + i]; });
-        F[0][mfi].copy<amrex::RunOn::Host>(host, b, 0, b, 0, F[0].nComp());
+        F[0][mfi].copy<amrex::RunOn::Device>(host, b, 0, b, 0, F[0].nComp());   // pinned: device-visible
+        amrex::Gpu::streamSynchronize();               // before ``host`` is freed
     }
-    amrex::Gpu::streamSynchronize();
     F = zs::halo(F, M);
 }
 

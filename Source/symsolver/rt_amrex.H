@@ -1112,11 +1112,6 @@ inline double norm2(const Field& a)
 }
 
 // x + h e_k (h = sqrt(eps) max(1, |x_k|)) and h
-std::pair<Field, Field> perturb(const Field& x, int k);
-// the per-cell Newton update from the residual r and the perturbed columns
-Field newton_update(const Field& x, const Field& r, const std::vector<Field>& cols,
-                    const std::vector<Field>& hs);
-
 inline std::pair<Field, Field> perturb(const Field& x, int kk)
 {
     Field xk = like(x, x.nq), h = like(x, 1);
@@ -1136,6 +1131,7 @@ inline std::pair<Field, Field> perturb(const Field& x, int kk)
     return {xk, h};
 }
 
+// the per-cell Newton update from the residual r and the perturbed columns
 inline Field newton_update(const Field& x, const Field& r, const std::vector<Field>& cols,
                            const std::vector<Field>& hs)
 {
@@ -1333,8 +1329,6 @@ inline void LinOp::precond(amrex::MultiFab& l, const amrex::MultiFab& r)
         for (int p = 0; p < n; ++p) la[bx](i, j, 0, p) = x[p];
     });
 }
-
-Field linsolve_impl(std::function<Field(Field)> op, const Field& b, const Mesh& M);
 
 inline Field linsolve_impl(std::function<Field(Field)> op, const Field& b, const Mesh& M)
 {
