@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import param
+import sympy as sp
 
 from zoomy_core.mesh import LSQMesh, ensure_lsq_mesh
 from zoomy_core.model.boundary_conditions import boundary_face_branches
@@ -206,6 +207,12 @@ class SymbolicChorinSolverAmrex(SymbolicHyperbolicSolverAmrex):
     pressure_tol = param.Number(default=ELLIPTIC_RTOL, bounds=(0, None))
     pressure_maxit = param.Integer(default=100, bounds=(1, None))
     pressure_restart = param.Integer(default=None, allow_None=True, bounds=(1, None))
+    pressure_solve = param.Selector(
+        default="linear", objects=["linear", "newton"],
+        doc="'linear': the constraint is affine in the pressure, one linear "
+            "solve.  'newton': a nonlinear constraint, Newton iterations.")
+    pressure_newton_tol = param.Number(default=1e-10, bounds=(0, None))
+    pressure_newton_maxit = param.Integer(default=10, bounds=(1, None))
 
     def _systems(self, nsm):
         return [("pred", nsm), ("press", self.press), ("corr", self.corr)]
@@ -219,8 +226,10 @@ class SymbolicChorinSolverAmrex(SymbolicHyperbolicSolverAmrex):
                     maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol))
 
     def _print(self, nsm, dimension):
+        newton = (None if self.pressure_solve == "linear" else
+                  (sp.Float(self.pressure_newton_tol), int(self.pressure_newton_maxit)))
         return chorin_program(nsm, self.press, self.corr, time_order=self.time_order,
-                              **self._kw(nsm, dimension))
+                              pressure_newton=newton, **self._kw(nsm, dimension))
 
     def _degree(self, nsm):
         return max(s.resolved_lsq_degree() for s in (nsm, self.press, self.corr))
