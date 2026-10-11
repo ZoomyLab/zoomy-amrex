@@ -1062,31 +1062,33 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Real lsq(const Geo& g, const A& u, const B& ub, int mode, const IV& c, int n, int m)
 {
     if (m < 0) return 0.0;
+    IV cw = c;                          // c in the domain (a periodic image wrapped)
     int cl = 0;
     for (int a = 0; a < D; ++a)
     {
         const int na = g.hi[a] - g.lo[a] + 1;
-        const int ia = ((c[a] - g.lo[a]) % na + na) % na;    // a periodic partner's class
-        cl = cl*g.ncls[a] + g.cls[a][ia];
+        cw[a] = g.lo[a] + ((c[a] - g.lo[a]) % na + na) % na;
+        cl = cl*g.ncls[a] + g.cls[a][cw[a] - g.lo[a]];
     }
     const Real uc = u(c, n);
     Real s = 0.0;
     for (int t = g.off[cl]; t < g.off[cl + 1]; ++t)
     {
         const int kind = g.smp[4*t];
-        IV cc = c;
-        for (int a = 0; a < D; ++a) cc[a] += g.smp[4*t + 1 + a];
+        IV cc = c, in = c;
+        bool image = false;             // a boundary sample across a periodic side
+        for (int a = 0; a < D; ++a)
+        {
+            const int o = g.smp[4*t + 1 + a], tw = cw[a] + o;
+            cc[a] += o;
+            // the face's inner cell (a boundary sample): clamped in the domain
+            in[a] = c[a] + (tw < g.lo[a] ? g.lo[a] : (tw > g.hi[a] ? g.hi[a] : tw)) - cw[a];
+            image = image || (g.per[a] && (tw < g.lo[a] || tw > g.hi[a]));
+        }
         Real delta;
         if (kind == 0) delta = u(cc, n) - uc;
-        else if (mode == 0) delta = ub(cc, n) - uc;
-        else if (mode == 1)
-        {
-            IV in = cc;                                  // the face's inner cell
-            for (int a = 0; a < D; ++a)
-                if (!g.per[a])
-                    in[a] = in[a] < g.lo[a] ? g.lo[a] : (in[a] > g.hi[a] ? g.hi[a] : in[a]);
-            delta = 2.0*ub(cc, n) - u(in, n) - uc;
-        }
+        else if (mode == 0) delta = (image ? u(cc, n) : ub(cc, n)) - uc;
+        else if (mode == 1) delta = 2.0*(image ? u(cc, n) : ub(cc, n)) - u(in, n) - uc;
         else delta = 0.0;
         s += g.w[t*g.nmon + m]*delta;
     }

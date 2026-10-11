@@ -305,7 +305,7 @@ def sides(mesh, nsm, dim):
 def lsq_table(nsm, degree, grid, periodic):
     """The LSQ stencils and weights of the zoomy mesh per cell class, from a
     proxy grid of the same spacing (classes: the distance to each side, up to
-    the stencil reach R; a periodic direction has only interior cells).  Text
+    the stencil reach R; a periodic side as a boundary).  Text
     read by ``zs::Mesh::load``."""
     dim, n, lo, h = grid["dim"], grid["n"], grid["lo"], grid["d"]
     np_ = [min(n[ax], 2 * degree + 3) for ax in range(dim)]
@@ -349,8 +349,8 @@ def lsq_table(nsm, degree, grid, periodic):
         if np_[ax] < n[ax] and np_[ax] < 2 * R + 1:
             raise RuntimeError(f"LSQ reach {R}: proxy grid too small")
 
-    def key(i, m, per):
-        return (R, R) if per else (min(i, R), min(m - 1 - i, R))
+    def key(i, m, per):     # periodic sides keep the boundary stencils (as JAX:
+        return (min(i, R), min(m - 1 - i, R))   # the partner is the ghost sample)
     keys = [sorted({key(i, np_[ax], periodic[ax]) for i in range(np_[ax])})
             for ax in range(dim)]
     rep = {}
