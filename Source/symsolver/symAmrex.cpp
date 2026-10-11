@@ -3,7 +3,8 @@
     AMReX grid (rt_amrex.H, CPU / GPU / MPI).
 
     inputs (ParmParse, prefix zs.):  n_cell, prob_lo, prob_hi, max_grid_size,
-    time_end, branch (BC branch of x-lo x-hi y-lo y-hi), lsq (the LSQ table),
+    time_end, branch (BC branch of x-lo x-hi y-lo y-hi z-lo z-hi), periodic (per
+    direction), lsq (the LSQ table),
     q0 / qaux0 (raw doubles, rows x ny x nx, x fastest), out (directory).
     Writes every io.write snapshot as a plotfile <out>/plt<k> and a raw dump
     <out>/<k>.bin, the final state as <out>/final.bin: (time, rows, nx, ny,
@@ -27,10 +28,19 @@ namespace zs
 
 namespace
 {
+// the flat index of cell c, row n in the driver's raw files (x fastest)
+size_t flat(const amrex::Box& dom, const amrex::IntVect& c, int n)
+{
+    size_t idx = size_t(n);
+    for (int d = AMREX_SPACEDIM - 1; d >= 0; --d) idx = idx*dom.length(d) + c[d];
+    return idx;
+}
+
 void load(const std::string& path, zs::Field& F, const zs::Mesh& M)
 {
-    const int nx = M.g.ihi - M.g.ilo + 1, ny = M.g.jhi - M.g.jlo + 1, nq = F.nq;
-    amrex::Vector<double> v(size_t(nq)*nx*ny, 0.0);
+    const amrex::Box dom = M.geom.Domain();
+    const int nq = F.nq;
+    amrex::Vector<double> v(size_t(nq)*dom.numPts(), 0.0);
     if (!path.empty())
     {
         FILE* f = std::fopen(path.c_str(), "rb");
@@ -43,14 +53,18 @@ void load(const std::string& path, zs::Field& F, const zs::Mesh& M)
         const amrex::Box& b = mfi.validbox();
         amrex::FArrayBox host(b, F[0].nComp(), amrex::The_Pinned_Arena());
         auto h = host.array();
-        amrex::LoopOnCpu(b, nq, [&](int i, int j, int, int n)
-        { h(i, j, 0, n) = v[(size_t(n)*ny + j)*nx + i]; });
+        amrex::LoopOnCpu(b, nq, [&](int i, int j, int k, int n)
+        {
+            const amrex::IntVect c(AMREX_D_DECL(i, j, k));
+            h(c, n) = v[flat(dom, c, n)];
+        });
         F[0][mfi].copy<amrex::RunOn::Device>(host, b, 0, b, 0, F[0].nComp());   // pinned: device-visible
         amrex::Gpu::streamSynchronize();               // before ``host`` is freed
     }
     F = zs::halo(F, M);
 }
 
+// time, rows, the D cell counts, then the rows (x fastest), on rank 0
 void dump(const std::string& path, double time, const zs::Field& F, const zs::Mesh& M)
 {
     const amrex::Box dom = M.geom.Domain();
@@ -61,9 +75,10 @@ void dump(const std::string& path, double time, const zs::Field& F, const zs::Me
     amrex::FArrayBox host(dom, F.nq, amrex::The_Pinned_Arena());
     host.copy<amrex::RunOn::Device>(all[0], dom, 0, dom, 0, F.nq);
     amrex::Gpu::streamSynchronize();
-    const double head[4] = {time, double(F.nq), double(dom.length(0)), double(dom.length(1))};
+    std::vector<double> head{time, double(F.nq)};
+    for (int d = 0; d < AMREX_SPACEDIM; ++d) head.push_back(double(dom.length(d)));
     FILE* f = std::fopen(path.c_str(), "wb");
-    std::fwrite(head, sizeof(double), 4, f);
+    std::fwrite(head.data(), sizeof(double), head.size(), f);
     std::fwrite(host.dataPtr(), sizeof(double), size_t(F.nq)*dom.numPts(), f);
     std::fclose(f);
 }
@@ -75,7 +90,7 @@ int main(int argc, char* argv[])
     amrex::ExecOnFinalize(zs::close_pool);
     {
         amrex::ParmParse pp("zs");
-        amrex::Vector<int> n_cell, branch(4, 0);
+        amrex::Vector<int> n_cell, branch(6, -1), periodic(AMREX_SPACEDIM, 0);
         amrex::Vector<amrex::Real> lo, hi;
         int max_grid_size = 64;
         double time_end = 0.0;
@@ -86,23 +101,28 @@ int main(int argc, char* argv[])
         pp.query("max_grid_size", max_grid_size);
         pp.get("time_end", time_end);
         pp.queryarr("branch", branch);
+        pp.queryarr("periodic", periodic);
+        branch.resize(6, -1);
+        periodic.resize(AMREX_SPACEDIM, 0);
         pp.get("lsq", lsq);
         pp.query("q0", q0);
         pp.query("qaux0", qaux0);
         pp.query("out", out);
 
-        const amrex::Box dom(amrex::IntVect(0, 0), amrex::IntVect(n_cell[0] - 1, n_cell[1] - 1));
+        amrex::IntVect hi_cell;
+        amrex::Array<int, AMREX_SPACEDIM> per;
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) { hi_cell[d] = n_cell[d] - 1; per[d] = periodic[d]; }
+        const amrex::Box dom(amrex::IntVect(0), hi_cell);
         zs::Mesh M;
-        M.geom.define(dom, amrex::RealBox(lo.data(), hi.data()), amrex::CoordSys::cartesian,
-                      amrex::Array<int, 2>{0, 0});
+        M.geom.define(dom, amrex::RealBox(lo.data(), hi.data()), amrex::CoordSys::cartesian, per);
         M.ba = amrex::BoxArray(dom);
         M.ba.maxSize(max_grid_size);
         M.dm = amrex::DistributionMapping(M.ba);
-        const int br[4] = {branch[0], branch[1], branch[2], branch[3]};
+        const int br[6] = {branch[0], branch[1], branch[2], branch[3], branch[4], branch[5]};
         M.load(lsq, br);
         zs::the_mesh() = &M;
         zs::configure();
-        amrex::Print() << "symAmrex: " << n_cell[0] << " x " << n_cell[1] << " cells, "
+        amrex::Print() << "symAmrex: " << AMREX_SPACEDIM << "-D, " << dom.numPts() << " cells, "
                        << M.ba.size() << " boxes, " << amrex::ParallelDescriptor::NProcs()
                        << " ranks, LSQ reach " << M.R << "\n";
 
@@ -115,17 +135,17 @@ int main(int argc, char* argv[])
         for (int i = 0; i < zs::NPAR; ++i) p(i, 0) = pv[i];
 
         amrex::UtilCreateDirectory(out, 0755);
-        int k = 0;
+        int nsnap = 0;
         amrex::Vector<std::string> names;
         for (int i = 0; i < Q.nq; ++i) names.push_back("Q" + std::to_string(i));
         zs::writer() = [&](double t, const zs::Field& q, const zs::Field&)
         {
             amrex::MultiFab v(M.ba, M.dm, q.nq, 0);
             amrex::MultiFab::Copy(v, q[0], 0, 0, q.nq, 0);
-            amrex::WriteSingleLevelPlotfile(out + "/plt" + std::to_string(k), v, names,
-                                            M.geom, t, k);
-            dump(out + "/" + std::to_string(k) + ".bin", t, q, M);
-            ++k;
+            amrex::WriteSingleLevelPlotfile(out + "/plt" + std::to_string(nsnap), v, names,
+                                            M.geom, t, nsnap);
+            dump(out + "/" + std::to_string(nsnap) + ".bin", t, q, M);
+            ++nsnap;
         };
 
         Qaux = std::get<0>(zs::initial_aux(Q, Qaux, p, std::cref(M), 0L));

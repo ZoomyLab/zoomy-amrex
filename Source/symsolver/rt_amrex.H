@@ -2,7 +2,8 @@
 /*---------------------------------------------------------------------------*\
     rt_amrex.H -- the AMReX runtime of the symbolic solvers: what every name
     in the printed C++ (zoomy_core.symsolver.CxxPrinter, the text foam runs)
-    means on a single-level AMReX grid (2-D, Cartesian).
+    means on a single-level AMReX grid (Cartesian, 1-, 2- or 3-D: the build's
+    AMREX_SPACEDIM is the model's dimension).
 
     Values: a Field is rows x (cells | faces) on the grid's BoxArray -- cells:
     one MultiFab with NG ghost cells; faces: one face-centred MultiFab per
@@ -16,7 +17,8 @@
     Faces follow the unstructured convention of the JAX/foam runtimes: an
     interior face is owned by its lower cell, normal +e_d; a boundary face by
     its inner cell, normal outward.  A boundary value (Qb, Wb) lives in the
-    out-of-domain ghost cell across its face.
+    out-of-domain ghost cell across its face.  A periodic direction has no
+    boundary faces: its ghost cells are the partner cells (FillBoundary).
 
     Every loop is an amrex::ParallelFor (CPU or GPU); reductions are
     ParReduce + ParallelDescriptor; the linear solve is amrex::GMRES.
@@ -43,15 +45,25 @@
 #include <utility>
 #include <vector>
 
-static_assert(AMREX_SPACEDIM == 2, "rt_amrex.H: 2-D builds only");
-
 namespace zs
 {
 using amrex::Real;
 using amrex::IntVect;
+using IV = amrex::IntVect;
+constexpr int D = AMREX_SPACEDIM;
 template<int N> using Col = amrex::SmallMatrix<Real, (N > 0 ? N : 1), 1>;
 constexpr Real NaN = std::numeric_limits<Real>::quiet_NaN();
 constexpr int MAXR = 16;      // most rows a static row list carries
+
+// the cell of a ParallelFor iteration
+#define ZS_CELL IV c(AMREX_D_DECL(i, j, k))
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE IV unit(int d)
+{
+    IV u(0);
+    u[d] = 1;
+    return u;
+}
 
 // ── settings (the driver's configure()) ─────────────────────────────────────
 struct Settings { int lsq_degree = 1; };
@@ -68,16 +80,17 @@ inline Implicit& implicit() { static Implicit s; return s; }
 
 // ── mesh ────────────────────────────────────────────────────────────────────
 // Geo: what a device loop needs (trivially copyable).  LSQ: per cell class
-// (clsx[i] * ncy + clsy[j]) a list of samples (kind 0: cell at (i+di, j+dj),
-// kind 1: the boundary value in the ghost cell (i+di, j+dj)) and their
-// weights per monomial -- the zoomy mesh's lsq_gradQ * lsq_scale_factors.
+// (the class of each index along each axis, combined) a list of samples
+// (kind 0: the cell at c + offset, kind 1: the boundary value in the ghost
+// cell c + offset) and their weights per monomial -- the zoomy mesh's
+// lsq_gradQ * lsq_scale_factors.
 struct Geo
 {
-    int ilo, ihi, jlo, jhi;
-    Real dx, dy, plox, ploy;
-    int branch[4];                     // BC branch: x-lo, x-hi, y-lo, y-hi
-    int ncy, nmon, gx, gy;             // gx, gy: monomial of d/dx, d/dy
-    const int* clsx; const int* clsy; const int* off; const int* smp;
+    int lo[3], hi[3], per[3];
+    Real dx[3], plo[3];
+    int branch[6];                     // BC branch: x-lo, x-hi, y-lo, y-hi, z-lo, z-hi
+    int ncls[3], nmon, gmon[3];        // gmon: the monomial of d/dx_a (or -1)
+    const int* cls[3]; const int* off; const int* smp;
     const Real* w;
 };
 
@@ -88,30 +101,34 @@ struct Mesh
     amrex::DistributionMapping dm;
     int NG = 2, R = 1;
     std::vector<std::array<int, 3>> mon;
-    amrex::Gpu::DeviceVector<int> clsx, clsy, off, smp;
+    amrex::Gpu::DeviceVector<int> cls[3], off, smp;
     amrex::Gpu::DeviceVector<Real> w;
     Geo g{};
 
-    // the LSQ table written by the driver (zoomy_amrex.symsolver._lsq_table)
-    void load(const std::string& path, const int branch[4])
+    // the LSQ table written by the driver (zoomy_amrex.symsolver.lsq_table)
+    void load(const std::string& path, const int branch[6])
     {
         std::ifstream f(path);
-        int nx, ny, ncx, ncy, nmon;
-        f >> R >> nx >> ny >> ncx >> ncy >> nmon;
+        int dim, n[3] = {1, 1, 1}, nc[3] = {1, 1, 1}, nmon;
+        f >> R >> dim;
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(dim == D, "rt_amrex: LSQ table of another dimension");
+        for (int a = 0; a < D; ++a) f >> n[a];
+        for (int a = 0; a < D; ++a) f >> nc[a];
+        f >> nmon;
         NG = R + 1;
-        std::vector<int> cx(nx), cy(ny), of{0}, sm;
+        std::vector<int> cv[3], of{0}, sm;
         std::vector<Real> ww;
-        for (auto& v : cx) f >> v;
-        for (auto& v : cy) f >> v;
+        for (int a = 0; a < D; ++a) { cv[a].resize(n[a]); for (auto& v : cv[a]) f >> v; }
         mon.resize(nmon);
-        for (auto& m : mon) { f >> m[0] >> m[1]; m[2] = 0; }
-        for (int c = 0; c < ncx*ncy; ++c)
+        for (auto& m : mon) { m = {0, 0, 0}; for (int a = 0; a < D; ++a) f >> m[a]; }
+        for (int c = 0; c < nc[0]*nc[1]*nc[2]; ++c)
         {
             int ns; f >> ns;
             for (int s = 0; s < ns; ++s)
             {
-                int kind, di, dj; f >> kind >> di >> dj;
-                sm.insert(sm.end(), {kind, di, dj});
+                int kind, o[3] = {0, 0, 0}; f >> kind;
+                for (int a = 0; a < D; ++a) f >> o[a];
+                sm.insert(sm.end(), {kind, o[0], o[1], o[2]});
                 for (int k = 0; k < nmon; ++k) { Real x; f >> x; ww.push_back(x); }
             }
             of.push_back(of.back() + ns);
@@ -122,97 +139,101 @@ struct Mesh
             dv.resize(hv.size());
             amrex::Gpu::copy(amrex::Gpu::hostToDevice, hv.begin(), hv.end(), dv.begin());
         };
-        up(clsx, cx); up(clsy, cy); up(off, of); up(smp, sm); up(w, ww);
+        for (int a = 0; a < D; ++a) up(cls[a], cv[a]);
+        up(off, of); up(smp, sm); up(w, ww);
         const amrex::Box& d = geom.Domain();
-        g.ilo = d.smallEnd(0); g.ihi = d.bigEnd(0);
-        g.jlo = d.smallEnd(1); g.jhi = d.bigEnd(1);
-        g.dx = geom.CellSize(0); g.dy = geom.CellSize(1);
-        g.plox = geom.ProbLo(0); g.ploy = geom.ProbLo(1);
-        for (int s = 0; s < 4; ++s) g.branch[s] = branch[s];
-        g.ncy = ncy; g.nmon = nmon;
-        g.gx = monomial(1, 0); g.gy = monomial(0, 1);
-        g.clsx = clsx.data(); g.clsy = clsy.data(); g.off = off.data();
-        g.smp = smp.data(); g.w = w.data();
+        for (int a = 0; a < 3; ++a)
+        {
+            g.lo[a] = a < D ? d.smallEnd(a) : 0;
+            g.hi[a] = a < D ? d.bigEnd(a) : 0;
+            g.per[a] = a < D ? int(geom.isPeriodic(a)) : 0;
+            g.dx[a] = a < D ? geom.CellSize(a) : 1.0;
+            g.plo[a] = a < D ? geom.ProbLo(a) : 0.0;
+            g.ncls[a] = nc[a];
+            g.cls[a] = a < D ? cls[a].data() : nullptr;
+            g.gmon[a] = a < D ? monomial(a == 0, a == 1, a == 2) : -1;
+        }
+        for (int s = 0; s < 6; ++s) g.branch[s] = branch[s];
+        g.nmon = nmon;
+        g.off = off.data(); g.smp = smp.data(); g.w = w.data();
     }
-    int monomial(int a, int b) const
+    int monomial(int a, int b, int c) const
     {
         for (int k = 0; k < int(mon.size()); ++k)
-            if (mon[k][0] == a && mon[k][1] == b) return k;
+            if (mon[k][0] == a && mon[k][1] == b && mon[k][2] == c) return k;
         return -1;
     }
 };
 
 // ── device geometry helpers ─────────────────────────────────────────────────
+// a cell of the domain: inside it, or across a periodic side (the partner)
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-bool inside(const Geo& g, int i, int j)
+bool inside(const Geo& g, const IV& c)
 {
-    return i >= g.ilo && i <= g.ihi && j >= g.jlo && j <= g.jhi;
+    for (int d = 0; d < D; ++d)
+        if (!g.per[d] && (c[d] < g.lo[d] || c[d] > g.hi[d])) return false;
+    return true;
 }
 
-// face (i, j) of direction d (between cells (i,j) - e_d and (i,j)):
-// owner, the other cell (out of the domain on a boundary face), normal
-struct FaceInfo { int oi, oj, xi, xj; bool bnd; Real n0, n1; };
+// face c of direction d (between cells c - e_d and c): owner, the other cell
+// (out of the domain on a boundary face), outward normal of the owner
+struct FaceInfo { IV o, x; bool bnd; Real n[3]; };
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-FaceInfo face_info(const Geo& g, int d, int i, int j)
+FaceInfo face_info(const Geo& g, int d, const IV& c)
 {
-    const int li = i - (d == 0), lj = j - (d == 1);
-    const bool blo = d == 0 ? i == g.ilo : j == g.jlo;
-    const bool bhi = d == 0 ? i == g.ihi + 1 : j == g.jhi + 1;
+    const IV l = c - unit(d);
+    const bool blo = !g.per[d] && c[d] == g.lo[d];
+    const bool bhi = !g.per[d] && c[d] == g.hi[d] + 1;
     FaceInfo f;
     f.bnd = blo || bhi;
-    if (blo) { f.oi = i; f.oj = j; f.xi = li; f.xj = lj; }
-    else     { f.oi = li; f.oj = lj; f.xi = i; f.xj = j; }
-    const Real s = blo ? -1.0 : 1.0;
-    f.n0 = d == 0 ? s : 0.0;
-    f.n1 = d == 1 ? s : 0.0;
+    f.o = blo ? c : l;
+    f.x = blo ? l : c;
+    for (int a = 0; a < 3; ++a) f.n[a] = a == d ? (blo ? -1.0 : 1.0) : 0.0;
     return f;
 }
 
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Col<3> cell_centre(const Geo& g, int i, int j)
+Col<3> cell_centre(const Geo& g, const IV& c)
 {
     Col<3> X{};
-    X(0, 0) = g.plox + (i + 0.5)*g.dx;
-    X(1, 0) = g.ploy + (j + 0.5)*g.dy;
+    for (int a = 0; a < D; ++a) X(a, 0) = g.plo[a] + (c[a] + 0.5)*g.dx[a];
     return X;
 }
 
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Col<3> face_centre(const Geo& g, int d, int i, int j)
+Col<3> face_centre(const Geo& g, int d, const IV& c)
 {
     Col<3> X{};
-    X(0, 0) = g.plox + (i + (d == 0 ? 0.0 : 0.5))*g.dx;
-    X(1, 0) = g.ploy + (j + (d == 1 ? 0.0 : 0.5))*g.dy;
+    for (int a = 0; a < D; ++a) X(a, 0) = g.plo[a] + (c[a] + (a == d ? 0.0 : 0.5))*g.dx[a];
     return X;
 }
 
 template<int N>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Col<N> normal(Real n0, Real n1)
+Col<N> normal(const Real (&v)[3], Real s = 1.0)
 {
     Col<N> n{};
-    n(0, 0) = n0;
-    if constexpr (N > 1) n(1, 0) = n1;
+    for (int a = 0; a < N && a < 3; ++a) n(a, 0) = s*v[a];
     return n;
 }
 
 template<int N, class A>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Col<N> col(const A& a, int i, int j, int nq)
+Col<N> col(const A& a, const IV& c, int nq)
 {
     Col<N> v{};
-    for (int q = 0; q < N && q < nq; ++q) v(q, 0) = a(i, j, 0, q);
+    for (int q = 0; q < N && q < nq; ++q) v(q, 0) = a(c, q);
     return v;
 }
 
 // ── fields ──────────────────────────────────────────────────────────────────
-// entry (i, j, row n) of a field in a device loop (one row broadcasts)
+// entry (cell c, row n) of a field in a device loop (one row broadcasts)
 struct DLeaf
 {
     amrex::MultiArray4<Real const> a;
     int nq;
-    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
-    { return a[bx](i, j, 0, nq == 1 ? 0 : n); }
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
+    { return a[bx](c, nq == 1 ? 0 : n); }
 };
 
 struct Field
@@ -223,7 +244,7 @@ struct Field
     std::shared_ptr<std::vector<amrex::MultiFab>> mf;
     std::shared_ptr<void> keep;        // the parent of an alias
     amrex::MultiFab& operator[](int d) const { return (*mf)[d]; }
-    int ncomp() const { return face ? AMREX_SPACEDIM : 1; }
+    int ncomp() const { return face ? D : 1; }
     int ng() const { return face ? 0 : (*mf)[0].nGrow(); }
     DLeaf dev(int d) const { return {(*mf)[d].const_arrays(), nq}; }
     const Field& shape() const { return *this; }
@@ -268,9 +289,9 @@ inline Field make_like(const amrex::BoxArray& ba, const amrex::DistributionMappi
     if (!m)
     {
         m = new MFs();
-        for (int d = 0; d < (face ? AMREX_SPACEDIM : 1); ++d)
+        for (int d = 0; d < (face ? D : 1); ++d)
         {
-            const amrex::BoxArray b = face ? amrex::convert(ba, IntVect::TheDimensionVector(d)) : ba;
+            const amrex::BoxArray b = face ? amrex::convert(ba, IV::TheDimensionVector(d)) : ba;
             m->emplace_back(b, dm, std::max(nq, 1), face ? 0 : ng);
         }
     }
@@ -328,13 +349,13 @@ struct Max
 struct DNum
 {
     Real s;
-    AMREX_GPU_HOST_DEVICE Real operator()(int, int, int, int) const { return s; }
+    AMREX_GPU_HOST_DEVICE Real operator()(int, const IV&, int) const { return s; }
 };
 template<class Op, class A, class B> struct DBin
 {
     Op op; A a; B b;
-    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
-    { return op(a(bx, i, j, n), b(bx, i, j, n)); }
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
+    { return op(a(bx, c, n), b(bx, c, n)); }
 };
 struct Num
 {
@@ -347,8 +368,8 @@ inline const Field* shape_of(const Field& f) { return &f; }
 struct DRaw
 {
     amrex::MultiArray4<Real const> a;
-    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
-    { return a[bx](i, j, 0, n); }
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
+    { return a[bx](c, n); }
 };
 struct DLeafless
 {
@@ -381,9 +402,9 @@ template<class X> Field eval(const X& x)
     {
         const auto f = x.dev(d);
         auto ra = r[d].arrays();
-        amrex::ParallelFor(r[d], IntVect(r.ng()), r.nq,
+        amrex::ParallelFor(r[d], IV(r.ng()), r.nq,
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
-        { ra[bx](i, j, k, n) = f(bx, i, j, n); });
+        { ZS_CELL; ra[bx](c, n) = f(bx, c, n); });
     }
     return r;
 }
@@ -428,7 +449,8 @@ inline double maximum(double a, double b) { return (a != a || b != b) ? NaN : st
 template<class A, class B, if_x<A, B> = 0> auto minimum(const A& a, const B& b) { return xbin(Min{}, a, b); }
 
 // ── halo ────────────────────────────────────────────────────────────────────
-// the copies of the neighbouring boxes' cells (any rank); a number passes
+// the copies of the neighbouring boxes' cells and the periodic partners (any
+// rank); a number passes
 inline Field halo(const Field& X, const Mesh& M)
 {
     BL_PROFILE("zs::halo");
@@ -457,15 +479,16 @@ double reduce_ext(const X& x)
     {
         const auto a = x.dev(d);
         auto r = amrex::ParReduce(amrex::TypeList<Op, amrex::ReduceOpLogicalOr>{},
-                                  amrex::TypeList<Real, int>{}, F[d], IntVect(0),
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+                                  amrex::TypeList<Real, int>{}, F[d], IV(0),
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
                 -> amrex::GpuTuple<Real, int>
         {
+            ZS_CELL;
             Real e = init;
             int bad = 0;
             for (int n = 0; n < nq; ++n)
             {
-                const Real v = a(bx, i, j, n);
+                const Real v = a(bx, c, n);
                 if (v != v) bad = 1;
                 else e = (MIN ? v < e : v > e) ? v : e;
             }
@@ -492,12 +515,13 @@ inline bool reduce_any(const Field& F)
     {
         auto a = F[d].const_arrays();
         any = any || amrex::ParReduce(amrex::TypeList<amrex::ReduceOpLogicalOr>{},
-                                      amrex::TypeList<int>{}, F[d], IntVect(0),
+                                      amrex::TypeList<int>{}, F[d], IV(0),
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
                 -> amrex::GpuTuple<int>
         {
+            ZS_CELL;
             int r = 0;
-            for (int n = 0; n < nq; ++n) r = r || a[bx](i, j, k, n) != 0.0;
+            for (int n = 0; n < nq; ++n) r = r || a[bx](c, n) != 0.0;
             return {r};
         });
     }
@@ -522,8 +546,8 @@ struct DRows
 {
     DLeaf a;
     Rows R;
-    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
-    { return a.a[bx](i, j, 0, R.r[n]); }
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
+    { return a.a[bx](c, R.r[n]); }
 };
 struct XRows
 {
@@ -547,10 +571,10 @@ XRows take(const Field& Q, const std::tuple<I...>& rows)
 template<class V> struct DPut
 {
     DLeaf q; V v; Rows R;
-    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
     {
-        for (int m = 0; m < R.n; ++m) if (R.r[m] == n) return v(bx, i, j, m);
-        return q.a[bx](i, j, 0, n);
+        for (int m = 0; m < R.n; ++m) if (R.r[m] == n) return v(bx, c, m);
+        return q.a[bx](c, n);
     }
 };
 template<class V> struct XPut
@@ -564,7 +588,7 @@ template<class V> struct XPut
 template<class V> struct is_x<XPut<V>> : std::true_type {};
 template<class V> const Field* shape_of(const XPut<V>& x) { return &x.Q; }
 
-template<class V, class... I>
+template<class V, class... I>   // nvcc: the pack last (device lambda inside)
 auto put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 {
     const auto v = wrap(values);
@@ -581,12 +605,13 @@ auto put(const Field& Q, const std::tuple<I...>& rows, const V& values)
         const auto q = Q.dev(d);
         const auto f = v.dev(d);
         auto o = out[d].arrays();
-        amrex::ParallelFor(out[d], IntVect(out.ng()), out.nq,
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+        amrex::ParallelFor(out[d], IV(out.ng()), out.nq,
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
         {
-            int k = -1;
-            for (int m = 0; m < R.n; ++m) if (R.r[m] == n) k = m;
-            o[bx](i, j, 0, n) = k < 0 ? q.a[bx](i, j, 0, n) : f(bx, i, j, k);
+            ZS_CELL;
+            int s = -1;
+            for (int m = 0; m < R.n; ++m) if (R.r[m] == n) s = m;
+            o[bx](c, n) = s < 0 ? q.a[bx](c, n) : f(bx, c, s);
         });
     }
     return out;
@@ -614,13 +639,14 @@ Field clean_round_off(const X& x, const std::tuple<I...>& rows, double tol)
     {
         auto o = out[d].arrays();
         const auto f = x.dev(d);
-        amrex::ParallelFor(out[d], IntVect(out.ng()), out.nq,
+        amrex::ParallelFor(out[d], IV(out.ng()), out.nq,
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
         {
-            Real v = f(bx, i, j, n);
+            ZS_CELL;
+            Real v = f(bx, c, n);
             for (int m = 0; m < R.n; ++m)
                 if (R.r[m] == n && v < 0.0 && v >= -tol) v = 0.0;
-            o[bx](i, j, k, n) = v;
+            o[bx](c, n) = v;
         });
     }
     return out;
@@ -633,8 +659,8 @@ struct Src
     int nq = 1;
     Real s = 0.0;
     bool num = true;
-    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
-    { return num ? s : a[bx](i, j, 0, nq == 1 ? 0 : n); }
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
+    { return num ? s : a[bx](c, nq == 1 ? 0 : n); }
 };
 inline Src src(const Field& F, int d) { return Src{F[d].const_arrays(), F.nq, 0.0, false}; }
 template<class T, if_num<T> = 0> Src src(T x, int) { Src s; s.s = Real(x); return s; }
@@ -655,10 +681,11 @@ Field select(const Field& m, const A& a_, const B& b_)
     {
         auto o = out[d].arrays();
         const Src M = src(m, d), Sa = src(a, d), Sb = src(b, d);
-        amrex::ParallelFor(out[d], IntVect(out.ng()), out.nq,
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+        amrex::ParallelFor(out[d], IV(out.ng()), out.nq,
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
         {
-            o[bx](i, j, 0, n) = M(bx, i, j, n) != 0.0 ? Sa(bx, i, j, n) : Sb(bx, i, j, n);
+            ZS_CELL;
+            o[bx](c, n) = M(bx, c, n) != 0.0 ? Sa(bx, c, n) : Sb(bx, c, n);
         });
     }
     return out;
@@ -667,7 +694,7 @@ Field select(const Field& m, const A& a_, const B& b_)
 // ── kernels on cells and faces ──────────────────────────────────────────────
 // a cell-family kernel in every cell (ghosts included)
 template<class K, class P, class T1, class T2>
-Field cells(K k, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
+Field cells(K kn, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
             const Mesh& M)
 {
     BL_PROFILE("zs::cells");
@@ -679,12 +706,13 @@ Field cells(K k, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
     auto o = out[0].arrays();
     auto q = Q[0].const_arrays();
     auto a = A[0].const_arrays();
-    amrex::ParallelFor(out[0], IntVect(out.ng()),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::ParallelFor(out[0], IV(out.ng()),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
-        const auto v = k(col<K::n_in>(q[bx], i, j, nq), col<K::n_aux>(a[bx], i, j, na),
-                         p, time, dt, cell_centre(g, i, j));
-        for (int r = 0; r < K::n_out; ++r) o[bx](i, j, 0, r) = v(r, 0);
+        ZS_CELL;
+        const auto v = kn(col<K::n_in>(q[bx], c, nq), col<K::n_aux>(a[bx], c, na),
+                          p, time, dt, cell_centre(g, c));
+        for (int r = 0; r < K::n_out; ++r) o[bx](c, r) = v(r, 0);
     });
     return out;
 }
@@ -693,26 +721,26 @@ Field cells(K k, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
 // = 0 and no position
 template<class K, class X, class A, class P>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-auto call_pointwise(const K& k, const X& x, const A& a, const P& p)
+auto call_pointwise(const K& kn, const X& x, const A& a, const P& p)
 {
-    if constexpr (K::family == 3) return k(x, a, p);
-    else return k(x, a, p, 0.0, 0.0, Col<3>{});
+    if constexpr (K::family == 3) return kn(x, a, p);
+    else return kn(x, a, p, 0.0, 0.0, Col<3>{});
 }
 
-// a column of an expression at (i, j)
+// a column of an expression at cell c
 template<int N, class F>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Col<N> colx(const F& f, int bx, int i, int j, int nq)
+Col<N> colx(const F& f, int bx, const IV& c, int nq)
 {
     Col<N> v{};
-    for (int q = 0; q < N && q < nq; ++q) v(q, 0) = f(bx, i, j, q);
+    for (int q = 0; q < N && q < nq; ++q) v(q, 0) = f(bx, c, q);
     return v;
 }
 
 // a kernel in every column (cells or faces); no time, step or position.
 // X and A may be expressions (read in the same loop)
 template<class K, class X, class A, class P>
-Field pointwise(K k, const X& X_, const A& A_, const P& p)
+Field pointwise(K kn, const X& X_, const A& A_, const P& p)
 {
     BL_PROFILE("zs::pointwise");
     const auto x = wrap(X_);
@@ -727,24 +755,25 @@ Field pointwise(K k, const X& X_, const A& A_, const P& p)
         {   // fields: plain array reads (the CPU compiler vectorises them)
             auto xa = x[d].const_arrays();
             auto aa = a[d].const_arrays();
-            amrex::ParallelFor(out[d], IntVect(out.ng()),
-                [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+            amrex::ParallelFor(out[d], IV(out.ng()),
+                [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
             {
-                const auto v = call_pointwise(k, col<K::n_in>(xa[bx], i, j, nq),
-                                              col<K::n_aux>(aa[bx], i, j, na), p);
-                for (int r = 0; r < K::n_out; ++r) o[bx](i, j, 0, r) = v(r, 0);
+                ZS_CELL;
+                const auto v = call_pointwise(kn, col<K::n_in>(xa[bx], c, nq),
+                                              col<K::n_aux>(aa[bx], c, na), p);
+                for (int r = 0; r < K::n_out; ++r) o[bx](c, r) = v(r, 0);
             });
             continue;
         }
         const auto xf = x.dev(d);
         const auto af = a.dev(d);
-        amrex::ParallelFor(out[d], IntVect(out.ng()),
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+        amrex::ParallelFor(out[d], IV(out.ng()),
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
-            const auto xc = colx<K::n_in>(xf, bx, i, j, nq);
-            const auto ac = colx<K::n_aux>(af, bx, i, j, na);
-            const auto v = call_pointwise(k, xc, ac, p);
-            for (int r = 0; r < K::n_out; ++r) o[bx](i, j, 0, r) = v(r, 0);
+            ZS_CELL;
+            const auto v = call_pointwise(kn, colx<K::n_in>(xf, bx, c, nq),
+                                          colx<K::n_aux>(af, bx, c, na), p);
+            for (int r = 0; r < K::n_out; ++r) o[bx](c, r) = v(r, 0);
         });
     }
     return out;
@@ -760,14 +789,14 @@ std::array<Field, N> split(const Field& F)
 
 // the face kernel on every face, owner -> other with the owner's normal
 template<class K, class P>
-Field face_kernel(K k, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
+Field face_kernel(K kn, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
                   const P& p, const Mesh& M)
 {
     BL_PROFILE("zs::face_kernel");
     Field out = faces_of(M, K::n_out);
     const Geo g = M.g;
     const int nq = QL.nq, na = AL.nq;
-    for (int d = 0; d < AMREX_SPACEDIM; ++d)
+    for (int d = 0; d < D; ++d)
     {
         auto o = out[d].arrays();
         auto l = QL[d].const_arrays();
@@ -775,22 +804,23 @@ Field face_kernel(K k, const Field& QL, const Field& QR, const Field& AL, const 
         auto al = AL[d].const_arrays();
         auto ar = AR[d].const_arrays();
         amrex::ParallelFor(out[d],
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
-            const FaceInfo f = face_info(g, d, i, j);
-            const auto v = k(col<K::n_in>(l[bx], i, j, nq), col<K::n_in>(r[bx], i, j, nq),
-                             col<K::n_aux>(al[bx], i, j, na), col<K::n_aux>(ar[bx], i, j, na),
-                             p, normal<K::n_nrm>(f.n0, f.n1));
-            for (int m = 0; m < K::n_out; ++m) o[bx](i, j, 0, m) = v(m, 0);
+            ZS_CELL;
+            const FaceInfo f = face_info(g, d, c);
+            const auto v = kn(col<K::n_in>(l[bx], c, nq), col<K::n_in>(r[bx], c, nq),
+                              col<K::n_aux>(al[bx], c, na), col<K::n_aux>(ar[bx], c, na),
+                              p, normal<K::n_nrm>(f.n));
+            for (int m = 0; m < K::n_out; ++m) o[bx](c, m) = v(m, 0);
         });
     }
     return out;
 }
 template<int N = 1, class K, class P>
-auto faces(K k, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
+auto faces(K kn, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
            const P& p, const Mesh& M)
 {
-    const Field out = face_kernel(k, QL, QR, AL, AR, p, M);
+    const Field out = face_kernel(kn, QL, QR, AL, AR, p, M);
     if constexpr (N == 1) return out;
     else return split<N>(out);
 }
@@ -804,16 +834,17 @@ inline std::tuple<Field, Field> face_aux(const Field& Qaux_, const Mesh& M)
     const Geo g = M.g;
     const int na = Qaux.nq;
     auto a = Qaux[0].const_arrays();
-    for (int d = 0; d < AMREX_SPACEDIM; ++d)
+    for (int d = 0; d < D; ++d)
     {
         auto l = L[d].arrays();
         auto r = R[d].arrays();
-        amrex::ParallelFor(L[d], IntVect(0), na,
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+        amrex::ParallelFor(L[d], IV(0), na,
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
         {
-            const FaceInfo f = face_info(g, d, i, j);
-            l[bx](i, j, 0, n) = a[bx](f.oi, f.oj, 0, n);
-            r[bx](i, j, 0, n) = f.bnd ? a[bx](f.oi, f.oj, 0, n) : a[bx](f.xi, f.xj, 0, n);
+            ZS_CELL;
+            const FaceInfo f = face_info(g, d, c);
+            l[bx](c, n) = a[bx](f.o, n);
+            r[bx](c, n) = f.bnd ? a[bx](f.o, n) : a[bx](f.x, n);
         });
     }
     return {L, R};
@@ -822,7 +853,7 @@ inline std::tuple<Field, Field> face_aux(const Field& Qaux_, const Mesh& M)
 // max |eigenvalue| per face over its two cells (the inner cell twice at a
 // boundary face)
 template<class K, class P>
-Field face_wavespeed(K k, const Field& Q_, const Field& A_, const P& p, const Mesh& M)
+Field face_wavespeed(K kn, const Field& Q_, const Field& A_, const P& p, const Mesh& M)
 {
     BL_PROFILE("zs::face_wavespeed");
     const Field Q = need(Q_, 1, M), A = need(A_, 1, M);
@@ -831,18 +862,18 @@ Field face_wavespeed(K k, const Field& Q_, const Field& A_, const P& p, const Me
     const int nq = Q.nq, na = A.nq;
     auto q = Q[0].const_arrays();
     auto a = A[0].const_arrays();
-    for (int d = 0; d < AMREX_SPACEDIM; ++d)
+    for (int d = 0; d < D; ++d)
     {
         auto o = out[d].arrays();
         amrex::ParallelFor(out[d],
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
-            const FaceInfo f = face_info(g, d, i, j);
-            const auto n = normal<K::n_nrm>(f.n0, f.n1);
-            auto peak = [&](int ci, int cj)
+            ZS_CELL;
+            const FaceInfo f = face_info(g, d, c);
+            const auto n = normal<K::n_nrm>(f.n);
+            auto peak = [&](const IV& cc)
             {
-                const auto v = k(col<K::n_in>(q[bx], ci, cj, nq),
-                                 col<K::n_aux>(a[bx], ci, cj, na), p, n);
+                const auto v = kn(col<K::n_in>(q[bx], cc, nq), col<K::n_aux>(a[bx], cc, na), p, n);
                 Real s = 0.0;
                 for (int m = 0; m < K::n_out; ++m)
                 {
@@ -851,9 +882,9 @@ Field face_wavespeed(K k, const Field& Q_, const Field& A_, const P& p, const Me
                 }
                 return s;
             };
-            const Real s0 = peak(f.oi, f.oj);
-            const Real s1 = f.bnd ? s0 : peak(f.xi, f.xj);
-            o[bx](i, j, 0, 0) = (s0 != s0 || s1 != s1) ? NaN : (s0 > s1 ? s0 : s1);
+            const Real s0 = peak(f.o);
+            const Real s1 = f.bnd ? s0 : peak(f.x);
+            o[bx](c, 0) = (s0 != s0 || s1 != s1) ? NaN : (s0 > s1 ? s0 : s1);
         });
     }
     return out;
@@ -862,12 +893,31 @@ Field face_wavespeed(K k, const Field& Q_, const Field& A_, const P& p, const Me
 // per-face cell size: d |V| / |dV| of the (uniform) cells
 inline Real face_inradius(const Mesh& M)
 {
-    return 2.0*M.g.dx*M.g.dy/(2.0*M.g.dx + 2.0*M.g.dy);   // uniform cells: one number
+    Real s = 0.0;
+    for (int d = 0; d < D; ++d) s += 2.0/M.g.dx[d];   // |dV| / |V|
+    return D/s;                                         // uniform cells: one number
 }
 
 // ── boundary ────────────────────────────────────────────────────────────────
+// out-of-domain ghost cell c across exactly one boundary face: its direction
+// d, side (2 d + upper) and inner cell; false otherwise
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+bool boundary_ghost(const Geo& g, const IV& c, int& d, int& side, IV& in)
+{
+    int n = 0;
+    in = c;
+    for (int a = 0; a < D; ++a)
+    {
+        const int o = c[a] < g.lo[a] ? -1 : (c[a] > g.hi[a] ? 1 : 0);
+        if (o == 0 || g.per[a]) continue;               // periodic: a partner cell
+        ++n; d = a; side = 2*a + (o > 0);
+        in[a] -= o;
+    }
+    return n == 1 && inside(g, in);
+}
+
 // the BC kernel's state in every out-of-domain ghost cell across a face, from
-// ``states`` (cells: the inner cell) and the inner cell's aux
+// the inner cell and its aux
 template<class K, class P, class T>
 Field bc_cells(K bc, const Field& Q, const Field& A, const P& p, T time_, const Mesh& M)
 {
@@ -880,22 +930,20 @@ Field bc_cells(K bc, const Field& Q, const Field& A, const P& p, T time_, const 
     auto o = out[0].arrays();
     auto q = Q[0].const_arrays();
     auto a = A[0].const_arrays();
-    amrex::ParallelFor(out[0], IntVect(out.ng()),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::ParallelFor(out[0], IV(out.ng()),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
-        const int ox = i < g.ilo ? -1 : (i > g.ihi ? 1 : 0);
-        const int oy = j < g.jlo ? -1 : (j > g.jhi ? 1 : 0);
-        if ((ox != 0) == (oy != 0)) return;                 // inside, or a corner
-        const int ii = i - ox, jj = j - oy;                 // the inner cell
-        if (!inside(g, ii, jj)) return;                     // two cells out
-        const int side = ox < 0 ? 0 : ox > 0 ? 1 : oy < 0 ? 2 : 3;
-        const int d = ox != 0 ? 0 : 1;
-        const Col<3> X = face_centre(g, d, ox > 0 ? i : ii, oy > 0 ? j : jj);
-        const Real dist = 0.5*(d == 0 ? g.dx : g.dy);
-        const auto v = bc(g.branch[side], time, X, dist, col<K::n_in>(q[bx], ii, jj, nq),
-                          col<K::n_aux>(a[bx], ii, jj, na), p,
-                          normal<K::n_nrm>(Real(ox), Real(oy)));
-        for (int m = 0; m < K::n_out && m < nq; ++m) o[bx](i, j, 0, m) = v(m, 0);
+        ZS_CELL;
+        int d = 0, side = 0;
+        IV in = c;
+        if (!boundary_ghost(g, c, d, side, in)) return;
+        const IV fc = (side & 1) ? c : in;                // the face index
+        Real n[3] = {0.0, 0.0, 0.0};
+        n[d] = (side & 1) ? 1.0 : -1.0;
+        const auto v = bc(g.branch[side], time, face_centre(g, d, fc), 0.5*g.dx[d],
+                          col<K::n_in>(q[bx], in, nq), col<K::n_aux>(a[bx], in, na), p,
+                          normal<K::n_nrm>(n));
+        for (int m = 0; m < K::n_out && m < nq; ++m) o[bx](c, m) = v(m, 0);
     });
     return out;
 }
@@ -909,13 +957,13 @@ inline Field inner_cells(const Field& A, const Mesh& M)
     const Geo g = M.g;
     auto o = out[0].arrays();
     auto a = A[0].const_arrays();
-    amrex::ParallelFor(out[0], IntVect(out.ng()), A.nq,
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+    amrex::ParallelFor(out[0], IV(out.ng()), A.nq,
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
     {
-        const int ox = i < g.ilo ? -1 : (i > g.ihi ? 1 : 0);
-        const int oy = j < g.jlo ? -1 : (j > g.jhi ? 1 : 0);
-        if ((ox != 0) == (oy != 0) || !inside(g, i - ox, j - oy)) return;
-        o[bx](i, j, 0, n) = a[bx](i - ox, j - oy, 0, n);
+        ZS_CELL;
+        int d = 0, side = 0;
+        IV in = c;
+        if (boundary_ghost(g, c, d, side, in)) o[bx](c, n) = a[bx](in, n);
     });
     return out;
 }
@@ -945,26 +993,26 @@ Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
     const Real time = time_;
     const int nq = QL.nq, na = A.nq;
     auto a = A[0].const_arrays();
-    for (int d = 0; d < AMREX_SPACEDIM; ++d)
+    for (int d = 0; d < D; ++d)
     {
         auto o = out[d].arrays();
         auto l = QL[d].const_arrays();
         auto r = QR[d].const_arrays();
         amrex::ParallelFor(out[d],
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
-            const FaceInfo f = face_info(g, d, i, j);
+            ZS_CELL;
+            const FaceInfo f = face_info(g, d, c);
             if (!f.bnd)
             {
-                for (int m = 0; m < nq; ++m) o[bx](i, j, 0, m) = r[bx](i, j, 0, m);
+                for (int m = 0; m < nq; ++m) o[bx](c, m) = r[bx](c, m);
                 return;
             }
-            const int side = d == 0 ? (f.n0 < 0 ? 0 : 1) : (f.n1 < 0 ? 2 : 3);
-            const auto v = bc(g.branch[side], time, face_centre(g, d, i, j),
-                              0.5*(d == 0 ? g.dx : g.dy), col<K::n_in>(l[bx], i, j, nq),
-                              col<K::n_aux>(a[bx], f.oi, f.oj, na), p,
-                              normal<K::n_nrm>(f.n0, f.n1));
-            for (int m = 0; m < nq; ++m) o[bx](i, j, 0, m) = v(m, 0);
+            const int side = 2*d + (f.n[d] > 0);
+            const auto v = bc(g.branch[side], time, face_centre(g, d, c), 0.5*g.dx[d],
+                              col<K::n_in>(l[bx], c, nq), col<K::n_aux>(a[bx], f.o, na), p,
+                              normal<K::n_nrm>(f.n));
+            for (int m = 0; m < nq; ++m) o[bx](c, m) = v(m, 0);
         });
     }
     return out;
@@ -978,18 +1026,19 @@ std::tuple<Field, Field> cell_traces_of(const X& Q, const Y& Qb, const Mesh& M)
     BL_PROFILE("zs::cell_traces");
     Field L = faces_of(M, Q.nq), R = faces_of(M, Q.nq);
     const Geo g = M.g;
-    for (int d = 0; d < AMREX_SPACEDIM; ++d)
+    for (int d = 0; d < D; ++d)
     {
         const auto q = Q.dev(0);
         const auto b = Qb.dev(0);
         auto l = L[d].arrays();
         auto r = R[d].arrays();
-        amrex::ParallelFor(L[d], IntVect(0), Q.nq,
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+        amrex::ParallelFor(L[d], IV(0), Q.nq,
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
         {
-            const FaceInfo f = face_info(g, d, i, j);
-            l[bx](i, j, 0, n) = q(bx, f.oi, f.oj, n);
-            r[bx](i, j, 0, n) = f.bnd ? b(bx, f.xi, f.xj, n) : q(bx, f.xi, f.xj, n);
+            ZS_CELL;
+            const FaceInfo f = face_info(g, d, c);
+            l[bx](c, n) = q(bx, f.o, n);
+            r[bx](c, n) = f.bnd ? b(bx, f.x, n) : q(bx, f.x, n);
         });
     }
     return {L, R};
@@ -1005,27 +1054,38 @@ inline std::tuple<Field, Field> cell_traces(const Field& Q, const Field& Qb, con
     return cell_traces_of(DLeafless{need(Q, 1, M)}, DLeafless{Qb}, M);
 }
 
-// LSQ fit of row ``n`` at cell (i, j), monomial ``m``: sum_s w_s,m delta_s.
-// A boundary sample's delta: ghost(n) - u_c with ghost = Wb (``mode`` 0), the
+// LSQ fit of row ``n`` at cell c, monomial ``m``: sum_s w_s,m delta_s.  A
+// boundary sample's delta: ghost(n) - u_c with ghost = Wb (``mode`` 0), the
 // face value 2 Qb - Q_inner (1), or u_c itself (2: no boundary value)
 template<class A, class B>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Real lsq(const Geo& g, const A& u, const B& ub, int mode, int i, int j, int n, int m)
+Real lsq(const Geo& g, const A& u, const B& ub, int mode, const IV& c, int n, int m)
 {
-    const int c = g.clsx[i - g.ilo]*g.ncy + g.clsy[j - g.jlo];
-    const Real uc = u(i, j, 0, n);
-    Real s = 0.0;
-    for (int t = g.off[c]; t < g.off[c + 1]; ++t)
+    if (m < 0) return 0.0;
+    int cl = 0;
+    for (int a = 0; a < D; ++a)
     {
-        const int kind = g.smp[3*t], ii = i + g.smp[3*t + 1], jj = j + g.smp[3*t + 2];
+        const int na = g.hi[a] - g.lo[a] + 1;
+        const int ia = ((c[a] - g.lo[a]) % na + na) % na;    // a periodic partner's class
+        cl = cl*g.ncls[a] + g.cls[a][ia];
+    }
+    const Real uc = u(c, n);
+    Real s = 0.0;
+    for (int t = g.off[cl]; t < g.off[cl + 1]; ++t)
+    {
+        const int kind = g.smp[4*t];
+        IV cc = c;
+        for (int a = 0; a < D; ++a) cc[a] += g.smp[4*t + 1 + a];
         Real delta;
-        if (kind == 0) delta = u(ii, jj, 0, n) - uc;
-        else if (mode == 0) delta = ub(ii, jj, 0, n) - uc;
+        if (kind == 0) delta = u(cc, n) - uc;
+        else if (mode == 0) delta = ub(cc, n) - uc;
         else if (mode == 1)
         {
-            const int ci = ii < g.ilo ? g.ilo : (ii > g.ihi ? g.ihi : ii);
-            const int cj = jj < g.jlo ? g.jlo : (jj > g.jhi ? g.jhi : jj);
-            delta = 2.0*ub(ii, jj, 0, n) - u(ci, cj, 0, n) - uc;
+            IV in = cc;                                  // the face's inner cell
+            for (int a = 0; a < D; ++a)
+                if (!g.per[a])
+                    in[a] = in[a] < g.lo[a] ? g.lo[a] : (in[a] > g.hi[a] ? g.hi[a] : in[a]);
+            delta = 2.0*ub(cc, n) - u(in, n) - uc;
         }
         else delta = 0.0;
         s += g.w[t*g.nmon + m]*delta;
@@ -1033,24 +1093,24 @@ Real lsq(const Geo& g, const A& u, const B& ub, int mode, int i, int j, int n, i
     return s;
 }
 
-// LSQ gradient of every row (row 2 q + a: d/dx_a of row q)
+// LSQ gradient of every row (row D q + a: d/dx_a of row q)
 inline Field gradient(const Field& W_, const Field& Wb, const Mesh& M)
 {
     BL_PROFILE("zs::gradient");
     const Field W = need(W_, M.R, M);
-    Field G = cells_of(M, 2*W.nq);
+    Field G = cells_of(M, D*W.nq);
     const int gr = std::max(0, std::min(W.ngv, Wb.ngv) - M.R);
     G.ngv = gr;
     const Geo g = M.g;
     auto o = G[0].arrays();
     auto w = W[0].const_arrays();
     auto wb = Wb[0].const_arrays();
-    amrex::ParallelFor(G[0], IntVect(gr), W.nq,
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+    amrex::ParallelFor(G[0], IV(gr), W.nq,
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
     {
-        if (!inside(g, i, j)) return;
-        o[bx](i, j, 0, 2*n) = lsq(g, w[bx], wb[bx], 0, i, j, n, g.gx);
-        o[bx](i, j, 0, 2*n + 1) = lsq(g, w[bx], wb[bx], 0, i, j, n, g.gy);
+        ZS_CELL;
+        if (!inside(g, c)) return;
+        for (int a = 0; a < D; ++a) o[bx](c, D*n + a) = lsq(g, w[bx], wb[bx], 0, c, n, g.gmon[a]);
     });
     return G;
 }
@@ -1086,37 +1146,40 @@ inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Fie
     const int gr = std::max(0, std::min({W.ngv - 1, G.ngv, Wb.ngv}));
     phi.ngv = gr;
     const Geo g = M.g;
-    const Real ev2 = g.dx*g.dy;                         // (V^(1/2))^2
+    Real vol = 1.0;
+    for (int d = 0; d < D; ++d) vol *= g.dx[d];
+    const Real ev2 = std::pow(vol, 2.0/D);              // (V^(1/d))^2
     auto o = phi[0].arrays();
     auto w = W[0].const_arrays();
     auto wb = Wb[0].const_arrays();
     auto gg = G[0].const_arrays();
-    amrex::ParallelFor(phi[0], IntVect(gr), W.nq,
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+    amrex::ParallelFor(phi[0], IV(gr), W.nq,
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
     {
+        ZS_CELL;
         bool lim = false;
         for (int m = 0; m < R.n; ++m) lim = lim || R.r[m] == n;
-        if (!lim || !inside(g, i, j)) { o[bx](i, j, 0, n) = 1.0; return; }
-        const Real u = w[bx](i, j, 0, n);
-        const int di[4] = {-1, 1, 0, 0}, dj[4] = {0, 0, -1, 1};
+        if (!lim || !inside(g, c)) { o[bx](c, n) = 1.0; return; }
+        const Real u = w[bx](c, n);
         Real lo = u, hi = u;
-        for (int f = 0; f < 4; ++f)
+        for (int f = 0; f < 2*D; ++f)
         {
-            const int ii = i + di[f], jj = j + dj[f];
-            const Real v = inside(g, ii, jj) ? w[bx](ii, jj, 0, n)
-                                             : wb[bx](ii, jj, 0, n);
+            IV cc = c;
+            cc[f/2] += (f & 1) ? 1 : -1;
+            // a boundary ghost holds Wb; a periodic one the partner cell
+            const Real v = inside(g, cc) ? w[bx](cc, n) : wb[bx](cc, n);
             lo = v < lo ? v : lo;
             hi = v > hi ? v : hi;
         }
-        Real p = 1.0;
-        for (int f = 0; f < 4; ++f)
+        Real ph = 1.0;
+        for (int f = 0; f < 2*D; ++f)
         {
-            const Real delta = gg[bx](i, j, 0, 2*n)*0.5*di[f]*g.dx
-                             + gg[bx](i, j, 0, 2*n + 1)*0.5*dj[f]*g.dy;
-            const Real c = limit(L, delta, lo - u, hi - u, ev2);
-            p = c < p ? c : p;
+            const int d = f/2;
+            const Real delta = gg[bx](c, D*n + d)*((f & 1) ? 0.5 : -0.5)*g.dx[d];
+            const Real cf = limit(L, delta, lo - u, hi - u, ev2);
+            ph = cf < ph ? cf : ph;
         }
-        o[bx](i, j, 0, n) = p;
+        o[bx](c, n) = ph;
     });
     return phi;
 }
@@ -1149,22 +1212,23 @@ std::tuple<Field, Field> extrapolate(const Field& W_, const Field& Wb, const Fie
     Field keep;                         // phi's storage lives through the launches
     if constexpr (std::is_arithmetic_v<P>) phi = src(phi_, 0);
     else { keep = need(Field(phi_), 1, M); phi = src(keep, 0); }
-    for (int d = 0; d < AMREX_SPACEDIM; ++d)
+    for (int d = 0; d < D; ++d)
     {
         auto l = L[d].arrays();
         auto r = R[d].arrays();
-        amrex::ParallelFor(L[d], IntVect(0), W.nq,
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+        amrex::ParallelFor(L[d], IV(0), W.nq,
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
         {
-            const FaceInfo f = face_info(g, d, i, j);
+            ZS_CELL;
+            const FaceInfo f = face_info(g, d, c);
             // the face centre from a cell centre: +- h/2 along d
-            auto val = [&](int ci, int cj)
+            auto val = [&](const IV& cc)
             {
-                const Real s = (d == 0 ? (ci < i ? 0.5 : -0.5)*g.dx : (cj < j ? 0.5 : -0.5)*g.dy);
-                return w[bx](ci, cj, 0, n) + phi(bx, ci, cj, n)*gg[bx](ci, cj, 0, 2*n + d)*s;
+                const Real s = (cc[d] < c[d] ? 0.5 : -0.5)*g.dx[d];
+                return w[bx](cc, n) + phi(bx, cc, n)*gg[bx](cc, D*n + d)*s;
             };
-            l[bx](i, j, 0, n) = val(f.oi, f.oj);
-            r[bx](i, j, 0, n) = f.bnd ? wb[bx](f.xi, f.xj, 0, n) : val(f.xi, f.xj);
+            l[bx](c, n) = val(f.o);
+            r[bx](c, n) = f.bnd ? wb[bx](f.x, n) : val(f.x);
         });
     }
     return {L, R};
@@ -1178,23 +1242,28 @@ inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
     Field out = cells_of(M, Wm.nq);
     const Geo g = M.g;
     auto o = out[0].arrays();
-    auto mx = Wm[0].const_arrays(); auto my = Wm[1].const_arrays();
-    auto px = Wp[0].const_arrays(); auto py = Wp[1].const_arrays();
-    amrex::ParallelFor(out[0], IntVect(0), Wm.nq,
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+    amrex::GpuArray<amrex::MultiArray4<Real const>, D> m, pp;
+    for (int d = 0; d < D; ++d) { m[d] = Wm[d].const_arrays(); pp[d] = Wp[d].const_arrays(); }
+    amrex::ParallelFor(out[0], IV(0), Wm.nq,
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
     {
-        // lower face: this cell owns it only on the domain's lower boundary
-        const Real xl = i == g.ilo ? mx[bx](i, j, 0, n) : px[bx](i, j, 0, n);
-        const Real yl = j == g.jlo ? my[bx](i, j, 0, n) : py[bx](i, j, 0, n);
-        o[bx](i, j, 0, n) = (xl + mx[bx](i + 1, j, 0, n))/g.dx
-                          + (yl + my[bx](i, j + 1, 0, n))/g.dy;
+        ZS_CELL;
+        Real s = 0.0;
+        for (int d = 0; d < D; ++d)
+        {
+            // lower face: this cell owns it only on the domain's lower boundary
+            const bool own = !g.per[d] && c[d] == g.lo[d];
+            const Real lower = own ? m[d][bx](c, n) : pp[d][bx](c, n);
+            s += (lower + m[d][bx](c + unit(d), n))/g.dx[d];
+        }
+        o[bx](c, n) = s;
     });
     return out;
 }
 
 // per cell the interior nonconservative integral over each of its faces
 template<class K, class P>
-Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
+Field edge_source(K kn, const Field& Q, const Field& QL, const Field& QR,
                   const Field& A, const P& p, const Mesh& M)
 {
     BL_PROFILE("zs::edge_source");
@@ -1204,29 +1273,27 @@ Field edge_source(K k, const Field& Q, const Field& QL, const Field& QR,
     auto o = out[0].arrays();
     auto q = Q[0].const_arrays();
     auto a = A[0].const_arrays();
-    auto lx = QL[0].const_arrays(); auto ly = QL[1].const_arrays();
-    auto rx = QR[0].const_arrays(); auto ry = QR[1].const_arrays();
-    amrex::ParallelFor(out[0], IntVect(0),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::GpuArray<amrex::MultiArray4<Real const>, D> ql, qr;
+    for (int d = 0; d < D; ++d) { ql[d] = QL[d].const_arrays(); qr[d] = QR[d].const_arrays(); }
+    amrex::ParallelFor(out[0], IV(0),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
-        const auto qc = col<K::n_in>(q[bx], i, j, nq);
-        const auto ac = col<K::n_aux>(a[bx], i, j, na);
+        ZS_CELL;
+        const auto qc = col<K::n_in>(q[bx], c, nq);
+        const auto ac = col<K::n_aux>(a[bx], c, na);
         Col<K::n_out> s{};
-        for (int d = 0; d < 2; ++d)
-            for (int hi = 0; hi < 2; ++hi)
+        for (int d = 0; d < D; ++d)
+            for (int up = 0; up < 2; ++up)
             {
-                const int fi = i + (d == 0 && hi), fj = j + (d == 1 && hi);
-                const FaceInfo f = face_info(g, d, fi, fj);
-                const bool own = f.oi == i && f.oj == j;
-                const auto L = d == 0 ? lx[bx] : ly[bx];
-                const auto R = d == 0 ? rx[bx] : ry[bx];
-                const Real sg = own ? 1.0 : -1.0;
-                const auto v = k(qc, own ? col<K::n_in>(L, fi, fj, nq) : col<K::n_in>(R, fi, fj, nq),
-                                 ac, ac, p, normal<K::n_nrm>(sg*f.n0, sg*f.n1));
-                const Real h = d == 0 ? g.dx : g.dy;
-                for (int m = 0; m < K::n_out; ++m) s(m, 0) += v(m, 0)/h;
+                const IV fc = up ? c + unit(d) : c;
+                const FaceInfo f = face_info(g, d, fc);
+                const bool own = f.o == c;
+                const auto v = kn(qc, own ? col<K::n_in>(ql[d][bx], fc, nq)
+                                          : col<K::n_in>(qr[d][bx], fc, nq),
+                                  ac, ac, p, normal<K::n_nrm>(f.n, own ? 1.0 : -1.0));
+                for (int mm = 0; mm < K::n_out; ++mm) s(mm, 0) += v(mm, 0)/g.dx[d];
             }
-        for (int m = 0; m < K::n_out && m < nq; ++m) o[bx](i, j, 0, m) = s(m, 0);
+        for (int mm = 0; mm < K::n_out && mm < nq; ++mm) o[bx](c, mm) = s(mm, 0);
     });
     return out;
 }
@@ -1258,14 +1325,15 @@ Field derivative_aux_impl(const S& spec, const Field& Q_, const Field& Qaux,
             for (int m = 0; m < rows.n; ++m) in = in || rows.r[m] == e[1];
             if (!in) continue;
         }
-        const int mi = M.monomial(e[2], e[3]);
-        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(mi >= 0 && e[4] == 0,
+        const int mi = M.monomial(e[2], e[3], e[4]);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(mi >= 0,
             "derivative_aux: the derivative exceeds the LSQ degree");
         const int row = e[0], s = e[1];
-        amrex::ParallelFor(out[0], IntVect(gr),
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+        amrex::ParallelFor(out[0], IV(gr),
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
-            if (inside(g, i, j)) o[bx](i, j, 0, row) = lsq(g, q[bx], qb[bx], mode, i, j, s, mi);
+            ZS_CELL;
+            if (inside(g, c)) o[bx](c, row) = lsq(g, q[bx], qb[bx], mode, c, s, mi);
         });
     }
     return out;
@@ -1280,7 +1348,7 @@ Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mes
 
 // cell mask: an admissibility row < 0 or a non-finite value
 template<class K, class P>
-Field inadmissible(K k, const Field& Q, const Field& A, const P& p)
+Field inadmissible(K kn, const Field& Q, const Field& A, const P& p)
 {
     BL_PROFILE("zs::inadmissible");
     Field out = like(Q, 1);
@@ -1289,15 +1357,16 @@ Field inadmissible(K k, const Field& Q, const Field& A, const P& p)
     auto o = out[0].arrays();
     auto q = Q[0].const_arrays();
     auto a = A[0].const_arrays();
-    amrex::ParallelFor(out[0], IntVect(out.ng()),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::ParallelFor(out[0], IV(out.ng()),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
-        const auto x = col<K::n_in>(q[bx], i, j, nq);
-        const auto v = k(x, col<K::n_aux>(a[bx], i, j, na), p, 0.0, 0.0, Col<3>{});
+        ZS_CELL;
+        const auto x = col<K::n_in>(q[bx], c, nq);
+        const auto v = kn(x, col<K::n_aux>(a[bx], c, na), p, 0.0, 0.0, Col<3>{});
         bool bad = false;
         for (int m = 0; m < K::n_out; ++m) bad = bad || v(m, 0) < 0.0;
-        for (int m = 0; m < nq; ++m) bad = bad || !std::isfinite(q[bx](i, j, 0, m));
-        o[bx](i, j, 0, 0) = bad ? 1.0 : 0.0;
+        for (int m = 0; m < nq; ++m) bad = bad || !std::isfinite(q[bx](c, m));
+        o[bx](c, 0) = bad ? 1.0 : 0.0;
     });
     return out;
 }
@@ -1308,7 +1377,7 @@ inline double norm2(const Field& a)
     return std::sqrt(amrex::MultiFab::Dot(a[0], 0, a[0], 0, a.nq, 0));
 }
 
-// x + h e_k (h = sqrt(eps) max(1, |x_k|)) and h
+// x + h e_kk (h = sqrt(eps) max(1, |x_kk|)) and h
 inline std::pair<Field, Field> perturb(const Field& x, int kk)
 {
     BL_PROFILE("zs::perturb");
@@ -1317,14 +1386,15 @@ inline std::pair<Field, Field> perturb(const Field& x, int kk)
     auto o = xk[0].arrays(); auto oh = h[0].arrays();
     auto a = x[0].const_arrays();
     const int nq = x.nq;
-    amrex::ParallelFor(xk[0], IntVect(xk.ng()),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::ParallelFor(xk[0], IV(xk.ng()),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
-        for (int n = 0; n < nq; ++n) o[bx](i, j, 0, n) = a[bx](i, j, 0, n);
-        const Real v = a[bx](i, j, 0, kk);
+        ZS_CELL;
+        for (int n = 0; n < nq; ++n) o[bx](c, n) = a[bx](c, n);
+        const Real v = a[bx](c, kk);
         const Real s = 1.4901161193847656e-08*(std::abs(v) > 1.0 ? std::abs(v) : 1.0);
-        oh[bx](i, j, 0, 0) = s;
-        o[bx](i, j, 0, kk) = v + s;
+        oh[bx](c, 0) = s;
+        o[bx](c, kk) = v + s;
     });
     return {xk, h};
 }
@@ -1338,45 +1408,46 @@ inline Field newton_update(const Field& x, const Field& r, const std::vector<Fie
     AMREX_ALWAYS_ASSERT(n <= MAXR);
     amrex::MultiFab J(x[0].boxArray(), x[0].DistributionMap(), n*n, 0), H(
         x[0].boxArray(), x[0].DistributionMap(), n, 0);
-    for (int k = 0; k < n; ++k)
+    for (int q = 0; q < n; ++q)
     {
-        for (int i = 0; i < n; ++i) amrex::MultiFab::Copy(J, cols[k][0], i, i*n + k, 1, 0);
-        amrex::MultiFab::Copy(H, hs[k][0], 0, k, 1, 0);
+        for (int p = 0; p < n; ++p) amrex::MultiFab::Copy(J, cols[q][0], p, p*n + q, 1, 0);
+        amrex::MultiFab::Copy(H, hs[q][0], 0, q, 1, 0);
     }
     Field out = like(x, n);
     amrex::MultiFab::Copy(out[0], x[0], 0, 0, n, 0);
     auto o = out[0].arrays();
     auto jj = J.const_arrays(); auto hh = H.const_arrays();
     auto rr = r[0].const_arrays();
-    amrex::ParallelFor(out[0], IntVect(0),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::ParallelFor(out[0], IV(0),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
+        ZS_CELL;
         Real A[MAXR*MAXR], b[MAXR];
         for (int p = 0; p < n; ++p)
         {
-            b[p] = -rr[bx](i, j, 0, p);
-            for (int k = 0; k < n; ++k)
-                A[p*n + k] = (jj[bx](i, j, 0, p*n + k) - rr[bx](i, j, 0, p))/hh[bx](i, j, 0, k);
+            b[p] = -rr[bx](c, p);
+            for (int q = 0; q < n; ++q)
+                A[p*n + q] = (jj[bx](c, p*n + q) - rr[bx](c, p))/hh[bx](c, q);
         }
-        for (int c = 0; c < n; ++c)                 // partial pivoting
+        for (int cc = 0; cc < n; ++cc)              // partial pivoting
         {
-            int piv = c;
-            for (int p = c + 1; p < n; ++p)
-                if (std::abs(A[p*n + c]) > std::abs(A[piv*n + c])) piv = p;
-            for (int k = 0; k < n; ++k) { Real t = A[c*n + k]; A[c*n + k] = A[piv*n + k]; A[piv*n + k] = t; }
-            { Real t = b[c]; b[c] = b[piv]; b[piv] = t; }
-            for (int p = c + 1; p < n; ++p)
+            int piv = cc;
+            for (int p = cc + 1; p < n; ++p)
+                if (std::abs(A[p*n + cc]) > std::abs(A[piv*n + cc])) piv = p;
+            for (int q = 0; q < n; ++q) { Real t = A[cc*n + q]; A[cc*n + q] = A[piv*n + q]; A[piv*n + q] = t; }
+            { Real t = b[cc]; b[cc] = b[piv]; b[piv] = t; }
+            for (int p = cc + 1; p < n; ++p)
             {
-                const Real m = A[p*n + c]/A[c*n + c];
-                for (int k = c; k < n; ++k) A[p*n + k] -= m*A[c*n + k];
-                b[p] -= m*b[c];
+                const Real m = A[p*n + cc]/A[cc*n + cc];
+                for (int q = cc; q < n; ++q) A[p*n + q] -= m*A[cc*n + q];
+                b[p] -= m*b[cc];
             }
         }
         for (int p = n - 1; p >= 0; --p)
         {
-            for (int k = p + 1; k < n; ++k) b[p] -= A[p*n + k]*b[k];
+            for (int q = p + 1; q < n; ++q) b[p] -= A[p*n + q]*b[q];
             b[p] /= A[p*n + p];
-            o[bx](i, j, 0, p) += b[p];
+            o[bx](c, p) += b[p];
         }
     });
     return out;
@@ -1393,11 +1464,11 @@ Field root(F f, Field x)
     for (; it < o.maxiter && norm2(r) > o.tol; ++it)
     {
         std::vector<Field> cols(x.nq), hs(x.nq);
-        for (int k = 0; k < x.nq; ++k)
+        for (int q = 0; q < x.nq; ++q)
         {
-            auto ph = perturb(x, k);
-            cols[k] = f(ph.first);
-            hs[k] = ph.second;
+            auto ph = perturb(x, q);
+            cols[q] = f(ph.first);
+            hs[q] = ph.second;
         }
         x = newton_update(x, r, cols, hs);
         r = f(x);
@@ -1451,63 +1522,76 @@ struct LinOp
     void blocks();
 };
 
+// the colour of cell c: (c - lo) mod S per axis, combined
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+int colour(const Geo& g, const IV& c, int S)
+{
+    int cl = 0;
+    for (int d = D - 1; d >= 0; --d) cl = cl*S + (c[d] - g.lo[d]) % S;
+    return cl;
+}
+
 inline void LinOp::blocks()
 {
     BL_PROFILE("zs::LinOp::blocks");
     const int n = nq, S = M->R + 1;
+    int ncol = 1;
+    for (int d = 0; d < D; ++d) ncol *= S;
     AMREX_ALWAYS_ASSERT(n <= MAXR);
     amrex::MultiFab A(M->ba, M->dm, n*n, 0);
     Binv.define(M->ba, M->dm, n*n, 0);
     const Geo g = M->g;
-    for (int cx = 0; cx < S; ++cx)
-        for (int cy = 0; cy < S; ++cy)
-            for (int m = 0; m < n; ++m)
+    for (int cl = 0; cl < ncol; ++cl)
+        for (int m = 0; m < n; ++m)
+        {
+            amrex::MultiFab e(M->ba, M->dm, n, M->NG);
+            e.setVal(0.0);
+            auto ea = e.arrays();
+            amrex::ParallelFor(e, IV(0),
+                [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
             {
-                amrex::MultiFab e(M->ba, M->dm, n, M->NG);
-                e.setVal(0.0);
-                auto ea = e.arrays();
-                amrex::ParallelFor(e, IntVect(0),
-                    [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
-                {
-                    if ((i - g.ilo) % S == cx && (j - g.jlo) % S == cy) ea[bx](i, j, 0, m) = 1.0;
-                });
-                const Field y = op(wrap(e));
-                auto ya = y[0].const_arrays();
-                auto aa = A.arrays();
-                amrex::ParallelFor(A, IntVect(0),
-                    [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
-                {
-                    if ((i - g.ilo) % S != cx || (j - g.jlo) % S != cy) return;
-                    for (int p = 0; p < n; ++p) aa[bx](i, j, 0, p*n + m) = ya[bx](i, j, 0, p);
-                });
-            }
+                ZS_CELL;
+                if (colour(g, c, S) == cl) ea[bx](c, m) = 1.0;
+            });
+            const Field y = op(wrap(e));
+            auto ya = y[0].const_arrays();
+            auto aa = A.arrays();
+            amrex::ParallelFor(A, IV(0),
+                [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+            {
+                ZS_CELL;
+                if (colour(g, c, S) != cl) return;
+                for (int p = 0; p < n; ++p) aa[bx](c, p*n + m) = ya[bx](c, p);
+            });
+        }
     auto aa = A.const_arrays();
     auto bi = Binv.arrays();
-    amrex::ParallelFor(Binv, IntVect(0),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::ParallelFor(Binv, IV(0),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
+        ZS_CELL;
         Real a[MAXR*MAXR], v[MAXR*MAXR];
-        for (int e = 0; e < n*n; ++e) { a[e] = aa[bx](i, j, 0, e); v[e] = 0.0; }
+        for (int e = 0; e < n*n; ++e) { a[e] = aa[bx](c, e); v[e] = 0.0; }
         for (int d = 0; d < n; ++d) v[d*n + d] = 1.0;
-        for (int c = 0; c < n; ++c)                 // Gauss-Jordan, partial pivoting
+        for (int cc = 0; cc < n; ++cc)              // Gauss-Jordan, partial pivoting
         {
-            int piv = c;
-            for (int p = c + 1; p < n; ++p) if (std::abs(a[p*n + c]) > std::abs(a[piv*n + c])) piv = p;
-            for (int k = 0; k < n; ++k)
+            int piv = cc;
+            for (int p = cc + 1; p < n; ++p) if (std::abs(a[p*n + cc]) > std::abs(a[piv*n + cc])) piv = p;
+            for (int q = 0; q < n; ++q)
             {
-                Real t = a[c*n + k]; a[c*n + k] = a[piv*n + k]; a[piv*n + k] = t;
-                t = v[c*n + k]; v[c*n + k] = v[piv*n + k]; v[piv*n + k] = t;
+                Real t = a[cc*n + q]; a[cc*n + q] = a[piv*n + q]; a[piv*n + q] = t;
+                t = v[cc*n + q]; v[cc*n + q] = v[piv*n + q]; v[piv*n + q] = t;
             }
-            const Real ip = a[c*n + c] != 0.0 ? 1.0/a[c*n + c] : 0.0;
-            for (int k = 0; k < n; ++k) { a[c*n + k] *= ip; v[c*n + k] *= ip; }
+            const Real ip = a[cc*n + cc] != 0.0 ? 1.0/a[cc*n + cc] : 0.0;
+            for (int q = 0; q < n; ++q) { a[cc*n + q] *= ip; v[cc*n + q] *= ip; }
             for (int p = 0; p < n; ++p)
             {
-                if (p == c) continue;
-                const Real f = a[p*n + c];
-                for (int k = 0; k < n; ++k) { a[p*n + k] -= f*a[c*n + k]; v[p*n + k] -= f*v[c*n + k]; }
+                if (p == cc) continue;
+                const Real f = a[p*n + cc];
+                for (int q = 0; q < n; ++q) { a[p*n + q] -= f*a[cc*n + q]; v[p*n + q] -= f*v[cc*n + q]; }
             }
         }
-        for (int e = 0; e < n*n; ++e) bi[bx](i, j, 0, e) = v[e];
+        for (int e = 0; e < n*n; ++e) bi[bx](c, e) = v[e];
     });
 }
 
@@ -1518,16 +1602,17 @@ inline void LinOp::precond(amrex::MultiFab& l, const amrex::MultiFab& r)
     auto la = l.arrays();
     auto ra = r.const_arrays();
     auto bi = Binv.const_arrays();
-    amrex::ParallelFor(l, IntVect(0),
-        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+    amrex::ParallelFor(l, IV(0),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
+        ZS_CELL;
         Real x[MAXR];
         for (int p = 0; p < n; ++p)
         {
             x[p] = 0.0;
-            for (int k = 0; k < n; ++k) x[p] += bi[bx](i, j, 0, p*n + k)*ra[bx](i, j, 0, k);
+            for (int q = 0; q < n; ++q) x[p] += bi[bx](c, p*n + q)*ra[bx](c, q);
         }
-        for (int p = 0; p < n; ++p) la[bx](i, j, 0, p) = x[p];
+        for (int p = 0; p < n; ++p) la[bx](c, p) = x[p];
     });
 }
 
