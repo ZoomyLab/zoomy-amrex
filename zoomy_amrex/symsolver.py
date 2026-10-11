@@ -70,6 +70,8 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
     gpu = param.Boolean(default=False, doc="CUDA build (one GPU per rank).")
     max_grid_size = param.Integer(default=None, allow_None=True,
                                   doc="AMReX box size; None: about 2 boxes per rank.")
+    build_only = param.Boolean(default=False,
+                               doc="run() only builds (and caches) the binary.")
 
     # ── printing ───────────────────────────────────────────────────────────
     def _systems(self, nsm):
@@ -149,7 +151,9 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
                else NumericalSystemModel.from_system_model(model))
         grid = cartesian(mesh)
         binary = self.build(nsm, 2)
-        case = Path(workdir)
+        if self.build_only:
+            return binary
+        case = Path(workdir).resolve()
         if case.exists():
             shutil.rmtree(case)
         case.mkdir(parents=True)

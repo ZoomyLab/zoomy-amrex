@@ -310,12 +310,16 @@ int schur(double* H, double* V, double* d, double* e) noexcept
                 y = H[(nl - 1) * N + (nl - 1)];
                 w = H[nl * N + (nl - 1)] * H[(nl - 1) * N + nl];
             }
-            // Exceptional shift EVERY 10 iterations (LAPACK dlahqr's KEXSH),
-            // not only at 10 and 20 as EISPACK/JAMA do.  Measured: with the
-            // EISPACK rule a 6x6 wet/dry Jacobian with a 3-fold near-degenerate
-            // cluster stagnates from iteration 21 on -- the QR step becomes an
-            // exact no-op and nothing ever deflates again.
-            if (iter > 0 && iter % 10 == 0) {  // exceptional shift
+            // Wilkinson's exceptional shift at iteration 10, MATLAB's at 30
+            // (JAMA hqr2).  The MATLAB shift used to run on EVERY iteration
+            // (its `iter == 30` guard was lost in the port), which replaced
+            // the Francis shifts by an ad hoc one and stalled clustered real
+            // spectra into NOCONV (+inf: dt = 0): 214 / 3000 of random 4x4
+            // with a near-degenerate cluster, the wet/dry SWE face Jacobian
+            // {0, c, c, c}, a VAM(1) 10x10 face Jacobian.  With the guard: 0
+            // failures, max |lambda| within 5e-3 of numpy on Jordan-type
+            // matrices (eps^(1/n) sensitivity), the cluster as numpy's.
+            if (iter == 10) {                  // Wilkinson's exceptional shift
                 exshift += x;
                 for (int i = low; i <= nl; ++i) H[i * N + i] -= x;
                 s = dabs(H[nl * N + (nl - 1)]) + dabs(H[(nl - 1) * N + (nl - 2)]);
@@ -333,15 +337,17 @@ int schur(double* H, double* V, double* d, double* e) noexcept
             // budget, not a whole-matrix one.
             if (iter > 60 * N + 120) return NOCONV;
 
-            s = (y - x) / 2.0;
-            s = s * s + w;
-            if (s > 0.0) {
-                s = dsqrt(s);
-                if (y < x) s = -s;
-                s = x - w / ((y - x) / 2.0 + s);
-                for (int i = low; i <= nl; ++i) H[i * N + i] -= s;
-                exshift += s;
-                x = y = w = 0.964;
+            if (iter == 31) {                  // MATLAB's ad hoc shift (iter 30)
+                s = (y - x) / 2.0;
+                s = s * s + w;
+                if (s > 0.0) {
+                    s = dsqrt(s);
+                    if (y < x) s = -s;
+                    s = x - w / ((y - x) / 2.0 + s);
+                    for (int i = low; i <= nl; ++i) H[i * N + i] -= s;
+                    exshift += s;
+                    x = y = w = 0.964;
+                }
             }
 
             int m = nl - 2;

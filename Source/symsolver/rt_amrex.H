@@ -541,6 +541,16 @@ Field cells(K k, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
     return out;
 }
 
+// a recon-family kernel takes (W, Qaux, p), a cell-family one gets time = dt
+// = 0 and no position
+template<class K, class X, class A, class P>
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+auto call_pointwise(const K& k, const X& x, const A& a, const P& p)
+{
+    if constexpr (K::family == 3) return k(x, a, p);
+    else return k(x, a, p, 0.0, 0.0, Col<3>{});
+}
+
 // a kernel in every column (cells or faces); no time, step or position
 template<class K, class P>
 Field pointwise(K k, const Field& X, const Field& A, const P& p)
@@ -556,12 +566,9 @@ Field pointwise(K k, const Field& X, const Field& A, const P& p)
         amrex::ParallelFor(out[d], IntVect(out.ng()),
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
         {
-            Col<K::n_out> v;
-            if constexpr (K::family == 3)
-                v = k(col<K::n_in>(x[bx], i, j, nq), col<K::n_aux>(a[bx], i, j, na), p);
-            else
-                v = k(col<K::n_in>(x[bx], i, j, nq), col<K::n_aux>(a[bx], i, j, na), p,
-                      0.0, 0.0, Col<3>{});
+            const auto xc = col<K::n_in>(x[bx], i, j, nq);
+            const auto ac = col<K::n_aux>(a[bx], i, j, na);
+            const auto v = call_pointwise(k, xc, ac, p);
             for (int r = 0; r < K::n_out; ++r) o[bx](i, j, 0, r) = v(r, 0);
         });
     }
@@ -577,9 +584,9 @@ std::array<Field, N> split(const Field& F)
 }
 
 // the face kernel on every face, owner -> other with the owner's normal
-template<int N = 1, class K, class P>
-auto faces(K k, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
-           const P& p, const Mesh& M)
+template<class K, class P>
+Field face_kernel(K k, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
+                  const P& p, const Mesh& M)
 {
     Field out = faces_of(M, K::n_out);
     const Geo g = M.g;
@@ -601,6 +608,13 @@ auto faces(K k, const Field& QL, const Field& QR, const Field& AL, const Field& 
             for (int m = 0; m < K::n_out; ++m) o[bx](i, j, 0, m) = v(m, 0);
         });
     }
+    return out;
+}
+template<int N = 1, class K, class P>
+auto faces(K k, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
+           const P& p, const Mesh& M)
+{
+    const Field out = face_kernel(k, QL, QR, AL, AR, p, M);
     if constexpr (N == 1) return out;
     else return split<N>(out);
 }
