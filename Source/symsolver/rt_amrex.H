@@ -206,6 +206,15 @@ Col<N> col(const A& a, int i, int j, int nq)
 }
 
 // ── fields ──────────────────────────────────────────────────────────────────
+// entry (i, j, row n) of a field in a device loop (one row broadcasts)
+struct DLeaf
+{
+    amrex::MultiArray4<Real const> a;
+    int nq;
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
+    { return a[bx](i, j, 0, nq == 1 ? 0 : n); }
+};
+
 struct Field
 {
     int nq = 0;
@@ -216,6 +225,8 @@ struct Field
     amrex::MultiFab& operator[](int d) const { return (*mf)[d]; }
     int ncomp() const { return face ? AMREX_SPACEDIM : 1; }
     int ng() const { return face ? 0 : (*mf)[0].nGrow(); }
+    DLeaf dev(int d) const { return {(*mf)[d].const_arrays(), nq}; }
+    const Field& shape() const { return *this; }
 };
 
 // Storage is recycled: a dead Field's MultiFabs go to a pool and the next
@@ -311,66 +322,101 @@ struct Max
     { return (x != x || y != y) ? NaN : (x > y ? x : y); }
 };
 
-template<class F>
-Field zip(const Field& a, const Field& b, F f)
+// Field arithmetic is lazy: it builds an expression, evaluated by one
+// ParallelFor where a block takes it as a Field (eval) or where a reduction
+// reads it -- no kernel and no temporary per operator.
+struct DNum
 {
-    BL_PROFILE("zs::zip");
-    Field r = like(a, std::max(a.nq, b.nq));
-    r.ngv = std::min(a.ngv, b.ngv);
-    const int na = a.nq, nb = b.nq;
+    Real s;
+    AMREX_GPU_HOST_DEVICE Real operator()(int, int, int, int) const { return s; }
+};
+template<class Op, class A, class B> struct DBin
+{
+    Op op; A a; B b;
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
+    { return op(a(bx, i, j, n), b(bx, i, j, n)); }
+};
+struct Num
+{
+    Real s;
+    int nq = 0, ngv = 1 << 20;
+    DNum dev(int) const { return {s}; }
+};
+inline const Field* shape_of(const Field& f) { return &f; }
+// a field read entry by entry, rows as stored (no broadcast test)
+struct DRaw
+{
+    amrex::MultiArray4<Real const> a;
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
+    { return a[bx](i, j, 0, n); }
+};
+struct DLeafless
+{
+    Field f;
+    int nq = f.nq, ngv = f.ngv;
+    DRaw dev(int d) const { return {f[d].const_arrays()}; }
+};
+inline const Field* shape_of(const Num&) { return nullptr; }
+
+template<class X> Field eval(const X& x);
+template<class Op, class A, class B> struct XBin
+{
+    Op op; A a; B b;
+    int nq, ngv;
+    XBin(Op o, const A& a_, const B& b_)
+        : op(o), a(a_), b(b_), nq(std::max(a_.nq, b_.nq)), ngv(std::min(a_.ngv, b_.ngv)) {}
+    auto dev(int d) const
+    { return DBin<Op, decltype(a.dev(d)), decltype(b.dev(d))>{op, a.dev(d), b.dev(d)}; }
+    const Field& shape() const { const Field* f = shape_of(a); return f ? *f : *shape_of(b); }
+    operator Field() const { return eval(*this); }
+};
+template<class Op, class A, class B> const Field* shape_of(const XBin<Op, A, B>& x) { return &x.shape(); }
+
+template<class X> Field eval(const X& x)
+{
+    BL_PROFILE("zs::eval");
+    Field r = like(x.shape(), x.nq);
+    r.ngv = std::min(x.ngv, r.ng());
     for (int d = 0; d < r.ncomp(); ++d)
     {
+        const auto f = x.dev(d);
         auto ra = r[d].arrays();
-        auto aa = a[d].const_arrays();
-        auto ba = b[d].const_arrays();
         amrex::ParallelFor(r[d], IntVect(r.ng()), r.nq,
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
-        {
-            ra[bx](i, j, k, n) = f(aa[bx](i, j, k, na == 1 ? 0 : n),
-                                   ba[bx](i, j, k, nb == 1 ? 0 : n));
-        });
+        { ra[bx](i, j, k, n) = f(bx, i, j, n); });
     }
     return r;
 }
 
-// f(x, s) (or f(s, x) with ``left``) for a number s
-template<class F>
-Field zip(const Field& a, Real s, F f, bool left)
-{
-    BL_PROFILE("zs::zip");
-    Field r = like(a, a.nq);
-    r.ngv = a.ngv;
-    for (int d = 0; d < r.ncomp(); ++d)
-    {
-        auto ra = r[d].arrays();
-        auto aa = a[d].const_arrays();
-        amrex::ParallelFor(r[d], IntVect(r.ng()), r.nq,
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
-        {
-            const Real x = aa[bx](i, j, k, n);
-            ra[bx](i, j, k, n) = left ? f(s, x) : f(x, s);
-        });
-    }
-    return r;
-}
-
+template<class T> struct is_x : std::false_type {};
+template<> struct is_x<Field> : std::true_type {};
+template<class Op, class A, class B> struct is_x<XBin<Op, A, B>> : std::true_type {};
 template<class T> using if_num = std::enable_if_t<std::is_arithmetic_v<T>, int>;
-inline Field operator+(const Field& a, const Field& b) { return zip(a, b, Add{}); }
-inline Field operator-(const Field& a, const Field& b) { return zip(a, b, Sub{}); }
-inline Field operator*(const Field& a, const Field& b) { return zip(a, b, Mul{}); }
-inline Field operator/(const Field& a, const Field& b) { return zip(a, b, Div{}); }
-template<class T, if_num<T> = 0> Field operator+(const Field& a, T s) { return zip(a, Real(s), Add{}, false); }
-template<class T, if_num<T> = 0> Field operator+(T s, const Field& a) { return zip(a, Real(s), Add{}, true); }
-template<class T, if_num<T> = 0> Field operator-(const Field& a, T s) { return zip(a, Real(s), Sub{}, false); }
-template<class T, if_num<T> = 0> Field operator-(T s, const Field& a) { return zip(a, Real(s), Sub{}, true); }
-template<class T, if_num<T> = 0> Field operator*(const Field& a, T s) { return zip(a, Real(s), Mul{}, false); }
-template<class T, if_num<T> = 0> Field operator*(T s, const Field& a) { return zip(a, Real(s), Mul{}, true); }
-template<class T, if_num<T> = 0> Field operator/(const Field& a, T s) { return zip(a, Real(s), Div{}, false); }
-template<class T, if_num<T> = 0> Field operator/(T s, const Field& a) { return zip(a, Real(s), Div{}, true); }
-inline Field operator-(const Field& a) { return zip(a, -1.0, Mul{}, false); }
-template<class T, if_num<T> = 0> Field pow(const Field& a, T e) { return zip(a, Real(e), Pow{}, false); }
+template<class A, class B> using if_x = std::enable_if_t<
+    (is_x<A>::value || is_x<B>::value) && (is_x<A>::value || std::is_arithmetic_v<A>)
+    && (is_x<B>::value || std::is_arithmetic_v<B>), int>;
+template<class T> auto wrap(const T& t)
+{
+    if constexpr (std::is_arithmetic_v<T>) return Num{Real(t)};
+    else return t;
+}
+template<class Op, class A, class B> auto xbin(Op op, const A& a, const B& b)
+{ return XBin<Op, decltype(wrap(a)), decltype(wrap(b))>(op, wrap(a), wrap(b)); }
+// a block argument: a Field (an expression evaluated) or a number
+template<class T> auto as_arg(const T& t)
+{
+    if constexpr (std::is_arithmetic_v<T>) return t;
+    else return Field(t);
+}
+
+template<class A, class B, if_x<A, B> = 0> auto operator+(const A& a, const B& b) { return xbin(Add{}, a, b); }
+template<class A, class B, if_x<A, B> = 0> auto operator-(const A& a, const B& b) { return xbin(Sub{}, a, b); }
+template<class A, class B, if_x<A, B> = 0> auto operator*(const A& a, const B& b) { return xbin(Mul{}, a, b); }
+template<class A, class B, if_x<A, B> = 0> auto operator/(const A& a, const B& b) { return xbin(Div{}, a, b); }
+template<class A, std::enable_if_t<is_x<A>::value, int> = 0> auto operator-(const A& a) { return xbin(Mul{}, a, -1.0); }
+template<class A, class T, if_x<A, T> = 0> auto pow(const A& a, T e) { return xbin(Pow{}, a, e); }
 struct Abs { AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real) const { return std::abs(x); } };
-inline Field abs(const Field& a) { return zip(a, 0.0, Abs{}, false); }
+template<class A, std::enable_if_t<is_x<A>::value, int> = 0> auto abs(const A& a) { return xbin(Abs{}, a, 0.0); }
 using std::abs;
 using std::floor;
 using std::fmod;
@@ -379,9 +425,7 @@ using std::pow;
 // NaN propagates (std::min / std::max would swallow it)
 inline double minimum(double a, double b) { return (a != a || b != b) ? NaN : std::min(a, b); }
 inline double maximum(double a, double b) { return (a != a || b != b) ? NaN : std::max(a, b); }
-inline Field minimum(const Field& a, const Field& b) { return zip(a, b, Min{}); }
-template<class T, if_num<T> = 0> Field minimum(const Field& a, T s) { return zip(a, Real(s), Min{}, false); }
-template<class T, if_num<T> = 0> Field minimum(T s, const Field& a) { return zip(a, Real(s), Min{}, true); }
+template<class A, class B, if_x<A, B> = 0> auto minimum(const A& a, const B& b) { return xbin(Min{}, a, b); }
 
 // ── halo ────────────────────────────────────────────────────────────────────
 // the copies of the neighbouring boxes' cells (any rank); a number passes
@@ -398,43 +442,47 @@ template<class T, if_num<T> = 0> T halo(T x, const Mesh&) { return x; }
 inline Field need(const Field& X, int n, const Mesh& M) { return X.ngv >= n ? X : halo(X, M); }
 
 // ── reductions (valid region, all ranks; NaN propagates) ────────────────────
-inline double reduce_ext(const Field& F, bool want_min)
+template<bool MIN, class X>
+double reduce_ext(const X& x)
 {
     BL_PROFILE("zs::reduce_ext");
-    double best = want_min ? std::numeric_limits<double>::infinity()
-                           : -std::numeric_limits<double>::infinity();
+    using Op = std::conditional_t<MIN, amrex::ReduceOpMin, amrex::ReduceOpMax>;
+    constexpr Real init = MIN ? std::numeric_limits<Real>::infinity()
+                              : -std::numeric_limits<Real>::infinity();
+    double best = init;
     bool nan = false;
-    const int nq = F.nq;
+    const int nq = x.nq;
+    const Field& F = x.shape();
     for (int d = 0; d < F.ncomp(); ++d)
     {
-        auto a = F[d].const_arrays();
-        auto r = amrex::ParReduce(
-            amrex::TypeList<amrex::ReduceOpMin, amrex::ReduceOpMax, amrex::ReduceOpLogicalOr>{},
-            amrex::TypeList<Real, Real, int>{}, F[d], IntVect(0),
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
-                -> amrex::GpuTuple<Real, Real, int>
+        const auto a = x.dev(d);
+        auto r = amrex::ParReduce(amrex::TypeList<Op, amrex::ReduceOpLogicalOr>{},
+                                  amrex::TypeList<Real, int>{}, F[d], IntVect(0),
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+                -> amrex::GpuTuple<Real, int>
         {
-            Real lo = std::numeric_limits<Real>::infinity(), hi = -lo;
+            Real e = init;
             int bad = 0;
             for (int n = 0; n < nq; ++n)
             {
-                const Real x = a[bx](i, j, k, n);
-                if (x != x) bad = 1;
-                else { lo = x < lo ? x : lo; hi = x > hi ? x : hi; }
+                const Real v = a(bx, i, j, n);
+                if (v != v) bad = 1;
+                else e = (MIN ? v < e : v > e) ? v : e;
             }
-            return {lo, hi, bad};
+            return {e, bad};
         });
-        best = want_min ? std::min(best, double(amrex::get<0>(r)))
-                        : std::max(best, double(amrex::get<1>(r)));
-        nan = nan || amrex::get<2>(r);
+        best = MIN ? std::min(best, double(amrex::get<0>(r))) : std::max(best, double(amrex::get<0>(r)));
+        nan = nan || amrex::get<1>(r);
     }
-    if (want_min) amrex::ParallelDescriptor::ReduceRealMin(best);
+    if (MIN) amrex::ParallelDescriptor::ReduceRealMin(best);
     else amrex::ParallelDescriptor::ReduceRealMax(best);
     amrex::ParallelDescriptor::ReduceBoolOr(nan);
     return nan ? NaN : best;
 }
-inline double reduce_min(const Field& F) { return reduce_ext(F, true); }
-inline double reduce_max(const Field& F) { return reduce_ext(F, false); }
+template<class X, std::enable_if_t<is_x<X>::value, int> = 0>
+double reduce_min(const X& x) { return reduce_ext<true>(x); }
+template<class X, std::enable_if_t<is_x<X>::value, int> = 0>
+double reduce_max(const X& x) { return reduce_ext<false>(x); }
 inline bool reduce_any(const Field& F)
 {
     BL_PROFILE("zs::reduce_any");
@@ -468,37 +516,81 @@ template<class... I> Rows rows_of(const std::tuple<I...>& t)
     return R;
 }
 
-template<class... I, class V>
-Field put(const Field& Q, const std::tuple<I...>& rows, const V& values)
+// put / take are lazy too: take is a row view, put writes its rows from the
+// value expression in the same loop that copies the others
+struct DRows
 {
-    BL_PROFILE("zs::put");
-    const Rows R = rows_of(rows);
-    Field out = like(Q, Q.nq);
-    out.ngv = Q.ngv;
-    if constexpr (!std::is_arithmetic_v<V>) out.ngv = std::min(Q.ngv, values.ngv);
-    for (int d = 0; d < Q.ncomp(); ++d)
-    {
-        amrex::MultiFab::Copy(out[d], Q[d], 0, 0, Q.nq, out.ng());
-        for (int k = 0; k < R.n; ++k)
-        {
-            if constexpr (std::is_arithmetic_v<V>) out[d].setVal(Real(values), R.r[k], 1, out.ng());
-            else amrex::MultiFab::Copy(out[d], values[d], values.nq == 1 ? 0 : k, R.r[k], 1, out.ng());
-        }
-    }
-    return out;
-}
+    DLeaf a;
+    Rows R;
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
+    { return a.a[bx](i, j, 0, R.r[n]); }
+};
+struct XRows
+{
+    Field src;
+    Rows R;
+    int nq, ngv;
+    DRows dev(int d) const { return {src.dev(d), R}; }
+    const Field& shape() const { return src; }
+    operator Field() const { return eval(*this); }
+};
+template<> struct is_x<XRows> : std::true_type {};
+inline const Field* shape_of(const XRows& x) { return &x.src; }
 
 template<class... I>
-Field take(const Field& Q, const std::tuple<I...>& rows)
+XRows take(const Field& Q, const std::tuple<I...>& rows)
 {
-    BL_PROFILE("zs::take");
     const Rows R = rows_of(rows);
-    Field out = like(Q, R.n);
-    out.ngv = Q.ngv;
+    return XRows{Q, R, R.n, Q.ngv};
+}
+
+template<class V> struct DPut
+{
+    DLeaf q; V v; Rows R;
+    AMREX_GPU_HOST_DEVICE Real operator()(int bx, int i, int j, int n) const
+    {
+        for (int m = 0; m < R.n; ++m) if (R.r[m] == n) return v(bx, i, j, m);
+        return q.a[bx](i, j, 0, n);
+    }
+};
+template<class V> struct XPut
+{
+    Field Q; V v; Rows R;
+    int nq, ngv;
+    auto dev(int d) const { return DPut<decltype(v.dev(d))>{Q.dev(d), v.dev(d), R}; }
+    const Field& shape() const { return Q; }
+    operator Field() const { return eval(*this); }
+};
+template<class V> struct is_x<XPut<V>> : std::true_type {};
+template<class V> const Field* shape_of(const XPut<V>& x) { return &x.Q; }
+
+template<class V, class... I>
+auto put(const Field& Q, const std::tuple<I...>& rows, const V& values)
+{
+    const auto v = wrap(values);
+    const XPut<decltype(v)> x{Q, v, rows_of(rows), Q.nq, std::min(Q.ngv, v.ngv)};
+#ifdef AMREX_USE_GPU
+    return x;            // GPU: read by the consumer (memory-bound: no pass)
+#else
+    BL_PROFILE("zs::put");   // CPU: one pass; a re-read expression costs more there
+    Field out = like(Q, Q.nq);
+    out.ngv = x.ngv;
+    const Rows R = x.R;
     for (int d = 0; d < Q.ncomp(); ++d)
-        for (int k = 0; k < R.n; ++k)
-            amrex::MultiFab::Copy(out[d], Q[d], R.r[k], k, 1, out.ng());
+    {
+        const auto q = Q.dev(d);
+        const auto f = v.dev(d);
+        auto o = out[d].arrays();
+        amrex::ParallelFor(out[d], IntVect(out.ng()), out.nq,
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
+        {
+            int k = -1;
+            for (int m = 0; m < R.n; ++m) if (R.r[m] == n) k = m;
+            o[bx](i, j, 0, n) = k < 0 ? q.a[bx](i, j, 0, n) : f(bx, i, j, k);
+        });
+    }
     return out;
+#endif
 }
 
 inline Field zeros(int n, const Mesh& M)
@@ -510,24 +602,25 @@ inline Field zeros(int n, const Mesh& M)
 }
 
 // entries of ``rows`` in [-tol, 0) -> 0: round-off below zero
-template<class... I>
-Field clean_round_off(const Field& Q, const std::tuple<I...>& rows, double tol)
+template<class X, class... I>
+Field clean_round_off(const X& x, const std::tuple<I...>& rows, double tol)
 {
     BL_PROFILE("zs::clean_round_off");
     const Rows R = rows_of(rows);
-    Field out = like(Q, Q.nq);
-    out.ngv = Q.ngv;
+    const Field& Q = x.shape();
+    Field out = like(Q, x.nq);
+    out.ngv = std::min(x.ngv, out.ng());
     for (int d = 0; d < Q.ncomp(); ++d)
     {
         auto o = out[d].arrays();
-        auto q = Q[d].const_arrays();
-        amrex::ParallelFor(out[d], IntVect(out.ng()), Q.nq,
+        const auto f = x.dev(d);
+        amrex::ParallelFor(out[d], IntVect(out.ng()), out.nq,
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
         {
-            Real x = q[bx](i, j, k, n);
+            Real v = f(bx, i, j, n);
             for (int m = 0; m < R.n; ++m)
-                if (R.r[m] == n && x < 0.0 && x >= -tol) x = 0.0;
-            o[bx](i, j, k, n) = x;
+                if (R.r[m] == n && v < 0.0 && v >= -tol) v = 0.0;
+            o[bx](i, j, k, n) = v;
         });
     }
     return out;
@@ -551,9 +644,11 @@ inline int ngv_of(const Field& F) { return F.ngv; }
 template<class T, if_num<T> = 0> int ngv_of(T) { return 1 << 20; }
 
 template<class A, class B>
-Field select(const Field& m, const A& a, const B& b)
+Field select(const Field& m, const A& a_, const B& b_)
 {
     BL_PROFILE("zs::select");
+    const auto a = as_arg(a_);
+    const auto b = as_arg(b_);
     Field out = like(m, std::max({m.nq, rows_n(a), rows_n(b)}));
     out.ngv = std::min({m.ngv, ngv_of(a), ngv_of(b)});
     for (int d = 0; d < m.ncomp(); ++d)
@@ -604,24 +699,50 @@ auto call_pointwise(const K& k, const X& x, const A& a, const P& p)
     else return k(x, a, p, 0.0, 0.0, Col<3>{});
 }
 
-// a kernel in every column (cells or faces); no time, step or position
-template<class K, class P>
-Field pointwise(K k, const Field& X, const Field& A, const P& p)
+// a column of an expression at (i, j)
+template<int N, class F>
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+Col<N> colx(const F& f, int bx, int i, int j, int nq)
+{
+    Col<N> v{};
+    for (int q = 0; q < N && q < nq; ++q) v(q, 0) = f(bx, i, j, q);
+    return v;
+}
+
+// a kernel in every column (cells or faces); no time, step or position.
+// X and A may be expressions (read in the same loop)
+template<class K, class X, class A, class P>
+Field pointwise(K k, const X& X_, const A& A_, const P& p)
 {
     BL_PROFILE("zs::pointwise");
-    Field out = like(X, K::n_out);
-    out.ngv = std::min(X.ngv, A.ngv);
-    const int nq = X.nq, na = A.nq;
-    for (int d = 0; d < X.ncomp(); ++d)
+    const auto x = wrap(X_);
+    const auto a = wrap(A_);
+    Field out = like(x.shape(), K::n_out);
+    out.ngv = std::min(x.ngv, a.ngv);
+    const int nq = x.nq, na = a.nq;
+    for (int d = 0; d < out.ncomp(); ++d)
     {
         auto o = out[d].arrays();
-        auto x = X[d].const_arrays();
-        auto a = A[d].const_arrays();
+        if constexpr (std::is_same_v<X, Field> && std::is_same_v<A, Field>)
+        {   // fields: plain array reads (the CPU compiler vectorises them)
+            auto xa = x[d].const_arrays();
+            auto aa = a[d].const_arrays();
+            amrex::ParallelFor(out[d], IntVect(out.ng()),
+                [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
+            {
+                const auto v = call_pointwise(k, col<K::n_in>(xa[bx], i, j, nq),
+                                              col<K::n_aux>(aa[bx], i, j, na), p);
+                for (int r = 0; r < K::n_out; ++r) o[bx](i, j, 0, r) = v(r, 0);
+            });
+            continue;
+        }
+        const auto xf = x.dev(d);
+        const auto af = a.dev(d);
         amrex::ParallelFor(out[d], IntVect(out.ng()),
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int) noexcept
         {
-            const auto xc = col<K::n_in>(x[bx], i, j, nq);
-            const auto ac = col<K::n_aux>(a[bx], i, j, na);
+            const auto xc = colx<K::n_in>(xf, bx, i, j, nq);
+            const auto ac = colx<K::n_aux>(af, bx, i, j, na);
             const auto v = call_pointwise(k, xc, ac, p);
             for (int r = 0; r < K::n_out; ++r) o[bx](i, j, 0, r) = v(r, 0);
         });
@@ -739,12 +860,9 @@ Field face_wavespeed(K k, const Field& Q_, const Field& A_, const P& p, const Me
 }
 
 // per-face cell size: d |V| / |dV| of the (uniform) cells
-inline Field face_inradius(const Mesh& M)
+inline Real face_inradius(const Mesh& M)
 {
-    Field out = faces_of(M, 1);
-    const Real r = 2.0*M.g.dx*M.g.dy/(2.0*M.g.dx + 2.0*M.g.dy);
-    for (int d = 0; d < AMREX_SPACEDIM; ++d) out[d].setVal(r);
-    return out;
+    return 2.0*M.g.dx*M.g.dy/(2.0*M.g.dx + 2.0*M.g.dy);   // uniform cells: one number
 }
 
 // ── boundary ────────────────────────────────────────────────────────────────
@@ -854,27 +972,37 @@ Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
 
 // ── reconstruction and assembly ─────────────────────────────────────────────
 // owner and other cell value per face; the boundary value on a boundary face
-inline std::tuple<Field, Field> cell_traces(const Field& Q_, const Field& Qb, const Mesh& M)
+template<class X, class Y>
+std::tuple<Field, Field> cell_traces_of(const X& Q, const Y& Qb, const Mesh& M)
 {
     BL_PROFILE("zs::cell_traces");
-    const Field Q = need(Q_, 1, M);
     Field L = faces_of(M, Q.nq), R = faces_of(M, Q.nq);
     const Geo g = M.g;
-    auto q = Q[0].const_arrays();
-    auto b = Qb[0].const_arrays();
     for (int d = 0; d < AMREX_SPACEDIM; ++d)
     {
+        const auto q = Q.dev(0);
+        const auto b = Qb.dev(0);
         auto l = L[d].arrays();
         auto r = R[d].arrays();
         amrex::ParallelFor(L[d], IntVect(0), Q.nq,
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int, int n) noexcept
         {
             const FaceInfo f = face_info(g, d, i, j);
-            l[bx](i, j, 0, n) = q[bx](f.oi, f.oj, 0, n);
-            r[bx](i, j, 0, n) = f.bnd ? b[bx](f.xi, f.xj, 0, n) : q[bx](f.xi, f.xj, 0, n);
+            l[bx](i, j, 0, n) = q(bx, f.oi, f.oj, n);
+            r[bx](i, j, 0, n) = f.bnd ? b(bx, f.xi, f.xj, n) : q(bx, f.xi, f.xj, n);
         });
     }
     return {L, R};
+}
+template<class X, class Y>
+std::tuple<Field, Field> cell_traces(const X& Q, const Y& Qb, const Mesh& M)
+{
+    if (Q.ngv >= 1) return cell_traces_of(Q, Qb, M);   // an expression: read lazily
+    return cell_traces_of(need(Field(Q), 1, M), Qb, M);
+}
+inline std::tuple<Field, Field> cell_traces(const Field& Q, const Field& Qb, const Mesh& M)
+{
+    return cell_traces_of(DLeafless{need(Q, 1, M)}, DLeafless{Qb}, M);
 }
 
 // LSQ fit of row ``n`` at cell (i, j), monomial ``m``: sum_s w_s,m delta_s.
@@ -1018,8 +1146,9 @@ std::tuple<Field, Field> extrapolate(const Field& W_, const Field& Wb, const Fie
     auto wb = Wb[0].const_arrays();
     auto gg = G[0].const_arrays();
     Src phi;
+    Field keep;                         // phi's storage lives through the launches
     if constexpr (std::is_arithmetic_v<P>) phi = src(phi_, 0);
-    else phi = src(need(phi_, 1, M), 0);
+    else { keep = need(Field(phi_), 1, M); phi = src(keep, 0); }
     for (int d = 0; d < AMREX_SPACEDIM; ++d)
     {
         auto l = L[d].arrays();
@@ -1449,15 +1578,28 @@ Field linsolve(F op, const Field& b)
 // its steps)
 inline long& loop_iterations() { static long n = 0; return n; }
 
-template<class C, class B, class S>
-S while_loop(C c, B b, S s)
+// a carried value: expressions are evaluated (the carry has one type)
+template<class T> auto carried(const T& v)
 {
+    if constexpr (is_x<T>::value) return Field(v);
+    else return v;
+}
+
+template<class C, class B, class S0>
+auto while_loop(C c, B b, S0 s0)
+{
+    auto s = std::apply([](const auto&... v) { return std::make_tuple(carried(v)...); }, s0);
     while (std::apply(c, s)) { s = std::apply(b, s); ++loop_iterations(); }
     return s;
 }
 
 template<class A, class B>
-auto cond(bool p, A a, B b) { return p ? a() : b(); }
+auto cond(bool p, A a, B b)
+{
+    using RA = decltype(a());
+    if constexpr (std::is_same_v<RA, decltype(b())>) return p ? a() : b();
+    else return p ? Field(a()) : Field(b());      // an expression and a Field
+}
 
 // ── effects ─────────────────────────────────────────────────────────────────
 inline std::function<void(double, const Field&, const Field&)>& writer()

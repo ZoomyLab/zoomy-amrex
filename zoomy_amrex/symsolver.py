@@ -166,7 +166,10 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         A0 = np.zeros((max(n_aux, 1), grid["nc"])) if Qaux0 is None else Qaux0
         to_grid(A0).tofile(case / "qaux0.bin")
         (case / "lsq.txt").write_text(lsq_table(mesh, nsm, self._degree(nsm), grid))
-        mgs = self.max_grid_size or max(8, int(np.ceil(max(nx, ny) / max(1, int(np.ceil(np.sqrt(2 * self.ranks)))))))
+        # boxes per rank: CPU ~8 (load balance across wet / dry / wall cells),
+        # GPU ~1 (one launch covers all boxes; fewer, larger boxes)
+        per = 1 if self.gpu else 8
+        mgs = self.max_grid_size or max(16, int(np.ceil(max(nx, ny) / np.ceil(np.sqrt(per * self.ranks)))))
         (case / "inputs").write_text(
             f"zs.n_cell = {nx} {ny}\nzs.prob_lo = {grid['lo'][0]!r} {grid['lo'][1]!r}\n"
             f"zs.prob_hi = {grid['hi'][0]!r} {grid['hi'][1]!r}\n"
