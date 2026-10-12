@@ -1641,13 +1641,13 @@ Field linsolve(F op, const Field& b)
 }
 
 // ── diffusion ───────────────────────────────────────────────────────────────
-/// div(A : grad X) per cell (zoomy_core's diffusion block, a TPFA): per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells' tensors, X_out the ghost across a boundary face and the partner cell across a periodic side; not refluxed (no AMR).
+/// The two-point part of div(A : grad X) per cell (zoomy_core's diffusion block): per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells' tensors, X_out the ghost across a boundary face and the partner cell across a periodic side; not refluxed (no AMR).
 /// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 template<class K, class G, class P, class T>
-Field diffusion(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
-                const Mesh& M)
+Field diffusion_tpfa(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                     const Mesh& M)
 {
-    BL_PROFILE("zs::diffusion");
+    BL_PROFILE("zs::diffusion_tpfa");
     constexpr int N = K::n_in;
     static_assert(K::n_out == N*N*D*D, "diffusion: a tensor (n, n, D, D)");
     AMREX_ALWAYS_ASSERT_WITH_MESSAGE(!M.log, "diffusion: AMR does not reflux diffusive fluxes");
@@ -1696,7 +1696,88 @@ Field diffusion(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T t
     return out;
 }
 
-/// One Crank-Nicolson step of diffusion from time to time + dt: R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, A at X (Qaux frozen), by Newton-Krylov.
+/// The rest of the face flux n.A.grad_f beyond diffusion_tpfa (2-D, 3-D): grad_f = the mean of the two cells' LSQ gradients (the derivative-aux fit, ghosts sampled), whose normal part the two-point difference replaces, so on a Cartesian face only its tangential part enters.
+/// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
+template<class K, class G, class P, class T>
+Field diffusion_correction(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                           const Mesh& M)
+{
+    BL_PROFILE("zs::diffusion_correction");
+    constexpr int N = K::n_in;
+    const int r1 = std::max(1, M.R);
+    const Field X = need(X_, r1, M), A = need(A_, r1, M);
+    const Field Xg = bc_cells(ghost, X, A, p, time_, M);
+    const Geo g = M.g;
+    const Real time = time_;
+    const int nq = X.nq, na = A.nq;
+    auto x = X[0].const_arrays();
+    auto a = A[0].const_arrays();
+    Field Gc = cells_of(M, D*nq);              // row D q + a: d/dx_a of row q
+    {
+        auto o = Gc[0].arrays();
+        auto xg = Xg[0].const_arrays();
+        amrex::ParallelFor(Gc[0], IV(0), nq,
+            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
+        {
+            ZS_CELL;
+            if (!inside(g, c)) return;
+            for (int e = 0; e < D; ++e) o[bx](c, D*n + e) = lsq(g, x[bx], xg[bx], true, c, n, g.gmon[e], -1);
+        });
+    }
+    const Field Gr = need(Gc, 1, M);
+    Field out = cells_of(M, nq);
+    auto o = out[0].arrays();
+    auto gr = Gr[0].const_arrays();
+    amrex::ParallelFor(out[0], IV(0),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        auto tensor = [&](const IV& cc)
+        {
+            return kn(col<N>(x[bx], cc, nq), col<K::n_aux>(a[bx], cc, na), p, time, 0.0,
+                      cell_centre(g, cc));
+        };
+        const auto Ac = tensor(c);
+        Real s[N] = {};
+        for (int d = 0; d < D; ++d)
+            for (int up = 0; up < 2; ++up)
+            {
+                const IV cc = up ? c + unit(d) : c - unit(d);
+                const bool in = inside(g, cc);
+                const auto An = in ? tensor(cc) : Ac;
+                const Real w = (up ? 1.0 : -1.0)/g.dx[d];
+                for (int r = 0; r < N; ++r)
+                {
+                    Real f = 0.0;
+                    for (int q = 0; q < N; ++q)
+                        for (int e = 0; e < D; ++e)
+                        {
+                            if (e == d) continue;
+                            const int m = ((r*N + q)*D + d)*D + e;
+                            const Real t = in ? 0.5*(Ac(m, 0) + An(m, 0)) : Ac(m, 0);
+                            const Real ge = in ? 0.5*(gr[bx](c, D*q + e) + gr[bx](cc, D*q + e))
+                                               : gr[bx](c, D*q + e);
+                            f += t*ge;
+                        }
+                    s[r] += f*w;
+                }
+            }
+        for (int r = 0; r < N && r < nq; ++r) o[bx](c, r) = s[r];
+    });
+    return out;
+}
+
+/// div(A : grad X) per cell (zoomy_core's diffusion block): diffusion_tpfa plus diffusion_correction.
+template<class K, class G, class P, class T>
+Field diffusion(K kn, G ghost, const Field& X, const Field& A, const P& p, T time,
+                const Mesh& M)
+{
+    if constexpr (D == 1) return diffusion_tpfa(kn, ghost, X, A, p, time, M);
+    else return Field(diffusion_tpfa(kn, ghost, X, A, p, time, M)
+                      + diffusion_correction(kn, ghost, X, A, p, time, M));
+}
+
+/// One Crank-Nicolson step of diffusion_tpfa from time to time + dt plus the correction explicit at Q (deferred): R(X) = X - Q - dt/2 (D(X) + D(Q) + 2 C(Q)) = 0, A at X (Qaux frozen), by Newton-Krylov.
 /// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G, class P, class T, class S>
 Field implicit_diffusion(K kn, G ghost, const Field& Q, const Field& A, const P& p,
@@ -1704,9 +1785,14 @@ Field implicit_diffusion(K kn, G ghost, const Field& Q, const Field& A, const P&
 {
     BL_PROFILE("zs::implicit_diffusion");
     const Real time = time_, dt = dt_;
-    const Field b = Q + 0.5*dt*diffusion(kn, ghost, Q, A, p, time, M);
+    const Field D0 = diffusion_tpfa(kn, ghost, Q, A, p, time, M);
+    const Field b = [&]() -> Field
+    {
+        if constexpr (D == 1) return Q + 0.5*dt*D0;
+        else return Q + 0.5*dt*(D0 + 2.0*diffusion_correction(kn, ghost, Q, A, p, time, M));
+    }();
     auto R = [&](const Field& X) -> Field
-    { return X - b - 0.5*dt*diffusion(kn, ghost, X, A, p, time + dt, M); };
+    { return X - b - 0.5*dt*diffusion_tpfa(kn, ghost, X, A, p, time + dt, M); };
     return halo(newton_krylov(R, Q), M);
 }
 
