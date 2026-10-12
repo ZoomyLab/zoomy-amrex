@@ -111,9 +111,12 @@ def referenced(source, system):
     return sorted(set(re.findall(rf"\b{system}\.(\w+)", source)))
 
 
-def write_kernels(systems, source, path, dimension):
+def write_kernels(systems, source, path, dimension, classes=None):
     """``Kernels.H``: ``struct <name>_t`` + ``constexpr <name>_t <name>`` for
-    each ``(name, nsm)`` in ``systems``, with the kernels ``source`` uses."""
+    each ``(name, nsm)`` in ``systems``, with the kernels ``source`` uses.
+    ``classes`` ``{(name, "state"): closure class per state row}`` (the
+    topology's ``lsq_closure_class``; ANALYSIS 41): the 6th int of each
+    ``aux_derivatives`` entry, -1 without a closure."""
     pr = AmrexKernelPrinter()
     first = systems[0][1]
     n_par = len(first.parameters.keys())
@@ -148,11 +151,13 @@ def write_kernels(systems, source, path, dimension):
                 f" = {{{', '.join(chr(34) + t + chr(34) for t in tags)}}};"]
         for k in referenced(source, name):
             if k == "aux_derivatives":
-                rows = [(e["row"], e["state_index"], *_axes(e["multi_index"]))
+                cls = (classes or {}).get((name, "state"), ())
+                rows = [(e["row"], e["state_index"], *_axes(e["multi_index"]),
+                         cls[e["state_index"]] if cls else -1)
                         for e in nsm.aux_derivatives
                         if e["kind"] == "derivative" and e["target_kind"] == "state"]
                 items = ", ".join("{" + ", ".join(map(str, r)) + "}" for r in rows)
-                out.append(f"    static constexpr std::array<std::array<int, 5>, "
+                out.append(f"    static constexpr std::array<std::array<int, 6>, "
                            f"{len(rows)}> aux_derivatives = {{{{{items}}}}};")
             elif call[k] is None:
                 raise ValueError(f"{name}.{k} is used but empty")

@@ -78,14 +78,19 @@ inline void warn(const std::string& message) { amrex::Print() << "warning: " << 
 // (the class of each index along each axis, combined) a list of samples
 // (kind 0: the cell at c + offset, kind 1: the boundary value in the ghost
 // cell c + offset) and their weights per monomial -- the zoomy mesh's
-// lsq_gradQ * lsq_scale_factors.
+// lsq_gradQ * lsq_scale_factors.  Boundary closure (ANALYSIS 41): each cell
+// class has 1 + ncl lists, the base fit and one per closure class (the
+// constrained fits, lsq_closure * lsq_scale_factors; an inactive class repeats
+// the base list); ``off`` holds (begin, end) of every list; ``rcl`` = the
+// closure class of each row of the reconstruction variables W.
 struct Geo
 {
     int lo[3], hi[3], per[3];
     Real dx[3], plo[3];
     int branch[6];                     // BC branch: x-lo, x-hi, y-lo, y-hi, z-lo, z-hi
     int ncls[3], nmon, gmon[3];        // gmon: the monomial of d/dx_a (or -1)
-    const int* cls[3]; const int* off; const int* smp;
+    int ncl, nrcl;
+    const int* cls[3]; const int* off; const int* smp; const int* rcl;
     const Real* w;
 };
 
@@ -101,7 +106,7 @@ struct Mesh
     std::function<Field(const Field&)> fill;
     std::shared_ptr<std::vector<std::array<Field, 2>>> log;
     std::vector<std::array<int, 3>> mon;
-    amrex::Gpu::DeviceVector<int> cls[3], off, smp;
+    amrex::Gpu::DeviceVector<int> cls[3], off, smp, rcl;
     amrex::Gpu::DeviceVector<Real> w;
     Geo g{};
 
@@ -109,30 +114,43 @@ struct Mesh
     void load(const std::string& path, const int branch[6])
     {
         std::ifstream f(path);
-        int dim, n[3] = {1, 1, 1}, nc[3] = {1, 1, 1}, nmon;
+        int dim, n[3] = {1, 1, 1}, nc[3] = {1, 1, 1}, nmon, ncl;
         f >> R >> dim;
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(dim == D, "rt_amrex: LSQ table of another dimension");
         for (int a = 0; a < D; ++a) f >> n[a];
         for (int a = 0; a < D; ++a) f >> nc[a];
-        f >> nmon;
+        f >> nmon >> ncl;
         NG = R + 1;
-        std::vector<int> cv[3], of{0}, sm;
+        std::vector<int> cv[3], of, sm, rc;
         std::vector<Real> ww;
         for (int a = 0; a < D; ++a) { cv[a].resize(n[a]); for (auto& v : cv[a]) f >> v; }
         mon.resize(nmon);
         for (auto& m : mon) { m = {0, 0, 0}; for (int a = 0; a < D; ++a) f >> m[a]; }
+        int nrc; f >> nrc;
+        rc.resize(nrc);
+        for (auto& v : rc) f >> v;
+        int nsamp = 0;
         for (int c = 0; c < nc[0]*nc[1]*nc[2]; ++c)
-        {
-            int ns; f >> ns;
-            for (int s = 0; s < ns; ++s)
+            for (int l = 0; l <= ncl; ++l)
             {
-                int kind, o[3] = {0, 0, 0}; f >> kind;
-                for (int a = 0; a < D; ++a) f >> o[a];
-                sm.insert(sm.end(), {kind, o[0], o[1], o[2]});
-                for (int k = 0; k < nmon; ++k) { Real x; f >> x; ww.push_back(x); }
+                int ns; f >> ns;
+                if (ns < 0)             // an inactive closure class: the base list
+                {
+                    const int b = of.size() - 2*l;
+                    of.push_back(of[b]); of.push_back(of[b + 1]);
+                    continue;
+                }
+                of.push_back(nsamp);
+                for (int s = 0; s < ns; ++s)
+                {
+                    int kind, o[3] = {0, 0, 0}; f >> kind;
+                    for (int a = 0; a < D; ++a) f >> o[a];
+                    sm.insert(sm.end(), {kind, o[0], o[1], o[2]});
+                    for (int k = 0; k < nmon; ++k) { Real x; f >> x; ww.push_back(x); }
+                }
+                nsamp += ns;
+                of.push_back(nsamp);
             }
-            of.push_back(of.back() + ns);
-        }
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(f.good(), "rt_amrex: bad LSQ table");
         auto up = [](auto& dv, const auto& hv)
         {
@@ -140,7 +158,7 @@ struct Mesh
             amrex::Gpu::copy(amrex::Gpu::hostToDevice, hv.begin(), hv.end(), dv.begin());
         };
         for (int a = 0; a < D; ++a) up(cls[a], cv[a]);
-        up(off, of); up(smp, sm); up(w, ww);
+        up(off, of); up(smp, sm); up(w, ww); up(rcl, rc);
         const amrex::Box& d = geom.Domain();
         for (int a = 0; a < 3; ++a)
         {
@@ -154,8 +172,8 @@ struct Mesh
             g.gmon[a] = a < D ? monomial(a == 0, a == 1, a == 2) : -1;
         }
         for (int s = 0; s < 6; ++s) g.branch[s] = branch[s];
-        g.nmon = nmon;
-        g.off = off.data(); g.smp = smp.data(); g.w = w.data();
+        g.nmon = nmon; g.ncl = ncl; g.nrcl = nrc;
+        g.off = off.data(); g.smp = smp.data(); g.w = w.data(); g.rcl = rcl.data();
     }
     int monomial(int a, int b, int c) const
     {
@@ -1041,10 +1059,12 @@ inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
 
 // LSQ fit of row ``n`` at cell c, monomial ``m``: sum_s w_s,m delta_s.  A
 // boundary sample (at the mirror image of the cell centre) carries
-// ug(n) - u_c, ug the ghost (``ghost``), else no change
+// ug(n) - u_c, ug the ghost (``ghost``), else no change.  ``k`` = the row's
+// boundary-closure class (-1: none): the class's list, its weights carry the
+// constraint data factors
 template<class A, class B>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, int m)
+Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, int m, int k = -1)
 {
     if (m < 0) return 0.0;
     IV cw = c;                          // c in the domain (a periodic image wrapped)
@@ -1057,7 +1077,8 @@ Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, 
     }
     const Real uc = u(c, n);
     Real s = 0.0;
-    for (int t = g.off[cl]; t < g.off[cl + 1]; ++t)
+    const int li = 2*(cl*(g.ncl + 1) + (k >= 0 && k < g.ncl ? 1 + k : 0));
+    for (int t = g.off[li]; t < g.off[li + 1]; ++t)
     {
         const int kind = g.smp[4*t];
         IV cc = c;
@@ -1086,7 +1107,8 @@ inline Field gradient(const Field& W_, const Field& Wg, const Mesh& M)
     {
         ZS_CELL;
         if (!inside(g, c)) return;
-        for (int a = 0; a < D; ++a) o[bx](c, D*n + a) = lsq(g, w[bx], wg[bx], true, c, n, g.gmon[a]);
+        const int kc = n < g.nrcl ? g.rcl[n] : -1;      // the closure class of W row n
+        for (int a = 0; a < D; ++a) o[bx](c, D*n + a) = lsq(g, w[bx], wg[bx], true, c, n, g.gmon[a], kc);
     });
     return G;
 }
@@ -1305,12 +1327,12 @@ Field derivative_aux_impl(const S& spec, const Field& Q_, const Field& Qaux,
         const int mi = M.monomial(e[2], e[3], e[4]);
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(mi >= 0,
             "derivative_aux: the derivative exceeds the LSQ degree");
-        const int row = e[0], s = e[1];
+        const int row = e[0], s = e[1], kc = ghost ? e[5] : -1;   // e[5]: closure class
         amrex::ParallelFor(out[0], IV(gr),
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
             ZS_CELL;
-            if (inside(g, c)) o[bx](c, row) = lsq(g, q[bx], qg[bx], ghost, c, s, mi);
+            if (inside(g, c)) o[bx](c, row) = lsq(g, q[bx], qg[bx], ghost, c, s, mi, kc);
         });
     }
     return out;

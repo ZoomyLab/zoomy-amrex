@@ -11,7 +11,8 @@ the same text foam runs), the device kernels (``Kernels.H``,
 apptainer (GNU make, one build tree per CPU/GPU, so AMReX itself compiles
 once), cached by a hash of the sources.  The grid is the mesh's uniform
 Cartesian grid; the LSQ stencils and weights are the zoomy mesh's own
-(``lsq_gradQ``), per cell class.
+(``lsq_gradQ``, and the boundary closure ``lsq_closure``, ANALYSIS 41), per
+cell class.
 """
 from __future__ import annotations
 
@@ -27,7 +28,9 @@ import numpy as np
 import param
 
 from zoomy_core.mesh import LSQMesh, ensure_lsq_mesh
+from zoomy_core.mesh.geometry_xp import build_topology, compute_geometry
 from zoomy_core.model.boundary_conditions import boundary_face_branches
+from zoomy_core.numerics.boundary_closure import closure_kinds
 from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
 from zoomy_amrex.symkernels import write_kernels
 
@@ -77,12 +80,14 @@ class AmrexDriver(param.Parameterized):
         return self.amr is not None
 
     # ── build ──────────────────────────────────────────────────────────────
-    def build(self, nsm, dimension):
-        """Print, write the build tree, make (cached).  Returns the binary."""
+    def build(self, nsm, dimension, classes=None):
+        """Print, write the build tree, make (cached).  Returns the binary.
+        ``classes``: the case's boundary-closure classes (:func:`lsq_fit`),
+        in ``Kernels.H``; without, no closure in the derivative aux."""
         self.source = self._print(nsm, dimension)
         CACHE.mkdir(parents=True, exist_ok=True)
         tmp = CACHE / f"kernels_{os.getpid()}_{threading.get_ident()}.H"   # per thread
-        write_kernels(self._systems(nsm), self.source, tmp, dimension)
+        write_kernels(self._systems(nsm), self.source, tmp, dimension, classes)
         files = {"Solver.H": self.source, "Kernels.H": tmp.read_text()}
         tmp.unlink()
         for f in APP:
@@ -135,7 +140,9 @@ class AmrexDriver(param.Parameterized):
         nsm = self._prepare(mesh, model)
         grid = cartesian(mesh)
         dim = grid["dim"]
-        binary = self.build(nsm, dim)
+        branch, periodic = sides(mesh, nsm, dim)
+        fit = self._lsq_fit(nsm, grid, branch)
+        binary = self.build(nsm, dim, fit["classes"])
         if self.build_only:
             return binary
         case = Path(workdir).resolve()
@@ -148,9 +155,8 @@ class AmrexDriver(param.Parameterized):
         n_aux = len(nsm.aux_state)
         A0 = np.zeros((max(n_aux, 1), grid["nc"])) if Qaux0 is None else Qaux0
         to_grid(A0).tofile(case / "qaux0.bin")
-        branch, periodic = sides(mesh, nsm, dim)
-        (case / "lsq.txt").write_text(lsq_table(nsm, self._degree(nsm), grid, periodic))
-        amr = self._amr_inputs(case, nsm, grid, periodic, fine) if self.amr else ""
+        (case / "lsq.txt").write_text(lsq_table(fit, grid, periodic, _owner(nsm)))
+        amr = self._amr_inputs(case, nsm, grid, periodic, branch, fine) if self.amr else ""
         if self.couple:
             c = self.couple
             amr += (f"zs.precice = {c['participant']} {c['config']} {c['mesh']}\n"
@@ -196,7 +202,13 @@ class AmrexDriver(param.Parameterized):
         self.snapshots = [_read(f, grid) for f in snaps]
         return _read(case / "out" / "final.bin", grid)
 
-    def _amr_inputs(self, case, nsm, grid, periodic, fine):
+    def _lsq_fit(self, nsm, grid, branch):
+        """The LSQ fits of ``grid`` with the boundary closure of every system
+        the template differentiates (:func:`lsq_fit`)."""
+        return lsq_fit(nsm, [s for _, s in self._systems(nsm)[1:]], self._degree(nsm),
+                       grid, branch)
+
+    def _amr_inputs(self, case, nsm, grid, periodic, branch, fine):
         """Per-level LSQ tables and initial states, the AMR inputs."""
         a = {**dict(ratio=2, regrid_int=0, reflux=True, blocking_factor=8, n_error_buf=2,
                     grid_eff=0.7), **self.amr}
@@ -211,7 +223,8 @@ class AmrexDriver(param.Parameterized):
                 np.asarray(fine[lv - 1][1], dtype=np.float64)[:, g["order"]].tofile(
                     case / f"q0_{lv}.bin")
             self._grids.append(g)
-            (case / f"lsq_{lv}.txt").write_text(lsq_table(nsm, self._degree(nsm), g, periodic))
+            (case / f"lsq_{lv}.txt").write_text(
+                lsq_table(self._lsq_fit(nsm, g, branch), g, periodic, _owner(nsm)))
             lsq.append(f"lsq_{lv}.txt")
             q0.append("q0.bin" if lv == 0 else (f"q0_{lv}.bin" if lv <= len(fine) else "-"))
         names = [str(v) for v in nsm.state]
@@ -319,51 +332,100 @@ def side_of(mesh, tag, dim):
     return 2 * ax + int(n[ax] > 0)
 
 
-def lsq_table(nsm, degree, grid, periodic):
-    """The LSQ stencils and weights of the zoomy mesh per cell class, from a
-    proxy grid of the same spacing (classes: the distance to each side, up to
-    the stencil reach R; along a periodic axis the interior class, its samples
-    across the seam the partner cells in the halo, as zoomy_core's wrapped
-    stencils).  Text
-    read by ``zs::Mesh::load``."""
+def _owner(nsm):
+    """The name a system's closure classes are keyed by (``lsq_closure_class``)."""
+    return getattr(nsm, "_symbolic_name", None) or "nsm"
+
+
+def lsq_fit(nsm, systems, degree, grid, branch):
+    """The zoomy topology and geometry (``lsq_gradQ`` and, for fits of degree
+    >= 2, the boundary closure ``lsq_closure``, ANALYSIS 41) of a proxy mesh
+    of ``grid``'s spacing, its sides carrying the case's BC branches
+    (``branch``, :func:`sides`; -1: periodic, no closure).  ``classes``: the
+    topology's ``lsq_closure_class`` (``{(owner, "state" | "reconstruction"):
+    class per row}``) renumbered by the kinds of the six sides, so a class has
+    the same id on every proxy (any grid size, AMR level) and in ``Kernels.H``,
+    which is written before the grid is known to the tables; ``order`` the
+    topology's class of each id."""
     dim, n, lo, h = grid["dim"], grid["n"], grid["lo"], grid["d"]
     np_ = [min(n[ax], 2 * degree + 3) for ax in range(dim)]
     dom = [v for ax in range(dim) for v in (lo[ax], lo[ax] + np_[ax] * h[ax])]
     proxy = (LSQMesh.create_1d(domain=tuple(dom), n_inner_cells=np_[0]) if dim == 1 else
              LSQMesh.create_2d(domain=tuple(dom), nx=np_[0], ny=np_[1]) if dim == 2 else
              LSQMesh.create_3d(domain=tuple(dom), nx=np_[0], ny=np_[1], nz=np_[2]))
-    if degree > 1:
-        proxy._build_lsq_stencil(degree)
+    bf = np.asarray(proxy.boundary_face_face_indices, dtype=int)
+    normals = np.asarray(proxy.face_normals)[:dim, bf]
+    axis = np.abs(normals).argmax(axis=0)
+    side = 2 * axis + (normals[axis, np.arange(bf.size)] > 0)       # x-lo, x-hi, y-lo, ...
+    kinds = (closure_kinds(nsm, systems, np.asarray(branch)[side], normals)
+             if degree >= 2 else {})
+    topo = build_topology(proxy, lsq_degree=degree, closure=kinds)
+    geom = compute_geometry(topo, np.asarray(proxy.vertex_coordinates)[:dim])
+    first = [int(np.flatnonzero(side == s)[0]) for s in range(2 * dim)]
+    kind_of = {k: tuple(int(kinds[key][r, f]) for f in first)
+               for key, cls in topo.lsq_closure_class.items()
+               for r, k in enumerate(cls) if k >= 0}
+    order = sorted(kind_of, key=kind_of.get)
+    ident = {k: i for i, k in enumerate(order)}
+    classes = {key: tuple(ident.get(k, -1) for k in cls)
+               for key, cls in topo.lsq_closure_class.items()}
+    return dict(proxy=proxy, np=np_, topo=topo, geom=geom, order=order, classes=classes)
+
+
+def lsq_table(fit, grid, periodic, owner):
+    """The LSQ stencils and weights of the zoomy mesh per cell class, from a
+    proxy grid of the same spacing (:func:`lsq_fit`; classes: the distance to
+    each side, up to the stencil reach R; along a periodic axis the interior
+    class, its samples across the seam the partner cells in the halo, as
+    zoomy_core's wrapped stencils).  Each cell class has the base list and
+    one list per boundary-closure class (the constrained fit's weights, the
+    constraint data factors folded in; -1: the class does not constrain the
+    class's cells, the base list); ``owner``'s reconstruction classes (the O2
+    gradient) follow the monomials.  Text read by ``zs::Mesh::load``."""
+    dim, n, h = grid["dim"], grid["n"], grid["d"]
+    np_, proxy, topo, geom = fit["np"], fit["proxy"], fit["topo"], fit["geom"]
     pg = cartesian(proxy)
     nc = pg["nc"]
     cc = np.asarray(proxy.cell_centers)[:dim]
-    nbrs = np.asarray(proxy.lsq_neighbors)
-    bnbr = np.asarray(proxy.lsq_boundary_face_neighbors)
-    A = np.asarray(proxy.lsq_gradQ)
-    scale = np.asarray(proxy.lsq_scale_factors, dtype=float)
-    mon = [tuple(int(x) for x in m) for m in np.asarray(proxy.lsq_monomial_multi_index)]
+    nbrs = np.asarray(topo.lsq_neighbors)
+    bnbr = np.asarray(topo.lsq_boundary_face_neighbors)
+    A = np.asarray(geom["lsq_gradQ"])
+    T = np.asarray(geom["lsq_closure"])
+    cl = topo.lsq_plan.get("closure")
+    cl_cells = {int(c): i for i, c in enumerate(cl["cells"])} if cl is not None else {}
+    scale = np.asarray(topo.lsq_scale_factors, dtype=float)
+    mon = [tuple(int(x) for x in m) for m in topo.lsq_monomial_multi_index]
     fcen = np.asarray(proxy.face_centers)[:, :dim].T
     bf_face = np.asarray(proxy.boundary_face_face_indices, dtype=int)
     bf_cell = np.asarray(proxy.boundary_face_cells, dtype=int)
     d = np.asarray(h)
-    samples = {}
-    for c in range(nc):
+
+    def samples(c, W):      # W (R, n_mon) in lsq_gradQ's layout: stencil cells, boundary slots
         row, smp = 0, []
         for nb in nbrs[c]:
-            w = scale * A[c, row]
+            w = scale * W[row]
             row += 1
             if nb == c or nb >= nc or not np.any(w):
                 continue
             smp.append((0, *np.rint((cc[:, nb] - cc[:, c]) / d).astype(int), w))
         for bf in bnbr[c]:
-            w = scale * A[c, row]
+            w = scale * W[row]
             row += 1
             if bf < 0 or not np.any(w):
                 continue
             ghost = 2 * fcen[:, bf_face[bf]] - cc[:, bf_cell[bf]]
             smp.append((1, *np.rint((ghost - cc[:, c]) / d).astype(int), w))
-        samples[c] = smp
-    R = max(max(abs(int(o)) for o in s[1:1 + dim]) for smp in samples.values() for s in smp)
+        return smp
+
+    def lists(c):           # the base list, then the closure classes' (None: the base)
+        out = [samples(c, A[c])]
+        for k in fit["order"]:
+            i = cl_cells.get(c)
+            out.append(samples(c, T[k, i]) if i is not None and cl["active"][k, i] else None)
+        return out
+    allv = {c: lists(c) for c in range(nc)}
+    R = max(max(abs(int(o)) for o in s[1:1 + dim]) for ls in allv.values()
+            for smp in ls if smp for s in smp)
     for ax in range(dim):
         if np_[ax] < n[ax] and np_[ax] < 2 * R + 1:
             raise RuntimeError(f"LSQ reach {R}: proxy grid too small")
@@ -379,14 +441,20 @@ def lsq_table(nsm, degree, grid, periodic):
             rep.setdefault(tuple(keys[ax].index(kc[ax]) for ax in range(dim)), c)
     cls = [[keys[ax].index(key(i, n[ax], periodic[ax])) for i in range(n[ax])]
            for ax in range(dim)]
-    out = [f"{R} {dim} {' '.join(map(str, n))} {' '.join(str(len(k)) for k in keys)} {len(mon)}",
-           *(" ".join(map(str, cl)) for cl in cls),
-           " ".join(" ".join(map(str, m)) for m in mon)]
+    recon = fit["classes"].get((owner, "reconstruction"), ())
+    out = [f"{R} {dim} {' '.join(map(str, n))} {' '.join(str(len(k)) for k in keys)} "
+           f"{len(mon)} {len(fit['order'])}",
+           *(" ".join(map(str, cl_)) for cl_ in cls),
+           " ".join(" ".join(map(str, m)) for m in mon),
+           f"{len(recon)} {' '.join(map(str, recon))}".strip()]
     for k in np.ndindex(*[len(kk) for kk in keys]):
-        smp = samples[rep[tuple(int(x) for x in k)]]
-        out.append(str(len(smp)))
-        out += [f"{s[0]} {' '.join(str(int(o)) for o in s[1:1 + dim])} "
-                + " ".join(repr(float(x)) for x in s[-1]) for s in smp]
+        for smp in allv[rep[tuple(int(x) for x in k)]]:
+            if smp is None:
+                out.append("-1")
+                continue
+            out.append(str(len(smp)))
+            out += [f"{s[0]} {' '.join(str(int(o)) for o in s[1:1 + dim])} "
+                    + " ".join(repr(float(x)) for x in s[-1]) for s in smp]
     return "\n".join(out) + "\n"
 
 
