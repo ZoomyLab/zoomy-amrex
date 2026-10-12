@@ -7,10 +7,11 @@
 The printed host program (``Solver.H``, :mod:`zoomy_core.symsolver.backend_cxx`:
 the same text foam runs), the device kernels (``Kernels.H``,
 :mod:`zoomy_amrex.symkernels`) and the app (``Source/symsolver/symAmrex.cpp``
-+ ``rt_amrex.H``) are compiled in the AMReX apptainer (GNU make, one build
-tree per CPU/GPU, so AMReX itself compiles once), cached by a hash of the
-sources.  The grid is the mesh's uniform Cartesian grid; the LSQ stencils
-and weights are the zoomy mesh's own (``lsq_gradQ``), per cell class.
++ ``rt_amrex.H`` + zoomy_core's ``rt_common.H``) are compiled in the AMReX
+apptainer (GNU make, one build tree per CPU/GPU, so AMReX itself compiles
+once), cached by a hash of the sources.  The grid is the mesh's uniform
+Cartesian grid; the LSQ stencils and weights are the zoomy mesh's own
+(``lsq_gradQ``), per cell class.
 """
 from __future__ import annotations
 
@@ -27,7 +28,7 @@ import param
 
 from zoomy_core.mesh import LSQMesh, ensure_lsq_mesh
 from zoomy_core.model.boundary_conditions import boundary_face_branches
-from zoomy_core.symsolver.backend_cxx import CxxBackend, CxxChorinBackend
+from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
 from zoomy_amrex.symkernels import write_kernels
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -86,6 +87,7 @@ class AmrexDriver(param.Parameterized):
         tmp.unlink()
         for f in APP:
             files[Path(f).name] = (SRC / f).read_text()
+        files[RUNTIME_HEADER.name] = RUNTIME_HEADER.read_text()
         cpl = bool(self.couple)
         h = hashlib.sha256(f"{self.gpu}{self.tiny_profile}{cpl}".encode())
         for k in sorted(files):
@@ -104,8 +106,8 @@ class AmrexDriver(param.Parameterized):
                 if not p.exists() or p.read_text() != v:
                     p.write_text(v)
             (tree / "Source" / "Make.package").write_text(
-                "CEXE_sources += symAmrex.cpp\nCEXE_headers += rt_amrex.H amr_amrex.H Kernels.H "
-                "Solver.H UserFunctions.H ZoomyEig.H\n")
+                "CEXE_sources += symAmrex.cpp\nCEXE_headers += rt_common.H rt_amrex.H amr_amrex.H "
+                "Kernels.H Solver.H UserFunctions.H ZoomyEig.H\n")
             (tree / "Exec" / "GNUmakefile").write_text(
                 _gnumakefile(self.gpu, self.tiny_profile, dimension, cpl))
             r = _apptainer(self.gpu, f"cd {tree}/Exec && taskset -c {BUILD_CPUS} "

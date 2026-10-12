@@ -24,7 +24,8 @@
     cells (FillBoundary).
 
     Every loop is an amrex::ParallelFor (CPU or GPU); reductions are
-    ParReduce + ParallelDescriptor; the linear solve is amrex::GMRES.
+    ParReduce + ParallelDescriptor; the linear solve is amrex::GMRES.  What
+    every C++ runtime shares is zoomy_core's rt_common.H.
 \*---------------------------------------------------------------------------*/
 #include <AMReX.H>
 #include <AMReX_Geometry.H>
@@ -47,9 +48,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#ifdef ZS_PRECICE
-#include <precice/precice.hpp>
-#endif
+
+#define ZS_HD AMREX_GPU_HOST_DEVICE
+#include "rt_common.H"
 
 namespace zs
 {
@@ -58,7 +59,6 @@ using amrex::IntVect;
 using IV = amrex::IntVect;
 constexpr int D = AMREX_SPACEDIM;
 template<int N> using Col = amrex::SmallMatrix<Real, (N > 0 ? N : 1), 1>;
-constexpr Real NaN = std::numeric_limits<Real>::quiet_NaN();
 constexpr int MAXR = 16;      // most rows a static row list carries
 
 // the cell of a ParallelFor iteration
@@ -71,22 +71,7 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE IV unit(int d)
     return u;
 }
 
-// ── settings (the driver's configure()) ─────────────────────────────────────
-struct Settings
-{
-    int lsq_degree = 1;       // highest derivative order the model asks for
-    double tpfa_cos_floor = NaN;   // two-point fluxes: |n.e| raised to this (unstructured)
-};
-inline Settings& settings() { static Settings s; return s; }
-struct Implicit
-{
-    double tol = 1e-8;        // Newton: ||R||_2 <= tol
-    int maxiter = 6;
-    double ls_tol = 1e-7;     // GMRES: ||A x - b|| <= ls_tol ||b||
-    int ls_restart = 20, ls_maxiter = 30;
-    double ls_accept = -1;    // > 0: abort above this relative residual
-};
-inline Implicit& implicit() { static Implicit s; return s; }
+inline void warn(const std::string& message) { amrex::Print() << "warning: " << message << "\n"; }
 
 // ── mesh ────────────────────────────────────────────────────────────────────
 // Geo: what a device loop needs (trivially copyable).  LSQ: per cell class
@@ -341,23 +326,7 @@ inline Field rows_alias(const Field& F, int first, int n)
     return A;
 }
 
-// ── elementwise arithmetic (one row broadcasts against many) ────────────────
-struct Add { AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real y) const { return x + y; } };
-struct Sub { AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real y) const { return x - y; } };
-struct Mul { AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real y) const { return x*y; } };
-struct Div { AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real y) const { return x/y; } };
-struct Pow { AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real y) const { return std::pow(x, y); } };
-struct Min
-{
-    AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real y) const
-    { return (x != x || y != y) ? NaN : (x < y ? x : y); }
-};
-struct Max
-{
-    AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real y) const
-    { return (x != x || y != y) ? NaN : (x > y ? x : y); }
-};
-
+// ── elementwise arithmetic (rt_common.H's functors; one row broadcasts) ─────
 // Field arithmetic is lazy: it builds an expression, evaluated by one
 // ParallelFor where a block takes it as a Field (eval) or where a reduction
 // reads it -- no kernel and no temporary per operator.
@@ -451,16 +420,12 @@ template<class A, class B, if_x<A, B> = 0> auto operator*(const A& a, const B& b
 template<class A, class B, if_x<A, B> = 0> auto operator/(const A& a, const B& b) { return xbin(Div{}, a, b); }
 template<class A, std::enable_if_t<is_x<A>::value, int> = 0> auto operator-(const A& a) { return xbin(Mul{}, a, -1.0); }
 template<class A, class T, if_x<A, T> = 0> auto pow(const A& a, T e) { return xbin(Pow{}, a, e); }
-struct Abs { AMREX_GPU_HOST_DEVICE Real operator()(Real x, Real) const { return std::abs(x); } };
 template<class A, std::enable_if_t<is_x<A>::value, int> = 0> auto abs(const A& a) { return xbin(Abs{}, a, 0.0); }
 using std::abs;
 using std::floor;
 using std::fmod;
 using std::pow;
 
-// NaN propagates (std::min / std::max would swallow it)
-inline double minimum(double a, double b) { return (a != a || b != b) ? NaN : std::min(a, b); }
-inline double maximum(double a, double b) { return (a != a || b != b) ? NaN : std::max(a, b); }
 template<class A, class B, if_x<A, B> = 0> auto minimum(const A& a, const B& b) { return xbin(Min{}, a, b); }
 
 // ── halo ────────────────────────────────────────────────────────────────────
@@ -1384,12 +1349,12 @@ Field inadmissible(K kn, const Field& Q, const Field& A, const P& p)
 }
 
 // ── implicit solves ─────────────────────────────────────────────────────────
-inline double norm2(const Field& a)
+inline double norm(const Field& a)
 {
     return std::sqrt(amrex::MultiFab::Dot(a[0], 0, a[0], 0, a.nq, 0));
 }
 
-// x + h e_kk (h = sqrt(eps) max(1, |x_kk|)) and h
+// x + h e_kk (h = fd_step(x_kk)) and h
 inline std::pair<Field, Field> perturb(const Field& x, int kk)
 {
     BL_PROFILE("zs::perturb");
@@ -1404,7 +1369,7 @@ inline std::pair<Field, Field> perturb(const Field& x, int kk)
         ZS_CELL;
         for (int n = 0; n < nq; ++n) o[bx](c, n) = a[bx](c, n);
         const Real v = a[bx](c, kk);
-        const Real s = 1.4901161193847656e-08*(std::abs(v) > 1.0 ? std::abs(v) : 1.0);
+        const Real s = fd_step(v);
         oh[bx](c, 0) = s;
         o[bx](c, kk) = v + s;
     });
@@ -1441,59 +1406,13 @@ inline Field newton_update(const Field& x, const Field& r, const std::vector<Fie
             for (int q = 0; q < n; ++q)
                 A[p*n + q] = (jj[bx](c, p*n + q) - rr[bx](c, p))/hh[bx](c, q);
         }
-        for (int cc = 0; cc < n; ++cc)              // partial pivoting
-        {
-            int piv = cc;
-            for (int p = cc + 1; p < n; ++p)
-                if (std::abs(A[p*n + cc]) > std::abs(A[piv*n + cc])) piv = p;
-            for (int q = 0; q < n; ++q) { Real t = A[cc*n + q]; A[cc*n + q] = A[piv*n + q]; A[piv*n + q] = t; }
-            { Real t = b[cc]; b[cc] = b[piv]; b[piv] = t; }
-            for (int p = cc + 1; p < n; ++p)
-            {
-                const Real m = A[p*n + cc]/A[cc*n + cc];
-                for (int q = cc; q < n; ++q) A[p*n + q] -= m*A[cc*n + q];
-                b[p] -= m*b[cc];
-            }
-        }
-        for (int p = n - 1; p >= 0; --p)
-        {
-            for (int q = p + 1; q < n; ++q) b[p] -= A[p*n + q]*b[q];
-            b[p] /= A[p*n + p];
-            o[bx](c, p) += b[p];
-        }
+        solve_small(A, b, n);
+        for (int p = 0; p < n; ++p) o[bx](c, p) += b[p];
     });
     return out;
 }
 
-// Newton on a cell-local residual f (x -> R, same shape): each cell's n x n
-// Jacobian by one-sided differences, one variable at a time in all cells.
-template<class F>
-Field root(F f, Field x)
-{
-    const auto& o = implicit();
-    Field r = f(x);
-    int it = 0;
-    for (; it < o.maxiter && norm2(r) > o.tol; ++it)
-    {
-        std::vector<Field> cols(x.nq), hs(x.nq);
-        for (int q = 0; q < x.nq; ++q)
-        {
-            auto ph = perturb(x, q);
-            cols[q] = f(ph.first);
-            hs[q] = ph.second;
-        }
-        x = newton_update(x, r, cols, hs);
-        r = f(x);
-    }
-    static bool warned = false;
-    if (norm2(r) > o.tol && !warned)
-    {
-        warned = true;
-        amrex::Print() << "root: not converged after " << it << " Newton updates, ||R|| = "
-                       << norm2(r) << " (warned once)\n";
-    }
-    return x;
-}
+template<class F> Field root(F f, Field x) { return newton_cellwise(f, std::move(x)); }
 
 // amrex::GMRES on the printed linear map, right-preconditioned by the exact
 // cell blocks of the operator (probed by colouring: cells (R+1) apart do not
@@ -1730,39 +1649,6 @@ Field diffusion(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T t
     return out;
 }
 
-// Newton on a global residual R (x -> R, same shape), ``implicit()`` tol /
-// maxiter on ||R||_2; each update a linsolve on the Jacobian action by a
-// directional difference (Jacobian-free Newton-Krylov; JAX: the exact jvp)
-template<class F>
-Field newton_krylov(F R, Field x)
-{
-    const auto& o = implicit();
-    Field r = R(x);
-    int it = 0;
-    for (; it < o.maxiter && norm2(r) > o.tol; ++it)
-    {
-        const Field x0 = x, r0 = r;
-        const double nx = norm2(x0);
-        auto J = [&R, x0, r0, nx](const Field& v) -> Field
-        {
-            const double nv = norm2(v);
-            if (!(nv > 0.0)) return Field(0.0*v);
-            const double h = std::sqrt(std::numeric_limits<double>::epsilon())*(1.0 + nx)/nv;
-            return Field((R(Field(x0 + h*v)) - r0)/h);
-        };
-        x = Field(x0 + linsolve(J, Field(-r0)));
-        r = R(x);
-    }
-    static bool warned = false;
-    if (norm2(r) > o.tol && !warned)
-    {
-        warned = true;
-        amrex::Print() << "newton_krylov: not converged after " << it
-                       << " Newton updates, ||R|| = " << norm2(r) << " (warned once)\n";
-    }
-    return x;
-}
-
 // one Crank-Nicolson step of ``diffusion`` from ``time`` to ``time + dt``:
 // R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, the ghosts of Q at ``time``, of X
 // at ``time + dt``, A at X (Qaux frozen)
@@ -1806,62 +1692,32 @@ auto cond(bool p, A a, B b)
     else return p ? Field(a()) : Field(b());      // an expression and a Field
 }
 
-// ── effects ─────────────────────────────────────────────────────────────────
-inline std::function<void(double, const Field&, const Field&)>& writer()
-{
-    static std::function<void(double, const Field&, const Field&)> w;
-    return w;
-}
-
-inline std::tuple<long> io_write(long tok, double time, const Field& Q, const Field& Qaux)
-{
-    if (writer()) writer()(time, Q, Qaux);
-    return {tok + 1};
-}
-
-inline std::tuple<long> check_cfl(long tok, double dt_cfl, double dt)
-{
-    static bool warned = false;
-    if (dt > dt_cfl*(1 + 1e-12) && !warned)
-    {
-        warned = true;
-        amrex::Print() << "warning: time step " << dt << " exceeds the CFL step "
-                       << dt_cfl << " (warned once)\n";
-    }
-    return {tok + 1};
-}
-
 #ifdef ZS_PRECICE
 // ── preCICE ─────────────────────────────────────────────────────────────────
-// The app fills ``coupling()`` (couple_setup): the participant, the data
-// names and the coupled side; the coupled faces are that side's boundary
-// faces of this rank's boxes, one preCICE vertex each (this rank's only),
-// numbered box by box (x fastest).  Interface values live on the host as
-// rows x vertices; the effects only make preCICE API calls.
-struct Vertices { int nq = 0, n = 0; std::vector<double> v; };   // v[q n + j]
-struct Coupling
+// couple_setup fills ``coupling()`` (rt_common.H: the participant, the data
+// names, the vertices) and ``interface()``: the coupled side; the coupled
+// faces are that side's boundary faces of this rank's boxes, one preCICE
+// vertex each (this rank's only), numbered box by box (x fastest).
+struct Interface
 {
-    std::unique_ptr<precice::Participant> participant;
-    std::string mesh;
-    std::vector<std::string> write, read;
     int side = -1;                                  // 2 d + upper
     Field index;                                    // vertex of a coupled face, -1 else
-    std::vector<precice::VertexID> ids;
 };
-inline Coupling& coupling() { static Coupling c; return c; }
+inline Interface& interface() { static Interface i; return i; }
 
 inline void couple_setup(const Mesh& M, const std::string& name, const std::string& config,
                          const std::string& mesh, const std::vector<std::string>& write,
                          const std::vector<std::string>& read, int side)
 {
     auto& cpl = coupling();
-    cpl.mesh = mesh; cpl.write = write; cpl.read = read; cpl.side = side;
+    auto& itf = interface();
+    cpl.mesh = mesh; cpl.write = write; cpl.read = read; itf.side = side;
     const int d = side/2, plane = (side & 1) ? M.g.hi[d] + 1 : M.g.lo[d];
-    cpl.index = faces_of(M, 1);
+    itf.index = faces_of(M, 1);
     std::vector<int> first;                         // per local box: its first vertex
     std::vector<double> xyz;
     const int dims = std::max(D, 2);                // the preCICE mesh: 2-D at least
-    for (amrex::MFIter mfi(cpl.index[d]); mfi.isValid(); ++mfi)
+    for (amrex::MFIter mfi(itf.index[d]); mfi.isValid(); ++mfi)
     {
         first.push_back(int(xyz.size())/dims);
         amrex::Box b = mfi.validbox();
@@ -1878,8 +1734,8 @@ inline void couple_setup(const Mesh& M, const std::string& name, const std::stri
     const int* fp = f0.data();
     for (int a = 0; a < D; ++a)
     {
-        auto o = cpl.index[a].arrays();
-        amrex::ParallelFor(cpl.index[a], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+        auto o = itf.index[a].arrays();
+        amrex::ParallelFor(itf.index[a], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
             ZS_CELL;
             if (a != d || c[d] != plane) { o[bx](c, 0) = -1.0; return; }
@@ -1900,7 +1756,7 @@ inline void couple_setup(const Mesh& M, const std::string& name, const std::stri
 
 inline Field coupled_faces(const Mesh&)
 {
-    const Field& I = coupling().index;
+    const Field& I = interface().index;
     Field out = like(I, 1);
     for (int d = 0; d < D; ++d)
     {
@@ -1915,13 +1771,13 @@ inline Field coupled_faces(const Mesh&)
 // the inner cell's state at every coupled face (vertex order), on the host
 inline Vertices interface_states(const Field& Q, const Mesh& M)
 {
-    const auto& cpl = coupling();
-    const int d = cpl.side/2, up = cpl.side & 1, nq = Q.nq, nv = int(cpl.ids.size());
+    const auto& itf = interface();
+    const int d = itf.side/2, up = itf.side & 1, nq = Q.nq, nv = int(coupling().ids.size());
     amrex::Gpu::DeviceVector<double> v(size_t(nq)*std::max(nv, 1));
     double* vp = v.data();
-    auto x = cpl.index[d].const_arrays();
+    auto x = itf.index[d].const_arrays();
     auto q = Q[0].const_arrays();
-    amrex::ParallelFor(cpl.index[d], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    amrex::ParallelFor(itf.index[d], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
     {
         ZS_CELL;
         const int jv = int(x[bx](c, 0));
@@ -1943,15 +1799,15 @@ template<class K, class KA, class P>
 Field interface_flux(K kn, KA kaux, int side, const Field& Q, const Field& Qaux,
                      const Vertices& peer, const P& p, const Mesh& M)
 {
-    const auto& cpl = coupling();
-    const int d = cpl.side/2, up = cpl.side & 1, nq = Q.nq, nv = peer.n;
+    const auto& itf = interface();
+    const int d = itf.side/2, up = itf.side & 1, nq = Q.nq, nv = peer.n;
     Field out = faces_of(M, nq);
     for (int a = 0; a < D; ++a) out[a].setVal(0.0);
     amrex::Gpu::DeviceVector<double> pv(std::max<size_t>(peer.v.size(), 1));
     amrex::Gpu::copy(amrex::Gpu::hostToDevice, peer.v.begin(), peer.v.end(), pv.begin());
     const double* pp = pv.data();
     const Geo g = M.g;
-    auto x = cpl.index[d].const_arrays();
+    auto x = itf.index[d].const_arrays();
     auto q = Q[0].const_arrays();
     auto o = out[d].arrays();
     constexpr int NQ = K::n_in, NA = K::n_aux;
@@ -1986,43 +1842,6 @@ Field interface_flux(K kn, KA kaux, int side, const Field& Q, const Field& Qaux,
     return out;
 }
 
-inline void couple_write_data(const Vertices& s)
-{
-    auto& cpl = coupling();
-    for (size_t i = 0; i < cpl.write.size(); ++i)
-        cpl.participant->writeData(cpl.mesh, cpl.write[i], cpl.ids,
-            std::vector<double>(s.v.begin() + long(i)*s.n, s.v.begin() + long(i + 1)*s.n));
-}
-inline std::tuple<long, bool> couple_init(long tok, const Vertices& s)
-{
-    auto& cpl = coupling();
-    if (cpl.participant->requiresInitialData()) couple_write_data(s);
-    cpl.participant->initialize();
-    return {tok + 1, cpl.participant->isCouplingOngoing()};
-}
-inline std::tuple<long, double> couple_max_dt(long tok)
-{ return {tok + 1, coupling().participant->getMaxTimeStepSize()}; }
-inline std::tuple<long, Vertices> couple_read(long tok)
-{
-    auto& cpl = coupling();
-    const int n = int(cpl.ids.size());
-    Vertices peer{int(cpl.read.size()), n, std::vector<double>(cpl.read.size()*n)};
-    std::vector<double> v(n);
-    for (size_t i = 0; i < cpl.read.size(); ++i)
-    {
-        cpl.participant->readData(cpl.mesh, cpl.read[i], cpl.ids, 0.0, v);
-        std::copy(v.begin(), v.end(), peer.v.begin() + long(i)*n);
-    }
-    return {tok + 1, peer};
-}
-inline std::tuple<long> couple_write(long tok, const Vertices& s)
-{ couple_write_data(s); return {tok + 1}; }
-inline std::tuple<long, bool> couple_advance(long tok, double dt)
-{
-    auto& cpl = coupling();
-    cpl.participant->advance(dt);
-    return {tok + 1, cpl.participant->isCouplingOngoing()};
-}
 #endif
 
 } // namespace zs
