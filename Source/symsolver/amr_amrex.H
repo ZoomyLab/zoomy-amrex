@@ -3,7 +3,7 @@
     amr_amrex.H -- the AMR level loop of the symbolic hyperbolic solver
     (amrex::AmrCore; one dt for every level, no subcycling) around the
     printed single-level procedures of Solver.H (program.amr_procedures):
-    ``step`` (hyperbolic.advance), ``dt_of`` (hyperbolic.cfl_dt),
+    ``step`` (HyperbolicTemplate.step), ``dt_of`` (HyperbolicTemplate.dt),
     ``initial_aux``, ``amr_w`` / ``amr_q`` (the reconstruction's variables),
     ``rk_weights``.
 
