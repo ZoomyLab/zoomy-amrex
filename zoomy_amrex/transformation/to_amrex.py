@@ -17,7 +17,9 @@ from zoomy_core.transformation.to_amrex import AmrexCore, AmrexNumerics
 # produce an ``int`` that breaks ``amrex::max(int, double)``.  Core's default
 # emits raw ``(c ? t : f)``; we override only the type.
 def _conditional_real(p, c, t, f):
-    """Print ``conditional`` with both branches cast to ``amrex::Real`` (else ``amrex::max`` sees an int)."""
+    """Print ``conditional`` with both branches cast to ``amrex::Real`` (else ``amrex::max`` sees an
+    int).
+    """
     return (f"(({p.doprint(c)}) ? (amrex::Real({p.doprint(t)})) "
             f": (amrex::Real({p.doprint(f)})))")
 
@@ -158,7 +160,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         self.symbol_maps.append({sm.time: "time"})
 
     def _uses_symbol(self, sym):
-        """True if ``sym`` appears in any printed operator (decides whether ``dt`` is appended to ``p``)."""
+        """True if ``sym`` appears in any printed operator (decides whether ``dt`` is appended to
+        ``p``).
+        """
         import sympy as sp
         for attr in ("flux", "source", "nonconservative_matrix", "eigenvalues",
                      "update_variables", "update_aux_variables", "state_update",
@@ -197,7 +201,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return ",\n        ".join(tbl[a] for a in names)
 
     def _registry_argnames(self, name):
-        """Argument names of operator ``name`` from ``Function.args``, minus ``dt`` (it rides in ``p``)."""
+        """Argument names of operator ``name`` from ``Function.args``, minus ``dt`` (it rides in
+        ``p``).
+        """
         return tuple(k for k in self._operator_arg_keys(name) if k != "dt")
 
     def _kernel(self, name, expr, shape, argnames):
@@ -315,7 +321,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
                 '#include <AMReX_SmallMatrix.H>')
 
     def _file_header(self, bc_tags):
-        """Top of ``Model.H``: sizes, state-row map (b, h, depth-scaled, discharge), BC tags, parameters."""
+        """Top of ``Model.H``: sizes, state-row map (b, h, depth-scaled, discharge), BC tags,
+        parameters.
+        """
         # parameter_names/default_parameters follow self._param_names (which may
         # include the appended "dt" slot); dt defaults to 0 (the driver sets it).
         pv = dict(self.sm.parameter_values)
@@ -566,7 +574,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return "\n".join(blocks)
 
     def _pressure_op_kernels(self, op):
-        """Print ``pressure_{A0,Axx,Ayy,Ax,Ay}``, ``pressure_rhs`` and ``n_press`` of operator ``op``."""
+        """Print ``pressure_{A0,Axx,Ayy,Ax,Ay}``, ``pressure_rhs`` and ``n_press`` of operator
+        ``op``.
+        """
         import sympy as sp
         NP = len(op.P_modes)
         def flat(M):
@@ -586,7 +596,9 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return out
 
     def _chorin_meta(self):
-        """Chorin sub-model metadata: evolved rows ``e2s`` and aux tables ``deriv_aux``, ``input_aux``."""
+        """Chorin sub-model metadata: evolved rows ``e2s`` and aux tables ``deriv_aux``,
+        ``input_aux``.
+        """
         sm = self.sm
         e2s = list(getattr(sm, "equation_to_state_index", range(self.n_eq)))
         def _rows(reg):
@@ -635,7 +647,9 @@ _SOURCE_DIR = _Path(__file__).resolve().parents[2] / "Source"
 
 
 def _stage_user_functions(out, write):
-    """Copy the hand-written kernel headers into ``out`` through the write-if-changed helper ``write``."""
+    """Copy the hand-written kernel headers into ``out`` through the write-if-changed helper
+    ``write``.
+    """
     for name in _USER_FN_SOURCES:
         write(out / name, (_SOURCE_DIR / name).read_text())
 
@@ -669,7 +683,9 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
     # that takes 2 s (60 s sim) to 26 s (600 s sim).  Skipping the write when the
     # content is unchanged lets make no-op, so a re-run is just the solve.
     def _write_if_changed(path, code):
-        """Write ``code`` to ``path`` unless identical (keeps the mtime, so ``make`` does not rebuild)."""
+        """Write ``code`` to ``path`` unless identical (keeps the mtime, so ``make`` does not
+        rebuild).
+        """
         try:
             if path.exists() and path.read_text() == code:
                 return
@@ -704,7 +720,9 @@ def write_chorin_headers(split, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
 
     def _write_if_changed(path, code):
-        """Write ``code`` to ``path`` unless identical (keeps the mtime, so ``make`` does not rebuild)."""
+        """Write ``code`` to ``path`` unless identical (keeps the mtime, so ``make`` does not
+        rebuild).
+        """
         try:
             if path.exists() and path.read_text() == code:
                 return

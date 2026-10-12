@@ -32,7 +32,9 @@ _SCALAR = {"time", "dt", "distance"}
 
 
 def family(f):
-    """Kernel family of the ``Function`` ``f`` (face, bc, recon, normal or cell), from its argument groups."""
+    """Kernel family of the ``Function`` ``f`` (face, bc, recon, normal or cell), from its argument
+    groups.
+    """
     keys = set(f.args.keys())
     if "q_minus" in keys:
         return "face"

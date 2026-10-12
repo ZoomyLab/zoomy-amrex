@@ -39,7 +39,9 @@ APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "symsolver/amr_amrex.H"
 
 
 def _apptainer(gpu, script, binds=(), **kw):
-    """Run the shell ``script`` in the CPU or GPU AMReX apptainer with the cache and ``binds`` mounted."""
+    """Run the shell ``script`` in the CPU or GPU AMReX apptainer with the cache and ``binds``
+    mounted.
+    """
     cmd = ["apptainer", "exec", "--cleanenv", *(["--nv"] if gpu else [])]
     for b in sorted({str(CACHE), *map(str, binds)}):
         cmd += ["--bind", b]
@@ -208,7 +210,9 @@ class AmrexDriver(param.Parameterized):
         return _read(case / "out" / "final.bin", grid)
 
     def _lsq_fit(self, nsm, grid, branch):
-        """LSQ fits of ``grid`` with the boundary closure of every system the template differentiates."""
+        """LSQ fits of ``grid`` with the boundary closure of every system the template
+        differentiates.
+        """
         return lsq_fit(nsm, [s for _, s in self._systems(nsm)[1:]], self._degree(nsm),
                        grid, branch)
 
@@ -436,7 +440,9 @@ def lsq_table(fit, grid, periodic, owner):
         return smp
 
     def lists(c):           # the base list, then the closure classes' (None: the base)
-        """The base sample list of cell ``c``, then one per closure class (None: the base list applies)."""
+        """The base sample list of cell ``c``, then one per closure class (None: the base list
+        applies).
+        """
         out = [samples(c, A[c])]
         for k in fit["order"]:
             i = cl_cells.get(c)
