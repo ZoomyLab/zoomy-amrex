@@ -357,8 +357,8 @@ def lsq_fit(nsm, systems, degree, grid, branch):
         systems: further systems the template differentiates besides ``nsm``.
         branch: BC branch per side (:func:`sides`; -1: periodic, no closure).
     Returns:
-        dict ``proxy, np, topo, geom, order, classes``; ``classes`` is ``{(owner, "state" |
-            "reconstruction"): class per row}``.
+        dict ``proxy, np, topo, geom, order, classes``; ``classes`` maps ``(owner, kind)`` (``kind``
+        ``"state"`` or ``"reconstruction"``) to the class per row.
     References:
         Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
     """

@@ -53,18 +53,14 @@ def prepare_rasters(msh_path, out_dir, ncell_x=180, ncell_y=96,
                     wall_above=5.0, pad_frac=0.0, subsample=4, bed_agg="min"):
     """Write ``bed.raw`` + ``depth.raw`` and return the AMReX geometry dict.
 
-    ncell_x/ncell_y  structured resolution.
-    wall_above       exterior wall bed = max reservoir surface + this (metres).
-    pad_frac         optional bounding-box padding as a fraction of each span.
-    subsample        sub-grid factor per cell for the bathymetry aggregation.
-    bed_agg          how to collapse the sub-grid bed to one cell value:
-                     "min"  -> channel-preserving (thalweg): keep the lowest
-                               point so the narrow gorge/breach stays open at
-                               coarse resolution (a dam-break would otherwise be
-                               sealed by cell-centre sampling on the rim);
-                     "mean" -> the plain cell average.
-                     The still-water *surface* (reservoir eta=100, sea eta=0) is
-                     preserved, so depth = max(0, surface - bed).
+    Depth is ``max(0, surface - bed)``; the still-water surface (reservoir eta=100, sea eta=0) is preserved.
+
+    Args:
+        ncell_x, ncell_y: Structured resolution.
+        wall_above: Exterior wall bed = max reservoir surface + this (metres).
+        pad_frac: Optional bounding-box padding as a fraction of each span.
+        subsample: Sub-grid factor per cell for the bathymetry aggregation.
+        bed_agg: ``"min"`` keeps the lowest sub-grid point (channel-preserving, keeps the narrow gorge open at coarse resolution); ``"mean"`` is the plain cell average.
     """
     from matplotlib.tri import Triangulation, LinearTriInterpolator
 
