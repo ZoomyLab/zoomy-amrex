@@ -72,7 +72,11 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE IV unit(int d)
 }
 
 // ── settings (the driver's configure()) ─────────────────────────────────────
-struct Settings { int lsq_degree = 1; };
+struct Settings
+{
+    int lsq_degree = 1;       // highest derivative order the model asks for
+    double tpfa_cos_floor = NaN;   // two-point fluxes: |n.e| raised to this (unstructured)
+};
 inline Settings& settings() { static Settings s; return s; }
 struct Implicit
 {
@@ -1664,6 +1668,114 @@ template<class F>
 Field linsolve(F op, const Field& b)
 {
     return linsolve_impl(std::function<Field(Field)>(op), b, *the_mesh());
+}
+
+// ── diffusion ───────────────────────────────────────────────────────────────
+// div(A : grad X) per cell (zoomy_core's ``diffusion`` block, JAX's TPFA):
+// per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells'
+// tensors (``kn`` = the diffusion tensor kernel, rows (i, j, d, e) flat);
+// across a boundary face X_out the ghost kernel's ghost at the mirror image
+// (bc_cells: d = dx, A the inner cell's), across a periodic side the
+// partner cell.  The diffusive fluxes are not refluxed: no AMR.
+template<class K, class G, class P, class T>
+Field diffusion(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                const Mesh& M)
+{
+    BL_PROFILE("zs::diffusion");
+    constexpr int N = K::n_in;
+    static_assert(K::n_out == N*N*D*D, "diffusion: a tensor (n, n, D, D)");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(!M.log, "diffusion: AMR does not reflux diffusive fluxes");
+    const Field X = need(X_, 1, M), A = need(A_, 1, M);
+    const Field Xg = bc_cells(ghost, X, A, p, time_, M);
+    Field out = cells_of(M, X.nq);
+    const Geo g = M.g;
+    const Real time = time_;
+    const int nq = X.nq, na = A.nq;
+    auto o = out[0].arrays();
+    auto x = X[0].const_arrays();
+    auto xg = Xg[0].const_arrays();
+    auto a = A[0].const_arrays();
+    amrex::ParallelFor(out[0], IV(0),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        auto tensor = [&](const IV& cc)
+        {
+            return kn(col<N>(x[bx], cc, nq), col<K::n_aux>(a[bx], cc, na), p, time, 0.0,
+                      cell_centre(g, cc));
+        };
+        const auto Ac = tensor(c);
+        Real s[N] = {};
+        for (int d = 0; d < D; ++d)
+            for (int up = 0; up < 2; ++up)
+            {
+                const IV cc = up ? c + unit(d) : c - unit(d);
+                const bool in = inside(g, cc);
+                const auto An = in ? tensor(cc) : Ac;
+                const Real w = 1.0/(g.dx[d]*g.dx[d]);
+                for (int r = 0; r < N; ++r)
+                {
+                    Real f = 0.0;
+                    for (int q = 0; q < N; ++q)
+                    {
+                        const int e = ((r*N + q)*D + d)*D + d;
+                        const Real t = in ? 0.5*(Ac(e, 0) + An(e, 0)) : Ac(e, 0);
+                        f += t*((in ? x[bx](cc, q) : xg[bx](cc, q)) - x[bx](c, q));
+                    }
+                    s[r] += f*w;
+                }
+            }
+        for (int r = 0; r < N && r < nq; ++r) o[bx](c, r) = s[r];
+    });
+    return out;
+}
+
+// Newton on a global residual R (x -> R, same shape), ``implicit()`` tol /
+// maxiter on ||R||_2; each update a linsolve on the Jacobian action by a
+// directional difference (Jacobian-free Newton-Krylov; JAX: the exact jvp)
+template<class F>
+Field newton_krylov(F R, Field x)
+{
+    const auto& o = implicit();
+    Field r = R(x);
+    int it = 0;
+    for (; it < o.maxiter && norm2(r) > o.tol; ++it)
+    {
+        const Field x0 = x, r0 = r;
+        const double nx = norm2(x0);
+        auto J = [&R, x0, r0, nx](const Field& v) -> Field
+        {
+            const double nv = norm2(v);
+            if (!(nv > 0.0)) return Field(0.0*v);
+            const double h = std::sqrt(std::numeric_limits<double>::epsilon())*(1.0 + nx)/nv;
+            return Field((R(Field(x0 + h*v)) - r0)/h);
+        };
+        x = Field(x0 + linsolve(J, Field(-r0)));
+        r = R(x);
+    }
+    static bool warned = false;
+    if (norm2(r) > o.tol && !warned)
+    {
+        warned = true;
+        amrex::Print() << "newton_krylov: not converged after " << it
+                       << " Newton updates, ||R|| = " << norm2(r) << " (warned once)\n";
+    }
+    return x;
+}
+
+// one Crank-Nicolson step of ``diffusion`` from ``time`` to ``time + dt``:
+// R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, the ghosts of Q at ``time``, of X
+// at ``time + dt``, A at X (Qaux frozen)
+template<class K, class G, class P, class T, class S>
+Field implicit_diffusion(K kn, G ghost, const Field& Q, const Field& A, const P& p,
+                         T time_, S dt_, const Mesh& M)
+{
+    BL_PROFILE("zs::implicit_diffusion");
+    const Real time = time_, dt = dt_;
+    const Field b = Q + 0.5*dt*diffusion(kn, ghost, Q, A, p, time, M);
+    auto R = [&](const Field& X) -> Field
+    { return X - b - 0.5*dt*diffusion(kn, ghost, X, A, p, time + dt, M); };
+    return halo(newton_krylov(R, Q), M);
 }
 
 // ── control ─────────────────────────────────────────────────────────────────
