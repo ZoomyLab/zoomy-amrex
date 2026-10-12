@@ -9,7 +9,8 @@ AMReX syntax: ``AMREX_GPU_HOST_DEVICE`` call operators on
 ``ParallelFor``.  Every kernel of a family takes the family's full argument
 list (the runtime calls all of them alike); it ignores what it does not
 declare.  ``family`` / ``n_out`` / ``n_in`` / ``n_aux`` tell the runtime the
-shapes at compile time.
+shapes at compile time.  The ghost kernel's ``boundary_data`` is the BC's
+input state ``Q`` (the template default: no coupling data).
 """
 import re
 
@@ -33,6 +34,7 @@ _KEYS = {           # family -> its full argument list (group keys)
 _NAME = {"variables": "Q", "aux_variables": "Qaux", "parameters": "p",
          "p": "p", "normal": "n", "position": "X", "time": "time", "dt": "dt",
          "distance": "dX", "idx": "bc_idx", "reconstruction": "W",
+         "boundary_data": "Q",
          "q_minus": "Q_minus", "q_plus": "Q_plus", "aux_minus": "Qaux_minus",
          "aux_plus": "Qaux_plus", "Q": "Q", "Qaux": "Qaux", "n": "n"}
 _SCALAR = {"time", "dt", "distance"}
@@ -125,7 +127,6 @@ def write_kernels(systems, source, path, dimension):
         if len(nsm.parameters.keys()) != n_par:
             raise ValueError(f"{name}: {len(nsm.parameters.keys())} parameters, "
                              f"the first system {n_par}: one p for all systems")
-        functions = {f.name: f for f in _functions(nsm)}
         tags = list(getattr(getattr(nsm, "_bc_source", None),
                             "list_sorted_function_names", []) or [])
         pv = nsm.parameter_values
@@ -156,20 +157,13 @@ def write_kernels(systems, source, path, dimension):
             elif call[k] is None:
                 raise ValueError(f"{name}.{k} is used but empty")
             else:
-                out.append(pr.kernel(functions[k], sizes))
+                out.append(pr.kernel(call[k].functions[k], sizes))
         out += ["};", f"inline constexpr {name}_t {name}{{}};", ""]
     out += [f"using System = {systems[0][0]}_t;",
             f"inline constexpr const System& sys = {systems[0][0]};",
             "} // namespace zs", ""]
     path.write_text("\n".join(out))
     return path
-
-
-def _functions(nsm):
-    from zoomy_core.systemmodel.system_model import OPERATOR_ARG_SLOTS
-    fs = [nsm.operator(n) for n in OPERATOR_ARG_SLOTS]
-    fs += [nsm.boundary_conditions, *nsm.build_numerics().functions.values()]
-    return [f for f in fs if f is not None]
 
 
 def _axes(multi_index):

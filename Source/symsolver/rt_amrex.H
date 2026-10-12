@@ -16,9 +16,12 @@
 
     Faces follow the unstructured convention of the JAX/foam runtimes: an
     interior face is owned by its lower cell, normal +e_d; a boundary face by
-    its inner cell, normal outward.  A boundary value (Qb, Wb) lives in the
-    out-of-domain ghost cell across its face.  A periodic direction has no
-    boundary faces: its ghost cells are the partner cells (FillBoundary).
+    its inner cell, normal outward.  A boundary GHOST (Qg, Wg: the BC's ghost
+    kernel, the value at the mirror image of the inner cell centre) lives in
+    the out-of-domain ghost cell across its face; the Riemann problem's outer
+    state is the BC's FACE kernel of the inner trace (boundary_traces).  A
+    periodic direction has no boundary faces: its ghost cells are the partner
+    cells (FillBoundary).
 
     Every loop is an amrex::ParallelFor (CPU or GPU); reductions are
     ParReduce + ParallelDescriptor; the linear solve is amrex::GMRES.
@@ -925,10 +928,11 @@ bool boundary_ghost(const Geo& g, const IV& c, int& d, int& side, IV& in)
     return n == 1 && inside(g, in);
 }
 
-// the BC kernel's state in every out-of-domain ghost cell across a face, from
-// the inner cell and its aux
+// the ghost kernel's value in every out-of-domain ghost cell across a face,
+// from the inner cell and its aux (Cartesian: the foot of the perpendicular
+// is the face centre, the normal distance h/2)
 template<class K, class P, class T>
-Field bc_cells(K bc, const Field& Q, const Field& A, const P& p, T time_, const Mesh& M)
+Field bc_cells(K ghost, const Field& Q, const Field& A, const P& p, T time_, const Mesh& M)
 {
     BL_PROFILE("zs::bc_cells");
     Field out = cells_of(M, Q.nq);
@@ -949,9 +953,9 @@ Field bc_cells(K bc, const Field& Q, const Field& A, const P& p, T time_, const 
         const IV fc = (side & 1) ? c : in;                // the face index
         Real n[3] = {0.0, 0.0, 0.0};
         n[d] = (side & 1) ? 1.0 : -1.0;
-        const auto v = bc(g.branch[side], time, face_centre(g, d, fc), 0.5*g.dx[d],
-                          col<K::n_in>(q[bx], in, nq), col<K::n_aux>(a[bx], in, na), p,
-                          normal<K::n_nrm>(n));
+        const auto v = ghost(g.branch[side], time, face_centre(g, d, fc), 0.5*g.dx[d],
+                             col<K::n_in>(q[bx], in, nq), col<K::n_aux>(a[bx], in, na), p,
+                             normal<K::n_nrm>(n));
         for (int m = 0; m < K::n_out && m < nq; ++m) o[bx](c, m) = v(m, 0);
     });
     return out;
@@ -978,20 +982,21 @@ inline Field inner_cells(const Field& A, const Mesh& M)
 }
 
 template<class K, class P, class T>
-Field boundary_ghosts(K bc, const Field& Q, const Field& A, const P& p, T time,
+Field boundary_ghosts(K ghost, const Field& Q, const Field& A, const P& p, T time,
                       const Mesh& M)
 {
-    return bc_cells(bc, Q, A, p, time, M);
+    return bc_cells(ghost, Q, A, p, time, M);
 }
 
 template<int N = 2, class K, class P, class T>
-std::tuple<Field, Field> boundary_states(K bc, const Field& Q, const Field& A,
+std::tuple<Field, Field> boundary_states(K ghost, const Field& Q, const Field& A,
                                          const P& p, T time, const Mesh& M)
 {
-    return {bc_cells(bc, Q, A, p, time, M), inner_cells(A, M)};
+    return {bc_cells(ghost, Q, A, p, time, M), inner_cells(A, M)};
 }
 
-// QR with BC(QL) on the boundary faces
+// QR with the BC's outer face state bc(QL) on the boundary faces (the face
+// kernel, at the face centre)
 template<class K, class P, class T>
 Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
                       const Field& A, const P& p, T time_, const Mesh& M)
@@ -1028,9 +1033,10 @@ Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
 }
 
 // ── reconstruction and assembly ─────────────────────────────────────────────
-// owner and other cell value per face; the boundary value on a boundary face
-template<class X, class Y>
-std::tuple<Field, Field> cell_traces_of(const X& Q, const Y& Qb, const Mesh& M)
+// owner and other cell value per face; a boundary face's outer slot holds
+// the inner value until boundary_traces sets the BC's face state
+template<class X>
+std::tuple<Field, Field> cell_traces_of(const X& Q, const Mesh& M)
 {
     BL_PROFILE("zs::cell_traces");
     Field L = faces_of(M, Q.nq), R = faces_of(M, Q.nq);
@@ -1038,7 +1044,6 @@ std::tuple<Field, Field> cell_traces_of(const X& Q, const Y& Qb, const Mesh& M)
     for (int d = 0; d < D; ++d)
     {
         const auto q = Q.dev(0);
-        const auto b = Qb.dev(0);
         auto l = L[d].arrays();
         auto r = R[d].arrays();
         amrex::ParallelFor(L[d], IV(0), Q.nq,
@@ -1047,28 +1052,28 @@ std::tuple<Field, Field> cell_traces_of(const X& Q, const Y& Qb, const Mesh& M)
             ZS_CELL;
             const FaceInfo f = face_info(g, d, c);
             l[bx](c, n) = q(bx, f.o, n);
-            r[bx](c, n) = f.bnd ? b(bx, f.x, n) : q(bx, f.x, n);
+            r[bx](c, n) = q(bx, f.bnd ? f.o : f.x, n);
         });
     }
     return {L, R};
 }
-template<class X, class Y>
-std::tuple<Field, Field> cell_traces(const X& Q, const Y& Qb, const Mesh& M)
+template<class X>
+std::tuple<Field, Field> cell_traces(const X& Q, const Mesh& M)
 {
-    if (Q.ngv >= 1) return cell_traces_of(Q, Qb, M);   // an expression: read lazily
-    return cell_traces_of(need(Field(Q), 1, M), Qb, M);
+    if (Q.ngv >= 1) return cell_traces_of(Q, M);   // an expression: read lazily
+    return cell_traces_of(need(Field(Q), 1, M), M);
 }
-inline std::tuple<Field, Field> cell_traces(const Field& Q, const Field& Qb, const Mesh& M)
+inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
 {
-    return cell_traces_of(DLeafless{need(Q, 1, M)}, DLeafless{Qb}, M);
+    return cell_traces_of(DLeafless{need(Q, 1, M)}, M);
 }
 
 // LSQ fit of row ``n`` at cell c, monomial ``m``: sum_s w_s,m delta_s.  A
-// boundary sample's delta: ghost(n) - u_c with ghost = Wb (``mode`` 0), the
-// face value 2 Qb - Q_inner (1), or u_c itself (2: no boundary value)
+// boundary sample (at the mirror image of the cell centre) carries
+// ug(n) - u_c, ug the ghost (``ghost``), else no change
 template<class A, class B>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Real lsq(const Geo& g, const A& u, const B& ub, int mode, const IV& c, int n, int m)
+Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, int m)
 {
     if (m < 0) return 0.0;
     IV cw = c;                          // c in the domain (a periodic image wrapped)
@@ -1084,42 +1089,33 @@ Real lsq(const Geo& g, const A& u, const B& ub, int mode, const IV& c, int n, in
     for (int t = g.off[cl]; t < g.off[cl + 1]; ++t)
     {
         const int kind = g.smp[4*t];
-        IV cc = c, in = c;
-        for (int a = 0; a < D; ++a)
-        {
-            const int o = g.smp[4*t + 1 + a], tw = cw[a] + o;
-            cc[a] += o;
-            // the face's inner cell (a boundary sample): clamped in the domain
-            in[a] = c[a] + (tw < g.lo[a] ? g.lo[a] : (tw > g.hi[a] ? g.hi[a] : tw)) - cw[a];
-        }
-        Real delta;
-        if (kind == 0) delta = u(cc, n) - uc;
-        else if (mode == 0) delta = ub(cc, n) - uc;
-        else if (mode == 1) delta = 2.0*ub(cc, n) - u(in, n) - uc;
-        else delta = 0.0;
+        IV cc = c;
+        for (int a = 0; a < D; ++a) cc[a] += g.smp[4*t + 1 + a];
+        const Real delta = kind == 0 ? u(cc, n) - uc : (ghost ? ug(cc, n) - uc : 0.0);
         s += g.w[t*g.nmon + m]*delta;
     }
     return s;
 }
 
-// LSQ gradient of every row (row D q + a: d/dx_a of row q)
-inline Field gradient(const Field& W_, const Field& Wb, const Mesh& M)
+// LSQ gradient of every row (row D q + a: d/dx_a of row q); boundary
+// samples: the ghosts Wg
+inline Field gradient(const Field& W_, const Field& Wg, const Mesh& M)
 {
     BL_PROFILE("zs::gradient");
     const Field W = need(W_, M.R, M);
     Field G = cells_of(M, D*W.nq);
-    const int gr = std::max(0, std::min(W.ngv, Wb.ngv) - M.R);
+    const int gr = std::max(0, std::min(W.ngv, Wg.ngv) - M.R);
     G.ngv = gr;
     const Geo g = M.g;
     auto o = G[0].arrays();
     auto w = W[0].const_arrays();
-    auto wb = Wb[0].const_arrays();
+    auto wg = Wg[0].const_arrays();
     amrex::ParallelFor(G[0], IV(gr), W.nq,
         [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
     {
         ZS_CELL;
         if (!inside(g, c)) return;
-        for (int a = 0; a < D; ++a) o[bx](c, D*n + a) = lsq(g, w[bx], wb[bx], 0, c, n, g.gmon[a]);
+        for (int a = 0; a < D; ++a) o[bx](c, D*n + a) = lsq(g, w[bx], wg[bx], true, c, n, g.gmon[a]);
     });
     return G;
 }
@@ -1145,14 +1141,14 @@ Real limit(Limiter L, Real delta, Real dmin, Real dmax, Real ev2)
 }
 
 // Limiter factors of ``rows``, 1 elsewhere; bounds from the face neighbours
-// and the boundary ghosts Wb (at the ghost position, as in gradient)
-inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Field& Wb,
+// and the boundary ghosts Wg (at the ghost position, as in gradient)
+inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Field& Wg,
                              const Field& G, const Mesh& M)
 {
     BL_PROFILE("zs::limiter_factors");
     const Field W = need(W_, 1, M);
     Field phi = cells_of(M, W.nq);
-    const int gr = std::max(0, std::min({W.ngv - 1, G.ngv, Wb.ngv}));
+    const int gr = std::max(0, std::min({W.ngv - 1, G.ngv, Wg.ngv}));
     phi.ngv = gr;
     const Geo g = M.g;
     Real vol = 1.0;
@@ -1160,7 +1156,7 @@ inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Fie
     const Real ev2 = std::pow(vol, 2.0/D);              // (V^(1/d))^2
     auto o = phi[0].arrays();
     auto w = W[0].const_arrays();
-    auto wb = Wb[0].const_arrays();
+    auto wg = Wg[0].const_arrays();
     auto gg = G[0].const_arrays();
     amrex::ParallelFor(phi[0], IV(gr), W.nq,
         [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
@@ -1175,8 +1171,8 @@ inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Fie
         {
             IV cc = c;
             cc[f/2] += (f & 1) ? 1 : -1;
-            // a boundary ghost holds Wb; a periodic one the partner cell
-            const Real v = inside(g, cc) ? w[bx](cc, n) : wb[bx](cc, n);
+            // a boundary ghost holds Wg; a periodic one the partner cell
+            const Real v = inside(g, cc) ? w[bx](cc, n) : wg[bx](cc, n);
             lo = v < lo ? v : lo;
             hi = v > hi ? v : hi;
         }
@@ -1193,29 +1189,29 @@ inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Fie
     return phi;
 }
 template<class... I>
-Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wb,
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
              const Field& G, const Mesh& M)
-{ return limiter_factors(Limiter::minmod, rows_of(rows), W, Wb, G, M); }
+{ return limiter_factors(Limiter::minmod, rows_of(rows), W, Wg, G, M); }
 template<class... I>
-Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wb,
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
                       const Field& G, const Mesh& M)
-{ return limiter_factors(Limiter::venkatakrishnan, rows_of(rows), W, Wb, G, M); }
+{ return limiter_factors(Limiter::venkatakrishnan, rows_of(rows), W, Wg, G, M); }
 template<class... I>
-Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wb,
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
                       const Field& G, const Mesh& M)
-{ return limiter_factors(Limiter::barth_jespersen, rows_of(rows), W, Wb, G, M); }
+{ return limiter_factors(Limiter::barth_jespersen, rows_of(rows), W, Wg, G, M); }
 
-// each cell's W moved to the face centre by phi G; Wb on the boundary faces
+// each cell's W moved to the face centre by phi G; a boundary face's outer
+// slot holds the inner trace until boundary_traces sets the BC's face state
 template<class P>
-std::tuple<Field, Field> extrapolate(const Field& W_, const Field& Wb, const Field& G_,
-                                     const P& phi_, const Mesh& M)
+std::tuple<Field, Field> extrapolate(const Field& W_, const Field& G_, const P& phi_,
+                                     const Mesh& M)
 {
     BL_PROFILE("zs::extrapolate");
     const Field W = need(W_, 1, M), G = need(G_, 1, M);
     Field L = faces_of(M, W.nq), R = faces_of(M, W.nq);
     const Geo g = M.g;
     auto w = W[0].const_arrays();
-    auto wb = Wb[0].const_arrays();
     auto gg = G[0].const_arrays();
     Src phi;
     Field keep;                         // phi's storage lives through the launches
@@ -1237,7 +1233,7 @@ std::tuple<Field, Field> extrapolate(const Field& W_, const Field& Wb, const Fie
                 return w[bx](cc, n) + phi(bx, cc, n)*gg[bx](cc, D*n + d)*s;
             };
             l[bx](c, n) = val(f.o);
-            r[bx](c, n) = f.bnd ? wb[bx](f.x, n) : val(f.x);
+            r[bx](c, n) = val(f.bnd ? f.o : f.x);
         });
     }
     return {L, R};
@@ -1310,26 +1306,26 @@ Field edge_source(K kn, const Field& Q, const Field& QL, const Field& QR,
 
 // ── whole-domain operations ─────────────────────────────────────────────────
 // Qaux with the derivative rows of ``spec`` from the LSQ fit; boundary
-// samples carry no change (no Qb) or the face value 2 Qb - Q (with Qb, only
-// the derivatives of state ``rows``)
+// samples carry no change (no Qg) or the ghost Qg (with Qg, only the
+// derivatives of state ``rows``)
 template<class S>
 Field derivative_aux_impl(const S& spec, const Field& Q_, const Field& Qaux,
-                          const Mesh& M, const Field* Qb, const Rows rows)
+                          const Mesh& M, const Field* Qg, const Rows rows)
 {
     BL_PROFILE("zs::derivative_aux_impl");
     const Field Q = need(Q_, M.R, M);
-    const int gr = std::max(0, std::min(Q.ngv, Qb ? Qb->ngv : Q.ngv) - M.R);
+    const int gr = std::max(0, std::min(Q.ngv, Qg ? Qg->ngv : Q.ngv) - M.R);
     Field out = like(Qaux, Qaux.nq);
     out.ngv = std::min(Qaux.ngv, gr);
     amrex::MultiFab::Copy(out[0], Qaux[0], 0, 0, Qaux.nq, out.ng());
     const Geo g = M.g;
     auto o = out[0].arrays();
     auto q = Q[0].const_arrays();
-    auto qb = (Qb ? *Qb : Q)[0].const_arrays();
-    const int mode = Qb ? 1 : 2;
+    auto qg = (Qg ? *Qg : Q)[0].const_arrays();
+    const bool ghost = Qg != nullptr;
     for (const auto& e : spec)
     {
-        if (Qb)
+        if (Qg)
         {
             bool in = false;
             for (int m = 0; m < rows.n; ++m) in = in || rows.r[m] == e[1];
@@ -1343,7 +1339,7 @@ Field derivative_aux_impl(const S& spec, const Field& Q_, const Field& Qaux,
             [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
         {
             ZS_CELL;
-            if (inside(g, c)) o[bx](c, row) = lsq(g, q[bx], qb[bx], mode, c, s, mi);
+            if (inside(g, c)) o[bx](c, row) = lsq(g, q[bx], qg[bx], ghost, c, s, mi);
         });
     }
     return out;
@@ -1353,8 +1349,8 @@ Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mes
 { return derivative_aux_impl(spec, Q, Qaux, M, nullptr, Rows{}); }
 template<class S, class... I>
 Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mesh& M,
-                     const Field& Qb, const std::tuple<I...>& rows)
-{ return derivative_aux_impl(spec, Q, Qaux, M, &Qb, rows_of(rows)); }
+                     const Field& Qg, const std::tuple<I...>& rows)
+{ return derivative_aux_impl(spec, Q, Qaux, M, &Qg, rows_of(rows)); }
 
 // cell mask: an admissibility row < 0 or a non-finite value
 template<class K, class P>
