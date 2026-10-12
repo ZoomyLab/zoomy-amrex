@@ -902,12 +902,14 @@ Field face_wavespeed(K kn, const Field& Q_, const Field& A_, const P& p, const M
     return out;
 }
 
-// per-face cell size: d |V| / |dV| of the (uniform) cells
+// per-face cell size: the inradius as zoomy_core's mesh defines it (the
+// shortest normal distance from the cell centre to a face plane), min dx / 2
+// of the (uniform) cells: one number
 inline Real face_inradius(const Mesh& M)
 {
-    Real s = 0.0;
-    for (int d = 0; d < D; ++d) s += 2.0/M.g.dx[d];   // |dV| / |V|
-    return D/s;                                         // uniform cells: one number
+    Real h = M.g.dx[0];
+    for (int d = 1; d < D; ++d) h = std::min(h, M.g.dx[d]);
+    return 0.5*h;
 }
 
 // ── boundary ────────────────────────────────────────────────────────────────
