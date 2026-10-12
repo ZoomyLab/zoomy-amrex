@@ -4,7 +4,7 @@
     solver = SymbolicHyperbolicSolverAmrex(time_end=0.5, gpu=True)      # CUDA
     time, Q = solver.run(mesh, nsm, Q0, workdir)        # Q in the mesh's order
 
-The printed host program (``Solver.H``, :mod:`zoomy_core.symsolver.program`:
+The printed host program (``Solver.H``, :mod:`zoomy_core.symsolver.backend_cxx`:
 the same text foam runs), the device kernels (``Kernels.H``,
 :mod:`zoomy_amrex.symkernels`) and the app (``Source/symsolver/symAmrex.cpp``
 + ``rt_amrex.H``) are compiled in the AMReX apptainer (GNU make, one build
@@ -24,14 +24,10 @@ from pathlib import Path
 
 import numpy as np
 import param
-import sympy as sp
 
 from zoomy_core.mesh import LSQMesh, ensure_lsq_mesh
 from zoomy_core.model.boundary_conditions import boundary_face_branches
-from zoomy_core.numerics import NumericalSystemModel
-from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
-from zoomy_core.symsolver.program import (chorin_program, chorin_systems, hyperbolic_program,
-                                          hyperbolic_precice_program)
+from zoomy_core.symsolver.backend_cxx import CxxBackend, CxxChorinBackend
 from zoomy_amrex.symkernels import write_kernels
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -57,23 +53,10 @@ def _apptainer(gpu, script, binds=(), **kw):
     return subprocess.run(cmd + [str(SIF[gpu]), "bash", "-c", script], **kw)
 
 
-class SymbolicHyperbolicSolverAmrex(param.Parameterized):
-    time_end = param.Number(default=None, allow_None=True)
-    cfl = param.Number(default=0.9, bounds=(0, None))
-    dt = param.Number(default=None, allow_None=True,
-                      doc="Constant time step; None = adaptive CFL step.")
-    cfl_check_every = param.Integer(default=10, bounds=(0, None))
-    cfl_wave_speed = param.Selector(default="faces", objects=["faces", "cells"])
-    mood = param.Boolean(default=True,
-                         doc="A-posteriori MOOD at order >= 2.")
-    dt_write = param.Number(default=None, allow_None=True,
-                            doc="Output interval (plotfiles); None = final state only.")
-    imex = param.Boolean(default=False)
-    implicit_tol = param.Number(default=1e-8, bounds=(0, None))
-    implicit_maxiter = param.Integer(default=6, bounds=(1, None))
-    gmres_tol = param.Number(default=1e-7, bounds=(0, None))
-    gmres_restart = param.Integer(default=20, bounds=(1, None))
-    gmres_maxiter = param.Integer(default=30, bounds=(1, None))
+class AmrexDriver(param.Parameterized):
+    """The AMReX runtime of a C++ solver backend (:mod:`zoomy_core.symsolver.backend_cxx`):
+    the build tree (GNU make in the container), the case (the Cartesian grid,
+    LSQ tables, inputs, AMR levels), the launch (``mpirun``) and the read-back."""
     ranks = param.Integer(default=1, bounds=(1, None), doc="MPI ranks (GPUs with gpu=True).")
     gpu = param.Boolean(default=False, doc="CUDA build (one GPU per rank).")
     max_grid_size = param.Integer(default=None, allow_None=True,
@@ -82,11 +65,6 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
                                  doc="AMReX TinyProfiler build (a tree of its own).")
     build_only = param.Boolean(default=False,
                                doc="run() only builds (and caches) the binary.")
-    couple = param.Dict(default=None, allow_None=True, doc=(
-        "preCICE (a ZS_PRECICE build, a container with libprecice): dict("
-        "participant=, config=, mesh=, write=[..], read=[..], tag=, side=); "
-        "side 0: this domain is the low side of the interface."))
-    subcycling = param.Boolean(default=False, doc="preCICE: adaptive steps inside a window.")
     amr = param.Dict(default=None, allow_None=True, doc=(
         "AMR (one dt for all levels; amr_amrex.H): max_level, ratio (2), "
         "regrid_int (0: the initial grids only), tag = (state name, 'value' | "
@@ -94,35 +72,8 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         "blocking_factor (8), n_error_buf (2), grid_eff (0.7).  The CFL step "
         "from the cells' wave speeds."))
 
-    # ── printing ───────────────────────────────────────────────────────────
-    def _systems(self, nsm):
-        return [("nsm", nsm)]
-
-    def _mood(self, nsm):
-        return bool(self.mood and nsm.reconstruction.order >= 2
-                    and nsm.call.admissible is not None)
-
-    def _linsolve(self, nsm):
-        return dict(tol=self.gmres_tol, restart=self.gmres_restart,
-                    maxiter=self.gmres_maxiter, accept=-1.0)
-
-    def _kw(self, nsm, dimension):
-        return dict(dimension=dimension, cfl=self.cfl, mood=self._mood(nsm),
-                    dt_write=self.dt_write, imex=self.imex,
-                    cfl_check_every=self.cfl_check_every,
-                    wave_speed=self.cfl_wave_speed, dt_constant=self.dt,
-                    implicit=dict(tol=self.implicit_tol, maxiter=self.implicit_maxiter),
-                    linsolve=self._linsolve(nsm))
-
-    def _print(self, nsm, dimension):
-        if self.couple:
-            return hyperbolic_precice_program(nsm, side=self.couple["side"],
-                                              subcycling=self.subcycling,
-                                              **self._kw(nsm, dimension))
-        return hyperbolic_program(nsm, amr=self.amr is not None, **self._kw(nsm, dimension))
-
-    def _degree(self, nsm):
-        return nsm.resolved_lsq_degree()
+    def _amr_loop(self):
+        return self.amr is not None
 
     # ── build ──────────────────────────────────────────────────────────────
     def build(self, nsm, dimension):
@@ -179,8 +130,7 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         ``Q`` is level 0 (the composite averaged down), ``self.initial`` its
         initial state, ``self.levels`` each level's final state (NaN where it
         has no cells; mesh_l order)."""
-        nsm = (model if isinstance(model, NumericalSystemModel)
-               else NumericalSystemModel.from_system_model(model))
+        nsm = self._prepare(mesh, model)
         grid = cartesian(mesh)
         dim = grid["dim"]
         binary = self.build(nsm, dim)
@@ -284,48 +234,18 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
                 f"geometry.is_periodic = {' '.join(map(str, periodic))}\n")
 
 
-class SymbolicChorinSolverAmrex(SymbolicHyperbolicSolverAmrex):
+class SymbolicHyperbolicSolverAmrex(AmrexDriver, CxxBackend):
+    """The explicit hyperbolic template on AMReX.
+
+        time, Q = SymbolicHyperbolicSolverAmrex(time_end=0.5).run(
+            mesh, nsm, Q0, workdir)"""
+
+
+class SymbolicChorinSolverAmrex(AmrexDriver, CxxChorinBackend):
     """The Chorin projection template on AMReX.
 
         time, Q = SymbolicChorinSolverAmrex(time_end=0.05).run(
             mesh, (pred, press, corr), Q0, workdir)"""
-    time_order = param.Integer(default=1, bounds=(1, 2))
-    pressure_tol = param.Number(default=ELLIPTIC_RTOL, bounds=(0, None))
-    pressure_maxit = param.Integer(default=100, bounds=(1, None))
-    pressure_restart = param.Integer(default=None, allow_None=True, bounds=(1, None))
-    pressure_solve = param.Selector(
-        default="linear", objects=["linear", "newton"],
-        doc="'linear': the constraint is affine in the pressure, one linear "
-            "solve.  'newton': a nonlinear constraint, Newton iterations.")
-    pressure_newton_tol = param.Number(default=1e-10, bounds=(0, None))
-    pressure_newton_maxit = param.Integer(default=10, bounds=(1, None))
-
-    def _systems(self, nsm):
-        return [("pred", nsm), ("press", self.press), ("corr", self.corr)]
-
-    def _linsolve(self, nsm):
-        n = len(self.press.equation_to_state_index) * self._nc
-        ell = elliptic_constants(n_unknowns=n, tol=self.pressure_tol,
-                                 restart=self.pressure_restart).values
-        tol = float(ell["c_elliptic_tol"])
-        return dict(tol=tol, restart=int(ell["c_elliptic_restart"]),
-                    maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol))
-
-    def _print(self, nsm, dimension):
-        if self.amr is not None:
-            raise NotImplementedError("AMR: the hyperbolic template only")
-        newton = (None if self.pressure_solve == "linear" else
-                  (sp.Float(self.pressure_newton_tol), int(self.pressure_newton_maxit)))
-        return chorin_program(nsm, self.press, self.corr, time_order=self.time_order,
-                              pressure_newton=newton, **self._kw(nsm, dimension))
-
-    def _degree(self, nsm):
-        return max(s.resolved_lsq_degree() for s in (nsm, self.press, self.corr))
-
-    def run(self, mesh, systems, Q0, workdir, Qaux0=None):
-        pred, self.press, self.corr = chorin_systems(*systems)
-        self._nc = int(mesh.n_inner_cells)
-        return super().run(mesh, pred, Q0, workdir, Qaux0)
 
 
 # ── the grid ────────────────────────────────────────────────────────────────
