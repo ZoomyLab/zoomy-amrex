@@ -96,6 +96,46 @@ amrex::Real eigenvalues(I idx_, Ts... a_flat_args) noexcept
     return static_cast<amrex::Real>(out[idx]);
 }
 
+// ── spectral_radius(k, safety, *A_flat) ───────────────────────────────────
+// safety * sqrt(rho(A^2)) of the row-major n x n A_flat, rho(A^2) by k power
+// steps on A^2 from x = 1/sqrt(n) (kernel_functions.spectral_radius; the
+// arithmetic of the JAX runtime's).  Matvecs only, the same on every device.
+template <typename K, typename S, typename... Ts>
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+amrex::Real spectral_radius(K k_, S safety, Ts... a_flat_args) noexcept
+{
+    constexpr int M = sizeof...(Ts);
+    constexpr int N = zoomy_eig::isqrt_ct(M);
+    static_assert(N * N == M, "spectral_radius(): flat argument count is not a perfect square");
+
+    const double A[M] = { static_cast<double>(a_flat_args)... };
+    double x[N], z[N];
+    for (int i = 0; i < N; ++i) x[i] = 1.0 / std::sqrt(double(N));
+    double lam = 0.0;
+    for (int s = 0; s < static_cast<int>(k_); ++s)
+    {
+        for (int i = 0; i < N; ++i)
+        {
+            double t = 0.0;
+            for (int j = 0; j < N; ++j) t += A[i*N + j]*x[j];
+            z[i] = t;
+        }
+        double ny = 0.0;
+        for (int i = 0; i < N; ++i)
+        {
+            double t = 0.0;
+            for (int j = 0; j < N; ++j) t += A[i*N + j]*z[j];
+            x[i] = t;
+            ny += t*t;
+        }
+        ny = std::sqrt(ny);
+        const double d = ny > 0.0 ? ny : 1.0;
+        for (int i = 0; i < N; ++i) x[i] /= d;
+        lam = ny;
+    }
+    return static_cast<amrex::Real>(static_cast<double>(safety)*std::sqrt(lam));
+}
+
 // ── eigensystem(idx, *A_flat) ─────────────────────────────────────────────
 // idx-th component of [ lambda(n) | R(n*n) row-major | L = R^-1 (n*n) ].
 // R's COLUMNS are the right eigenvectors (A R = R Lambda); L is an EXPLICIT
