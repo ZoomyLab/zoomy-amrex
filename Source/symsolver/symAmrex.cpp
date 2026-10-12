@@ -1,17 +1,6 @@
-/*---------------------------------------------------------------------------*\
-    symAmrex -- runs a printed symbolic solver (Solver.H) on a single-level
-    AMReX grid (rt_amrex.H, CPU / GPU / MPI), or with zs.amr = 1 on an AMR
-    hierarchy (amr_amrex.H); built with ZS_PRECICE, one preCICE participant
-    (zs.precice*, rt_amrex.H couple_setup).
-
-    inputs (ParmParse, prefix zs.):  n_cell, prob_lo, prob_hi, max_grid_size,
-    time_end, branch (BC branch of x-lo x-hi y-lo y-hi z-lo z-hi), periodic (per
-    direction), lsq (the LSQ table),
-    q0 / qaux0 (raw doubles, rows x ny x nx, x fastest), out (directory).
-    Writes every io.write snapshot as a plotfile <out>/plt<k> and a raw dump
-    <out>/<k>.bin, the final state as <out>/final.bin: (time, rows, nx, ny,
-    data) as doubles, gathered on rank 0.
-\*---------------------------------------------------------------------------*/
+/// \file
+/// symAmrex: runs a printed symbolic solver (Solver.H) on a single-level AMReX grid (rt_amrex.H; CPU / GPU / MPI), or with zs.amr = 1 on an AMR hierarchy (amr_amrex.H), optionally as one preCICE participant.
+/// Inputs are the ParmParse zs.* keys (n_cell, prob_lo / prob_hi, branch, periodic, lsq, q0 / qaux0, out); it writes each io.write snapshot as plotfile plt<k> and raw dump <k>.bin, and the final state as final.bin.
 #include <AMReX.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_PlotFileUtil.H>
@@ -30,7 +19,7 @@ namespace zs
 
 namespace
 {
-// the flat index of cell c, row n in the driver's raw files (x fastest)
+/// Flat index of cell c, row n in the driver's raw files (x fastest).
 size_t flat(const amrex::Box& dom, const amrex::IntVect& c, int n)
 {
     size_t idx = size_t(n);
@@ -38,6 +27,7 @@ size_t flat(const amrex::Box& dom, const amrex::IntVect& c, int n)
     return idx;
 }
 
+/// Read a raw-double file (rows x ny x nx, x fastest; an empty path gives zeros) into the cell Field F and fill its halo.
 void load(const std::string& path, zs::Field& F, const zs::Mesh& M)
 {
     const amrex::Box dom = M.geom.Domain();
@@ -66,7 +56,7 @@ void load(const std::string& path, zs::Field& F, const zs::Mesh& M)
     F = zs::halo(F, M);
 }
 
-// time, rows, the D cell counts, then the rows (x fastest), on rank 0
+/// Write (time, rows, the D cell counts, then the rows with x fastest) as doubles gathered on rank 0 (NaN where a level lacks cells).
 void dump(const std::string& path, double time, const zs::Field& F, const zs::Mesh& M)
 {
     const amrex::Box dom = M.geom.Domain();
@@ -91,6 +81,7 @@ void dump(const std::string& path, double time, const zs::Field& F, const zs::Me
 #include "amr_amrex.H"
 #endif
 
+/// Entry point: read the zs.* inputs, build the mesh, run the printed march (single level, or run_amr), write the snapshots and the final state.
 int main(int argc, char* argv[])
 {
     amrex::Initialize(argc, argv);

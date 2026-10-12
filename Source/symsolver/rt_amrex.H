@@ -1,32 +1,8 @@
 #pragma once
-/*---------------------------------------------------------------------------*\
-    rt_amrex.H -- the AMReX runtime of the symbolic solvers: what every name
-    in the printed C++ (zoomy_core.symsolver.CxxPrinter, the text foam runs)
-    means on a single-level AMReX grid (Cartesian, 1-, 2- or 3-D: the build's
-    AMREX_SPACEDIM is the model's dimension).
-
-    Values: a Field is rows x (cells | faces) on the grid's BoxArray -- cells:
-    one MultiFab with NG ghost cells; faces: one face-centred MultiFab per
-    direction (the faces of each box's valid cells).  Fields are immutable
-    after the block that makes them (shared storage, value semantics).
-    ``ngv``: how many ghost layers hold valid data.  Pointwise blocks compute
-    on the whole fab (ngv = min of the inputs), stencil blocks shrink it,
-    ``halo`` (FillBoundary) restores it; a stencil block whose input is too
-    thin exchanges it itself.
-
-    Faces follow the unstructured convention of the JAX/foam runtimes: an
-    interior face is owned by its lower cell, normal +e_d; a boundary face by
-    its inner cell, normal outward.  A boundary GHOST (Qg, Wg: the BC's ghost
-    kernel, the value at the mirror image of the inner cell centre) lives in
-    the out-of-domain ghost cell across its face; the Riemann problem's outer
-    state is the BC's FACE kernel of the inner trace (boundary_traces).  A
-    periodic direction has no boundary faces: its ghost cells are the partner
-    cells (FillBoundary).
-
-    Every loop is an amrex::ParallelFor (CPU or GPU); reductions are
-    ParReduce + ParallelDescriptor; the linear solve is amrex::GMRES.  What
-    every C++ runtime shares is zoomy_core's rt_common.H.
-\*---------------------------------------------------------------------------*/
+/// \file
+/// The AMReX runtime of the symbolic solvers: what every name in the printed C++ (zoomy_core.symsolver.CxxPrinter) means on a single-level Cartesian AMReX grid of dimension AMREX_SPACEDIM.
+/// Loops are amrex::ParallelFor, reductions ParReduce, the linear solve amrex::GMRES; what all C++ runtimes share is zoomy_core's rt_common.H.
+/// Ref: Zhang et al. 2019, https://doi.org/10.21105/joss.01370
 #include <AMReX.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_GMRES.H>
@@ -57,13 +33,16 @@ namespace zs
 using amrex::Real;
 using amrex::IntVect;
 using IV = amrex::IntVect;
+/// Spatial dimension of the build (the model's dimension).
 constexpr int D = AMREX_SPACEDIM;
+/// An N-column of Real (a static matrix, usable in device code).
 template<int N> using Col = amrex::SmallMatrix<Real, (N > 0 ? N : 1), 1>;
 constexpr int MAXR = 16;      // most rows a static row list carries
 
-// the cell of a ParallelFor iteration
+/// Declare IV c, the cell of the current ParallelFor iteration.
 #define ZS_CELL IV c(AMREX_D_DECL(i, j, k))
 
+/// Unit IntVect e_d.
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE IV unit(int d)
 {
     IV u(0);
@@ -71,18 +50,11 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE IV unit(int d)
     return u;
 }
 
+/// Print a warning (amrex::Print: I/O rank only).
 inline void warn(const std::string& message) { amrex::Print() << "warning: " << message << "\n"; }
 
 // ── mesh ────────────────────────────────────────────────────────────────────
-// Geo: what a device loop needs (trivially copyable).  LSQ: per cell class
-// (the class of each index along each axis, combined) a list of samples
-// (kind 0: the cell at c + offset, kind 1: the boundary value in the ghost
-// cell c + offset) and their weights per monomial -- the zoomy mesh's
-// lsq_gradQ * lsq_scale_factors.  Boundary closure (ANALYSIS 41): each cell
-// class has 1 + ncl lists, the base fit and one per closure class (the
-// constrained fits, lsq_closure * lsq_scale_factors; an inactive class repeats
-// the base list); ``off`` holds (begin, end) of every list; ``rcl`` = the
-// closure class of each row of the reconstruction variables W.
+/// Geo: what a device loop needs (trivially copyable): domain box, periodicity, spacing, BC branch per side, and the LSQ tables (per-class sample lists, weights per monomial, closure classes).
 struct Geo
 {
     int lo[3], hi[3], per[3];
@@ -95,6 +67,7 @@ struct Geo
 };
 
 struct Field;
+/// Mesh: the grid (Geometry, BoxArray, DistributionMapping, NG ghost cells, LSQ radius R), the AMR hooks (halo fill, refluxing log) and the LSQ tables behind Geo.
 struct Mesh
 {
     amrex::Geometry geom;
@@ -110,7 +83,7 @@ struct Mesh
     amrex::Gpu::DeviceVector<Real> w;
     Geo g{};
 
-    // the LSQ table written by the driver (zoomy_amrex.symsolver.lsq_table)
+    /// Read the LSQ table written by the driver (zoomy_amrex.symsolver.lsq_table) into Geo.
     void load(const std::string& path, const int branch[6])
     {
         std::ifstream f(path);
@@ -175,6 +148,7 @@ struct Mesh
         g.nmon = nmon; g.ncl = ncl; g.nrcl = nrc;
         g.off = off.data(); g.smp = smp.data(); g.w = w.data(); g.rcl = rcl.data();
     }
+    /// Index of the monomial x^a y^b z^c in the LSQ table, or -1.
     int monomial(int a, int b, int c) const
     {
         for (int k = 0; k < int(mon.size()); ++k)
@@ -184,7 +158,7 @@ struct Mesh
 };
 
 // ── device geometry helpers ─────────────────────────────────────────────────
-// a cell of the domain: inside it, or across a periodic side (the partner)
+/// True if cell c lies in the domain or across a periodic side (its partner cell).
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 bool inside(const Geo& g, const IV& c)
 {
@@ -193,9 +167,9 @@ bool inside(const Geo& g, const IV& c)
     return true;
 }
 
-// face c of direction d (between cells c - e_d and c): owner, the other cell
-// (out of the domain on a boundary face), outward normal of the owner
+/// Face c of direction d (between cells c - e_d and c): its owner (the lower cell; the inner cell on a boundary face), the other cell, a boundary flag and the owner's outward normal.
 struct FaceInfo { IV o, x; bool bnd; Real n[3]; };
+/// The FaceInfo of face c of direction d (unstructured convention of the JAX/foam runtimes).
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 FaceInfo face_info(const Geo& g, int d, const IV& c)
 {
@@ -210,6 +184,7 @@ FaceInfo face_info(const Geo& g, int d, const IV& c)
     return f;
 }
 
+/// Centre of cell c.
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Col<3> cell_centre(const Geo& g, const IV& c)
 {
@@ -218,6 +193,7 @@ Col<3> cell_centre(const Geo& g, const IV& c)
     return X;
 }
 
+/// Centre of face c of direction d (the face between cells c - e_d and c).
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Col<3> face_centre(const Geo& g, int d, const IV& c)
 {
@@ -226,6 +202,7 @@ Col<3> face_centre(const Geo& g, int d, const IV& c)
     return X;
 }
 
+/// The first N components of s * v as a column.
 template<int N>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Col<N> normal(const Real (&v)[3], Real s = 1.0)
@@ -235,6 +212,7 @@ Col<N> normal(const Real (&v)[3], Real s = 1.0)
     return n;
 }
 
+/// The first min(N, nq) rows of a at cell c as a column.
 template<int N, class A>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Col<N> col(const A& a, const IV& c, int nq)
@@ -245,7 +223,7 @@ Col<N> col(const A& a, const IV& c, int nq)
 }
 
 // ── fields ──────────────────────────────────────────────────────────────────
-// entry (cell c, row n) of a field in a device loop (one row broadcasts)
+/// Device view of a Field: entry (cell c, row n) in box bx; a one-row field broadcasts.
 struct DLeaf
 {
     amrex::MultiArray4<Real const> a;
@@ -254,6 +232,7 @@ struct DLeaf
     { return a[bx](c, nq == 1 ? 0 : n); }
 };
 
+/// A Field: nq rows over the cells (one MultiFab with ghosts) or the faces (one MultiFab per direction); ngv = ghost layers holding valid data. Immutable once built (shared storage).
 struct Field
 {
     int nq = 0;
@@ -261,25 +240,31 @@ struct Field
     int ngv = 0;
     std::shared_ptr<std::vector<amrex::MultiFab>> mf;
     std::shared_ptr<void> keep;        // the parent of an alias
+    /// The MultiFab of direction d (0 for cells).
     amrex::MultiFab& operator[](int d) const { return (*mf)[d]; }
+    /// Number of MultiFabs: D for faces, 1 for cells.
     int ncomp() const { return face ? D : 1; }
+    /// Ghost layers allocated.
     int ng() const { return face ? 0 : (*mf)[0].nGrow(); }
+    /// Device view of the MultiFab d.
     DLeaf dev(int d) const { return {(*mf)[d].const_arrays(), nq}; }
+    /// Itself, as the shape of an expression.
     const Field& shape() const { return *this; }
 };
 
-// Storage is recycled: a dead Field's MultiFabs go to a pool and the next
-// Field of the same shape takes them (no allocation, and no upload of the
-// device table of Array4s: FabArray::arrays() builds it once per MultiFab
-// with a blocking copy).  close_pool() empties it before amrex::Finalize.
+/// Storage is recycled: a dead Field's MultiFabs go to a pool and the next Field of the same shape takes them (no allocation, no blocking Array4-table upload); close_pool() empties it before amrex::Finalize.
 using MFs = std::vector<amrex::MultiFab>;
+/// A pooled MultiFab set with the BoxArray and mapping it was made for.
 struct Pooled { MFs* mf; amrex::BoxArray ba; amrex::DistributionMapping dm; };
+/// The free sets, keyed by (rows, face, ghosts).
 inline std::map<std::tuple<int, bool, int>, std::vector<Pooled>>& pool()
 {
     static auto* p = new std::map<std::tuple<int, bool, int>, std::vector<Pooled>>();
     return *p;
 }
+/// False once close_pool() has run (later frees delete instead of pooling).
 inline bool& pool_open() { static bool o = true; return o; }
+/// Empty the pool; call before amrex::Finalize.
 inline void close_pool()
 {
     pool_open() = false;
@@ -288,6 +273,7 @@ inline void close_pool()
     pool().clear();
 }
 
+/// A Field of nq rows on (ba, dm), reusing a pooled MultiFab set when one of that shape is free.
 inline Field make_like(const amrex::BoxArray& ba, const amrex::DistributionMapping& dm,
                        int nq, bool face, int ng)
 {
@@ -323,8 +309,11 @@ inline Field make_like(const amrex::BoxArray& ba, const amrex::DistributionMappi
     });
     return F;
 }
+/// A cell Field of nq rows on the mesh's grid.
 inline Field cells_of(const Mesh& M, int nq) { return make_like(M.ba, M.dm, nq, false, M.NG); }
+/// A face Field of nq rows on the mesh's grid.
 inline Field faces_of(const Mesh& M, int nq) { return make_like(M.ba, M.dm, nq, true, 0); }
+/// A Field of nq rows with the layout of a.
 inline Field like(const Field& a, int nq)
 {
     const amrex::MultiFab& m = a[0];
@@ -334,7 +323,7 @@ inline Field like(const Field& a, int nq)
     return F;
 }
 
-// rows ``first .. first + n`` of F, no copy
+/// Rows first .. first + n of F as an alias (no copy).
 inline Field rows_alias(const Field& F, int first, int n)
 {
     Field A;
@@ -345,43 +334,47 @@ inline Field rows_alias(const Field& F, int first, int n)
 }
 
 // ── elementwise arithmetic (rt_common.H's functors; one row broadcasts) ─────
-// Field arithmetic is lazy: it builds an expression, evaluated by one
-// ParallelFor where a block takes it as a Field (eval) or where a reduction
-// reads it -- no kernel and no temporary per operator.
+/// Device leaf: the number s at every entry.
 struct DNum
 {
     Real s;
     AMREX_GPU_HOST_DEVICE Real operator()(int, const IV&, int) const { return s; }
 };
+/// Device node: op applied to the entries of a and b.
 template<class Op, class A, class B> struct DBin
 {
     Op op; A a; B b;
     AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
     { return op(a(bx, c, n), b(bx, c, n)); }
 };
+/// Host leaf: a number (no shape, nq = 0, ngv unbounded).
 struct Num
 {
     Real s;
     int nq = 0, ngv = 1 << 20;
     DNum dev(int) const { return {s}; }
 };
+/// The Field an expression takes its shape from (nullptr for a number).
 inline const Field* shape_of(const Field& f) { return &f; }
-// a field read entry by entry, rows as stored (no broadcast test)
+/// Device view of a field read entry by entry, rows as stored (no one-row broadcast).
 struct DRaw
 {
     amrex::MultiArray4<Real const> a;
     AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
     { return a[bx](c, n); }
 };
+/// A Field as an expression leaf read without the one-row broadcast.
 struct DLeafless
 {
     Field f;
     int nq = f.nq, ngv = f.ngv;
     DRaw dev(int d) const { return {f[d].const_arrays()}; }
 };
+/// A number has no shape.
 inline const Field* shape_of(const Num&) { return nullptr; }
 
 template<class X> Field eval(const X& x);
+/// Expression node op(a, b); arithmetic on Fields is lazy and evaluated by one ParallelFor where a block takes a Field (eval) or a reduction reads it.
 template<class Op, class A, class B> struct XBin
 {
     Op op; A a; B b;
@@ -393,8 +386,10 @@ template<class Op, class A, class B> struct XBin
     const Field& shape() const { const Field* f = shape_of(a); return f ? *f : *shape_of(b); }
     operator Field() const { return eval(*this); }
 };
+/// The shape of an expression node.
 template<class Op, class A, class B> const Field* shape_of(const XBin<Op, A, B>& x) { return &x.shape(); }
 
+/// Evaluate an expression into a new Field with one ParallelFor.
 template<class X> Field eval(const X& x)
 {
     BL_PROFILE("zs::eval");
@@ -411,27 +406,32 @@ template<class X> Field eval(const X& x)
     return r;
 }
 
+/// Trait: T is a Field or an expression node.
 template<class T> struct is_x : std::false_type {};
 template<> struct is_x<Field> : std::true_type {};
 template<class Op, class A, class B> struct is_x<XBin<Op, A, B>> : std::true_type {};
+/// SFINAE guards: if_num<T> an arithmetic T, if_x<A, B> an operand pair with at least one expression.
 template<class T> using if_num = std::enable_if_t<std::is_arithmetic_v<T>, int>;
 template<class A, class B> using if_x = std::enable_if_t<
     (is_x<A>::value || is_x<B>::value) && (is_x<A>::value || std::is_arithmetic_v<A>)
     && (is_x<B>::value || std::is_arithmetic_v<B>), int>;
+/// Wrap a number as a Num leaf; expressions pass through.
 template<class T> auto wrap(const T& t)
 {
     if constexpr (std::is_arithmetic_v<T>) return Num{Real(t)};
     else return t;
 }
+/// Build the expression node op(a, b).
 template<class Op, class A, class B> auto xbin(Op op, const A& a, const B& b)
 { return XBin<Op, decltype(wrap(a)), decltype(wrap(b))>(op, wrap(a), wrap(b)); }
-// a block argument: a Field (an expression evaluated) or a number
+/// A block argument: a number as is, an expression evaluated into a Field.
 template<class T> auto as_arg(const T& t)
 {
     if constexpr (std::is_arithmetic_v<T>) return t;
     else return Field(t);
 }
 
+/// Lazy elementwise arithmetic and functions on expressions and numbers.
 template<class A, class B, if_x<A, B> = 0> auto operator+(const A& a, const B& b) { return xbin(Add{}, a, b); }
 template<class A, class B, if_x<A, B> = 0> auto operator-(const A& a, const B& b) { return xbin(Sub{}, a, b); }
 template<class A, class B, if_x<A, B> = 0> auto operator*(const A& a, const B& b) { return xbin(Mul{}, a, b); }
@@ -444,11 +444,11 @@ using std::floor;
 using std::fmod;
 using std::pow;
 
+/// Lazy elementwise minimum.
 template<class A, class B, if_x<A, B> = 0> auto minimum(const A& a, const B& b) { return xbin(Min{}, a, b); }
 
 // ── halo ────────────────────────────────────────────────────────────────────
-// the copies of the neighbouring boxes' cells and the periodic partners (any
-// rank); a number passes
+/// Fill the ghost layers: copies of the neighbouring boxes' cells and the periodic partners (any rank); a number passes through.
 inline Field halo(const Field& X, const Mesh& M)
 {
     BL_PROFILE("zs::halo");
@@ -459,10 +459,13 @@ inline Field halo(const Field& X, const Mesh& M)
     Y.ngv = X.ng();
     return Y;
 }
+/// A number needs no halo.
 template<class T, if_num<T> = 0> T halo(T x, const Mesh&) { return x; }
+/// X with at least n valid ghost layers (halo-exchanged when too thin).
 inline Field need(const Field& X, int n, const Mesh& M) { return X.ngv >= n ? X : halo(X, M); }
 
 // ── reductions (valid region, all ranks; NaN propagates) ────────────────────
+/// Min or max over the valid region of all rows and ranks (ParReduce); a NaN anywhere gives NaN.
 template<bool MIN, class X>
 double reduce_ext(const X& x)
 {
@@ -501,10 +504,13 @@ double reduce_ext(const X& x)
     amrex::ParallelDescriptor::ReduceBoolOr(nan);
     return nan ? NaN : best;
 }
+/// Global minimum of an expression.
 template<class X, std::enable_if_t<is_x<X>::value, int> = 0>
 double reduce_min(const X& x) { return reduce_ext<true>(x); }
+/// Global maximum of an expression.
 template<class X, std::enable_if_t<is_x<X>::value, int> = 0>
 double reduce_max(const X& x) { return reduce_ext<false>(x); }
+/// True if any entry is nonzero on any rank.
 inline bool reduce_any(const Field& F)
 {
     BL_PROFILE("zs::reduce_any");
@@ -527,11 +533,14 @@ inline bool reduce_any(const Field& F)
     amrex::ParallelDescriptor::ReduceBoolOr(any);
     return any;
 }
+/// A number reduces to itself.
 template<class T, if_num<T> = 0> double reduce_min(T x) { return x; }
 template<class T, if_num<T> = 0> double reduce_max(T x) { return x; }
 
 // ── static row lists ────────────────────────────────────────────────────────
+/// A static list of up to MAXR row indices.
 struct Rows { int n = 0; int r[MAXR]; };
+/// The row list of an index tuple.
 template<class... I> Rows rows_of(const std::tuple<I...>& t)
 {
     Rows R;
@@ -539,8 +548,7 @@ template<class... I> Rows rows_of(const std::tuple<I...>& t)
     return R;
 }
 
-// put / take are lazy too: take is a row view, put writes its rows from the
-// value expression in the same loop that copies the others
+/// Device view of a row subset (put / take are lazy too): row n is row R.r[n] of the field.
 struct DRows
 {
     DLeaf a;
@@ -548,6 +556,7 @@ struct DRows
     AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
     { return a.a[bx](c, R.r[n]); }
 };
+/// Expression node for take: a row view of src, no copy.
 struct XRows
 {
     Field src;
@@ -558,8 +567,10 @@ struct XRows
     operator Field() const { return eval(*this); }
 };
 template<> struct is_x<XRows> : std::true_type {};
+/// The shape of a take: its source.
 inline const Field* shape_of(const XRows& x) { return &x.src; }
 
+/// The rows `rows` of Q as a lazy row view.
 template<class... I>
 XRows take(const Field& Q, const std::tuple<I...>& rows)
 {
@@ -567,6 +578,7 @@ XRows take(const Field& Q, const std::tuple<I...>& rows)
     return XRows{Q, R, R.n, Q.ngv};
 }
 
+/// Device view of put: v for the rows in R, q elsewhere.
 template<class V> struct DPut
 {
     DLeaf q; V v; Rows R;
@@ -576,6 +588,7 @@ template<class V> struct DPut
         return q.a[bx](c, n);
     }
 };
+/// Expression node for put: Q with rows R replaced by v, evaluated in the loop that copies the others.
 template<class V> struct XPut
 {
     Field Q; V v; Rows R;
@@ -585,8 +598,10 @@ template<class V> struct XPut
     operator Field() const { return eval(*this); }
 };
 template<class V> struct is_x<XPut<V>> : std::true_type {};
+/// The shape of a put: Q.
 template<class V> const Field* shape_of(const XPut<V>& x) { return &x.Q; }
 
+/// Q with the rows `rows` replaced by `values`: lazy on the GPU (read by the consumer), one pass on the CPU.
 template<class V, class... I>   // nvcc: the pack last (device lambda inside)
 auto put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 {
@@ -617,6 +632,7 @@ auto put(const Field& Q, const std::tuple<I...>& rows, const V& values)
 #endif
 }
 
+/// A cell Field of n rows of zeros.
 inline Field zeros(int n, const Mesh& M)
 {
     Field Z = cells_of(M, n);
@@ -625,7 +641,7 @@ inline Field zeros(int n, const Mesh& M)
     return Z;
 }
 
-// entries of ``rows`` in [-tol, 0) -> 0: round-off below zero
+/// Set the entries of `rows` in [-tol, 0) to 0 (round-off below zero).
 template<class X, class... I>
 Field clean_round_off(const X& x, const std::tuple<I...>& rows, double tol)
 {
@@ -651,7 +667,7 @@ Field clean_round_off(const X& x, const std::tuple<I...>& rows, double tol)
     return out;
 }
 
-// select(mask, A, B): A where mask else B (fields broadcast, numbers too)
+/// Device read of a Field row or a number, a one-row field broadcasting (operand of select).
 struct Src
 {
     amrex::MultiArray4<Real const> a;
@@ -661,13 +677,17 @@ struct Src
     AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
     { return num ? s : a[bx](c, nq == 1 ? 0 : n); }
 };
+/// The Src of direction d of a Field, or of a number.
 inline Src src(const Field& F, int d) { return Src{F[d].const_arrays(), F.nq, 0.0, false}; }
 template<class T, if_num<T> = 0> Src src(T x, int) { Src s; s.s = Real(x); return s; }
+/// Row count of a field (1 for a number).
 inline int rows_n(const Field& F) { return F.nq; }
 template<class T, if_num<T> = 0> int rows_n(T) { return 1; }
+/// Valid ghost layers of a field (unbounded for a number).
 inline int ngv_of(const Field& F) { return F.ngv; }
 template<class T, if_num<T> = 0> int ngv_of(T) { return 1 << 20; }
 
+/// select(mask, A, B): A where mask is nonzero, else B (fields broadcast, numbers too).
 template<class A, class B>
 Field select(const Field& m, const A& a_, const B& b_)
 {
@@ -691,7 +711,7 @@ Field select(const Field& m, const A& a_, const B& b_)
 }
 
 // ── kernels on cells and faces ──────────────────────────────────────────────
-// a cell-family kernel in every cell (ghosts included)
+/// Apply a cell-family kernel (Q, Qaux, p, time, dt, position) in every cell, ghosts included.
 template<class K, class P, class T1, class T2>
 Field cells(K kn, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
             const Mesh& M)
@@ -716,8 +736,7 @@ Field cells(K kn, const Field& Q, const Field& A, const P& p, T1 time_, T2 dt_,
     return out;
 }
 
-// a recon-family kernel takes (W, Qaux, p), a cell-family one gets time = dt
-// = 0 and no position
+/// Call a kernel pointwise: a recon-family kernel takes (W, Qaux, p), a cell-family one gets time = dt = 0 and no position.
 template<class K, class X, class A, class P>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 auto call_pointwise(const K& kn, const X& x, const A& a, const P& p)
@@ -726,7 +745,7 @@ auto call_pointwise(const K& kn, const X& x, const A& a, const P& p)
     else return kn(x, a, p, 0.0, 0.0, Col<3>{});
 }
 
-// a column of an expression at cell c
+/// Column of the first min(N, nq) rows of an expression at cell c.
 template<int N, class F>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Col<N> colx(const F& f, int bx, const IV& c, int nq)
@@ -736,8 +755,7 @@ Col<N> colx(const F& f, int bx, const IV& c, int nq)
     return v;
 }
 
-// a kernel in every column (cells or faces); no time, step or position.
-// X and A may be expressions (read in the same loop)
+/// Apply a kernel in every column (cells or faces), without time, step or position; X and A may be expressions (read in the same loop).
 template<class K, class X, class A, class P>
 Field pointwise(K kn, const X& X_, const A& A_, const P& p)
 {
@@ -778,6 +796,7 @@ Field pointwise(K kn, const X& X_, const A& A_, const P& p)
     return out;
 }
 
+/// Split F into N equal blocks of rows (aliases).
 template<int N>
 std::array<Field, N> split(const Field& F)
 {
@@ -786,7 +805,7 @@ std::array<Field, N> split(const Field& F)
     return out;
 }
 
-// the face kernel on every face, owner -> other with the owner's normal
+/// Apply the face kernel on every face, from the owner to the other cell, with the owner's normal.
 template<class K, class P>
 Field face_kernel(K kn, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
                   const P& p, const Mesh& M)
@@ -815,6 +834,7 @@ Field face_kernel(K kn, const Field& QL, const Field& QR, const Field& AL, const
     }
     return out;
 }
+/// face_kernel, split into N row blocks when N > 1.
 template<int N = 1, class K, class P>
 auto faces(K kn, const Field& QL, const Field& QR, const Field& AL, const Field& AR,
            const P& p, const Mesh& M)
@@ -824,7 +844,7 @@ auto faces(K kn, const Field& QL, const Field& QR, const Field& AL, const Field&
     else return split<N>(out);
 }
 
-// owner and other cell aux per face (the inner cell twice at a boundary face)
+/// Owner and other cell aux per face (the inner cell twice at a boundary face).
 inline std::tuple<Field, Field> face_aux(const Field& Qaux_, const Mesh& M)
 {
     BL_PROFILE("zs::face_aux");
@@ -849,8 +869,7 @@ inline std::tuple<Field, Field> face_aux(const Field& Qaux_, const Mesh& M)
     return {L, R};
 }
 
-// max |eigenvalue| per face over its two cells (the inner cell twice at a
-// boundary face)
+/// Max |eigenvalue| per face over its two cells (the inner cell twice at a boundary face); NaN propagates.
 template<class K, class P>
 Field face_wavespeed(K kn, const Field& Q_, const Field& A_, const P& p, const Mesh& M)
 {
@@ -889,9 +908,7 @@ Field face_wavespeed(K kn, const Field& Q_, const Field& A_, const P& p, const M
     return out;
 }
 
-// per-face cell size: the inradius as zoomy_core's mesh defines it (the
-// shortest normal distance from the cell centre to a face plane), min dx / 2
-// of the (uniform) cells: one number
+/// Cell size per face: the inradius as zoomy_core's mesh defines it (shortest normal distance from the cell centre to a face plane), min dx / 2 of the uniform cells, one number.
 inline Real face_inradius(const Mesh& M)
 {
     Real h = M.g.dx[0];
@@ -900,8 +917,7 @@ inline Real face_inradius(const Mesh& M)
 }
 
 // ── boundary ────────────────────────────────────────────────────────────────
-// out-of-domain ghost cell c across exactly one boundary face: its direction
-// d, side (2 d + upper) and inner cell; false otherwise
+/// True if c is an out-of-domain ghost cell across exactly one boundary face; gives its direction d, side (2 d + upper) and inner cell.
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 bool boundary_ghost(const Geo& g, const IV& c, int& d, int& side, IV& in)
 {
@@ -917,9 +933,7 @@ bool boundary_ghost(const Geo& g, const IV& c, int& d, int& side, IV& in)
     return n == 1 && inside(g, in);
 }
 
-// the ghost kernel's value in every out-of-domain ghost cell across a face,
-// from the inner cell and its aux (Cartesian: the foot of the perpendicular
-// is the face centre, the normal distance h/2)
+/// The ghost kernel's value in every out-of-domain ghost cell across a face, from the inner cell and its aux (Cartesian: the foot of the perpendicular is the face centre, normal distance h/2).
 template<class K, class P, class T>
 Field bc_cells(K ghost, const Field& Q, const Field& A, const P& p, T time_, const Mesh& M)
 {
@@ -950,7 +964,7 @@ Field bc_cells(K ghost, const Field& Q, const Field& A, const P& p, T time_, con
     return out;
 }
 
-// the inner cell's values in every out-of-domain ghost cell across a face
+/// The inner cell's values in every out-of-domain ghost cell across a face.
 inline Field inner_cells(const Field& A, const Mesh& M)
 {
     BL_PROFILE("zs::inner_cells");
@@ -970,6 +984,7 @@ inline Field inner_cells(const Field& A, const Mesh& M)
     return out;
 }
 
+/// The boundary ghosts Wg of the BC ghost kernel (bc_cells).
 template<class K, class P, class T>
 Field boundary_ghosts(K ghost, const Field& Q, const Field& A, const P& p, T time,
                       const Mesh& M)
@@ -977,6 +992,7 @@ Field boundary_ghosts(K ghost, const Field& Q, const Field& A, const P& p, T tim
     return bc_cells(ghost, Q, A, p, time, M);
 }
 
+/// The boundary ghosts (bc_cells) and the inner cells' aux in the ghost cells.
 template<int N = 2, class K, class P, class T>
 std::tuple<Field, Field> boundary_states(K ghost, const Field& Q, const Field& A,
                                          const P& p, T time, const Mesh& M)
@@ -984,8 +1000,7 @@ std::tuple<Field, Field> boundary_states(K ghost, const Field& Q, const Field& A
     return {bc_cells(ghost, Q, A, p, time, M), inner_cells(A, M)};
 }
 
-// QR with the BC's outer face state bc(QL) on the boundary faces (the face
-// kernel, at the face centre)
+/// QR with the BC's outer face state bc(QL) on the boundary faces (the face kernel, at the face centre).
 template<class K, class P, class T>
 Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
                       const Field& A, const P& p, T time_, const Mesh& M)
@@ -1022,8 +1037,7 @@ Field boundary_traces(K bc, const Field&, const Field& QL, const Field& QR,
 }
 
 // ── reconstruction and assembly ─────────────────────────────────────────────
-// owner and other cell value per face; a boundary face's outer slot holds
-// the inner value until boundary_traces sets the BC's face state
+/// Owner and other cell value per face; a boundary face's outer slot holds the inner value until boundary_traces sets the BC's face state.
 template<class X>
 std::tuple<Field, Field> cell_traces_of(const X& Q, const Mesh& M)
 {
@@ -1046,22 +1060,21 @@ std::tuple<Field, Field> cell_traces_of(const X& Q, const Mesh& M)
     }
     return {L, R};
 }
+/// Cell traces of an expression (read lazily when its halo is valid).
 template<class X>
 std::tuple<Field, Field> cell_traces(const X& Q, const Mesh& M)
 {
     if (Q.ngv >= 1) return cell_traces_of(Q, M);   // an expression: read lazily
     return cell_traces_of(need(Field(Q), 1, M), M);
 }
+/// Cell traces of a Field (halo-exchanged when too thin).
 inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
 {
     return cell_traces_of(DLeafless{need(Q, 1, M)}, M);
 }
 
-// LSQ fit of row ``n`` at cell c, monomial ``m``: sum_s w_s,m delta_s.  A
-// boundary sample (at the mirror image of the cell centre) carries
-// ug(n) - u_c, ug the ghost (``ghost``), else no change.  ``k`` = the row's
-// boundary-closure class (-1: none): the class's list, its weights carry the
-// constraint data factors
+/// LSQ fit of row n at cell c, monomial m: sum_s w_s,m delta_s; a boundary sample carries ug(n) - u_c (ghost ug) or no change, k = the row's boundary-closure class (-1: none).
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
 template<class A, class B>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, int m, int k = -1)
@@ -1089,8 +1102,8 @@ Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, 
     return s;
 }
 
-// LSQ gradient of every row (row D q + a: d/dx_a of row q); boundary
-// samples: the ghosts Wg
+/// LSQ gradient of every row of the cells (row D q + a: d/dx_a of row q); the boundary samples are the ghosts Wg.
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
 inline Field gradient(const Field& W_, const Field& Wg, const Mesh& M)
 {
     BL_PROFILE("zs::gradient");
@@ -1113,9 +1126,10 @@ inline Field gradient(const Field& W_, const Field& Wg, const Mesh& M)
     return G;
 }
 
-// Limiter factor of one cell from one face increment ``delta`` (cell bounds
-// dmin/dmax); ``ev2`` = (cell size)^2 for Venkatakrishnan
+/// The slope limiters of a reconstruction.
 enum class Limiter { minmod, venkatakrishnan, barth_jespersen };
+/// Limiter factor of one cell from one face increment delta (cell bounds dmin, dmax); ev2 = (cell size)^2 for Venkatakrishnan.
+/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 Real limit(Limiter L, Real delta, Real dmin, Real dmax, Real ev2)
 {
@@ -1133,8 +1147,8 @@ Real limit(Limiter L, Real delta, Real dmin, Real dmax, Real ev2)
     return r < 0.0 ? 0.0 : (r > 1.0 ? 1.0 : r);
 }
 
-// Limiter factors of ``rows``, 1 elsewhere; bounds from the face neighbours
-// and the boundary ghosts Wg (at the ghost position, as in gradient)
+/// Limiter factors of `rows` (1 elsewhere), the bounds from the face neighbours and the boundary ghosts Wg (at the ghost position, as in gradient).
+/// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
 inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Field& Wg,
                              const Field& G, const Mesh& M)
 {
@@ -1181,21 +1195,24 @@ inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Fie
     });
     return phi;
 }
+/// Limiter factors with the minmod limiter.
 template<class... I>
 Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
              const Field& G, const Mesh& M)
 { return limiter_factors(Limiter::minmod, rows_of(rows), W, Wg, G, M); }
+/// Limiter factors with the Venkatakrishnan limiter.
 template<class... I>
 Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
                       const Field& G, const Mesh& M)
 { return limiter_factors(Limiter::venkatakrishnan, rows_of(rows), W, Wg, G, M); }
+/// Limiter factors with the Barth-Jespersen limiter.
 template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
                       const Field& G, const Mesh& M)
 { return limiter_factors(Limiter::barth_jespersen, rows_of(rows), W, Wg, G, M); }
 
-// each cell's W moved to the face centre by phi G; a boundary face's outer
-// slot holds the inner trace until boundary_traces sets the BC's face state
+/// Each cell's W moved to the face centre by phi G; a boundary face's outer slot holds the inner trace until boundary_traces sets the BC's face state.
+/// Ref: van Leer 1979, https://doi.org/10.1016/0021-9991(79)90145-1
 template<class P>
 std::tuple<Field, Field> extrapolate(const Field& W_, const Field& G_, const P& phi_,
                                      const Mesh& M)
@@ -1232,8 +1249,7 @@ std::tuple<Field, Field> extrapolate(const Field& W_, const Field& G_, const P& 
     return {L, R};
 }
 
-// per cell sum_f |f| W / |V| over its faces: Wm where it owns the face, Wp
-// where it is the other cell
+/// Per cell sum_f |f| W / |V| over its faces: Wm where it owns the face, Wp where it is the other cell; the face terms are logged for refluxing on an AMR level.
 inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
 {
     BL_PROFILE("zs::divergence");
@@ -1260,7 +1276,8 @@ inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
     return out;
 }
 
-// per cell the interior nonconservative integral over each of its faces
+/// Per cell the interior nonconservative integral over each of its faces.
+/// Ref: Pares 2006, https://doi.org/10.1137/050628052
 template<class K, class P>
 Field edge_source(K kn, const Field& Q, const Field& QL, const Field& QR,
                   const Field& A, const P& p, const Mesh& M)
@@ -1298,9 +1315,8 @@ Field edge_source(K kn, const Field& Q, const Field& QL, const Field& QR,
 }
 
 // ── whole-domain operations ─────────────────────────────────────────────────
-// Qaux with the derivative rows of ``spec`` from the LSQ fit; boundary
-// samples carry no change (no Qg) or the ghost Qg (with Qg, only the
-// derivatives of state ``rows``)
+/// Qaux with the derivative rows of spec from the LSQ fit; boundary samples carry no change (no Qg) or the ghost Qg (with Qg, only the derivatives of the states in rows).
+/// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
 template<class S>
 Field derivative_aux_impl(const S& spec, const Field& Q_, const Field& Qaux,
                           const Mesh& M, const Field* Qg, const Rows rows)
@@ -1337,15 +1353,17 @@ Field derivative_aux_impl(const S& spec, const Field& Q_, const Field& Qaux,
     }
     return out;
 }
+/// derivative_aux_impl without ghosts.
 template<class S>
 Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mesh& M)
 { return derivative_aux_impl(spec, Q, Qaux, M, nullptr, Rows{}); }
+/// derivative_aux_impl with the ghosts Qg for the states in `rows`.
 template<class S, class... I>
 Field derivative_aux(const S& spec, const Field& Q, const Field& Qaux, const Mesh& M,
                      const Field& Qg, const std::tuple<I...>& rows)
 { return derivative_aux_impl(spec, Q, Qaux, M, &Qg, rows_of(rows)); }
 
-// cell mask: an admissibility row < 0 or a non-finite value
+/// Cell mask: 1 where an admissibility row of kn is < 0 or a state is non-finite.
 template<class K, class P>
 Field inadmissible(K kn, const Field& Q, const Field& A, const P& p)
 {
@@ -1371,12 +1389,13 @@ Field inadmissible(K kn, const Field& Q, const Field& A, const P& p)
 }
 
 // ── implicit solves ─────────────────────────────────────────────────────────
+/// L2 norm of a Field's rows over the valid cells (all ranks).
 inline double norm(const Field& a)
 {
     return std::sqrt(amrex::MultiFab::Dot(a[0], 0, a[0], 0, a.nq, 0));
 }
 
-// x + h e_kk (h = fd_step(x_kk)) and h
+/// x + h e_kk (h = fd_step(x_kk)) and h: the finite-difference column kk.
 inline std::pair<Field, Field> perturb(const Field& x, int kk)
 {
     BL_PROFILE("zs::perturb");
@@ -1398,7 +1417,7 @@ inline std::pair<Field, Field> perturb(const Field& x, int kk)
     return {xk, h};
 }
 
-// the per-cell Newton update from the residual r and the perturbed columns
+/// The per-cell Newton update from the residual r and the perturbed columns (finite-difference Jacobian, solved per cell).
 inline Field newton_update(const Field& x, const Field& r, const std::vector<Field>& cols,
                            const std::vector<Field>& hs)
 {
@@ -1434,11 +1453,11 @@ inline Field newton_update(const Field& x, const Field& r, const std::vector<Fie
     return out;
 }
 
+/// Newton on f(x) = 0 with a per-cell (block-diagonal) Jacobian (newton_cellwise of rt_common.H).
 template<class F> Field root(F f, Field x) { return newton_cellwise(f, std::move(x)); }
 
-// amrex::GMRES on the printed linear map, right-preconditioned by the exact
-// cell blocks of the operator (probed by colouring: cells (R+1) apart do not
-// share a stencil), inverted per cell.
+/// amrex::GMRES operator on the printed linear map, right-preconditioned by the exact cell blocks of the operator (probed by colouring: cells R + 1 apart share no stencil) inverted per cell.
+/// Ref: Saad, Schultz 1986, https://doi.org/10.1137/0907058
 struct LinOp
 {
     using RT = Real;
@@ -1447,6 +1466,7 @@ struct LinOp
     int nq = 0;
     amrex::MultiFab Binv;
 
+    /// The vector-space interface amrex::GMRES requires of its operator (allocation, copy, dot, axpy, norm, scale).
     amrex::MultiFab makeVecRHS() const { return amrex::MultiFab(M->ba, M->dm, nq, 0); }
     amrex::MultiFab makeVecLHS() const { return amrex::MultiFab(M->ba, M->dm, nq, M->NG); }
     void assign(amrex::MultiFab& l, const amrex::MultiFab& r) { amrex::MultiFab::Copy(l, r, 0, 0, nq, 0); }
@@ -1458,6 +1478,7 @@ struct LinOp
     void scale(amrex::MultiFab& v, RT f) { v.mult(f, 0, nq, 0); }
     void setToZero(amrex::MultiFab& v) { v.setVal(0.0); }
 
+    /// Alias of a MultiFab as a Field.
     Field wrap(const amrex::MultiFab& x) const
     {
         Field X;
@@ -1466,16 +1487,19 @@ struct LinOp
         X.mf->emplace_back(x, amrex::make_alias, 0, nq);
         return X;
     }
+    /// Ax = op(x).
     void apply(amrex::MultiFab& Ax, const amrex::MultiFab& x)
     {
         const Field y = op(wrap(x));
         amrex::MultiFab::Copy(Ax, y[0], 0, 0, nq, 0);
     }
+    /// l = Binv r, the cell-block preconditioner (defined below).
     void precond(amrex::MultiFab& l, const amrex::MultiFab& r);
+    /// Probe op and invert its cell blocks into Binv (defined below).
     void blocks();
 };
 
-// the colour of cell c: (c - lo) mod S per axis, combined
+/// Colour of cell c: (c - lo) mod S per axis, combined (cells S apart share no stencil).
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
 int colour(const Geo& g, const IV& c, int S)
 {
@@ -1484,6 +1508,7 @@ int colour(const Geo& g, const IV& c, int S)
     return cl;
 }
 
+/// Probe op with one unit vector per colour and row, and invert the n x n cell blocks by Gauss-Jordan with partial pivoting into Binv.
 inline void LinOp::blocks()
 {
     BL_PROFILE("zs::LinOp::blocks");
@@ -1548,6 +1573,7 @@ inline void LinOp::blocks()
     });
 }
 
+/// l = Binv r: the exact cell blocks as a right preconditioner.
 inline void LinOp::precond(amrex::MultiFab& l, const amrex::MultiFab& r)
 {
     BL_PROFILE("zs::LinOp::precond");
@@ -1569,6 +1595,8 @@ inline void LinOp::precond(amrex::MultiFab& l, const amrex::MultiFab& r)
     });
 }
 
+/// Solve op(x) = b with amrex::GMRES (restart, iterations and tolerance from implicit()); aborts above the accept gate.
+/// Ref: Saad, Schultz 1986, https://doi.org/10.1137/0907058
 inline Field linsolve_impl(std::function<Field(Field)> op, const Field& b, const Mesh& M)
 {
     BL_PROFILE("zs::linsolve_impl");
@@ -1602,9 +1630,10 @@ inline Field linsolve_impl(std::function<Field(Field)> op, const Field& b, const
     return x;
 }
 
-// the printed linsolve(op, b) carries no mesh: the driver's (one per run)
+/// The driver's mesh (one per run): the printed linsolve(op, b) carries none.
 inline const Mesh*& the_mesh() { static const Mesh* m = nullptr; return m; }
 
+/// The printed linear solve: linsolve_impl on the driver's mesh.
 template<class F>
 Field linsolve(F op, const Field& b)
 {
@@ -1612,12 +1641,7 @@ Field linsolve(F op, const Field& b)
 }
 
 // ── diffusion ───────────────────────────────────────────────────────────────
-// div(A : grad X) per cell (zoomy_core's ``diffusion`` block, JAX's TPFA):
-// per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells'
-// tensors (``kn`` = the diffusion tensor kernel, rows (i, j, d, e) flat);
-// across a boundary face X_out the ghost kernel's ghost at the mirror image
-// (bc_cells: d = dx, A the inner cell's), across a periodic side the
-// partner cell.  The diffusive fluxes are not refluxed: no AMR.
+/// div(A : grad X) per cell (zoomy_core's diffusion block, a TPFA): per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells' tensors, X_out the ghost across a boundary face and the partner cell across a periodic side; not refluxed (no AMR).
 template<class K, class G, class P, class T>
 Field diffusion(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
                 const Mesh& M)
@@ -1671,9 +1695,8 @@ Field diffusion(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T t
     return out;
 }
 
-// one Crank-Nicolson step of ``diffusion`` from ``time`` to ``time + dt``:
-// R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, the ghosts of Q at ``time``, of X
-// at ``time + dt``, A at X (Qaux frozen)
+/// One Crank-Nicolson step of diffusion from time to time + dt: R(X) = X - Q - dt/2 (D(X) + D(Q)) = 0, A at X (Qaux frozen), by Newton-Krylov.
+/// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G, class P, class T, class S>
 Field implicit_diffusion(K kn, G ghost, const Field& Q, const Field& A, const P& p,
                          T time_, S dt_, const Mesh& M)
@@ -1687,17 +1710,17 @@ Field implicit_diffusion(K kn, G ghost, const Field& Q, const Field& A, const P&
 }
 
 // ── control ─────────────────────────────────────────────────────────────────
-// iterations of every run-time loop (the time loop of a hyperbolic march:
-// its steps)
+/// Iterations of every run-time loop (the steps of a hyperbolic march's time loop).
 inline long& loop_iterations() { static long n = 0; return n; }
 
-// a carried value: expressions are evaluated (the carry has one type)
+/// A carried loop value; expressions are evaluated (the carry has one type).
 template<class T> auto carried(const T& v)
 {
     if constexpr (is_x<T>::value) return Field(v);
     else return v;
 }
 
+/// The printed while loop: the body b applied to the carried tuple while c holds.
 template<class C, class B, class S0>
 auto while_loop(C c, B b, S0 s0)
 {
@@ -1706,6 +1729,7 @@ auto while_loop(C c, B b, S0 s0)
     return s;
 }
 
+/// The printed conditional on a host bool; an expression and a Field branch are unified as Fields.
 template<class A, class B>
 auto cond(bool p, A a, B b)
 {
@@ -1716,17 +1740,17 @@ auto cond(bool p, A a, B b)
 
 #ifdef ZS_PRECICE
 // ── preCICE ─────────────────────────────────────────────────────────────────
-// couple_setup fills ``coupling()`` (rt_common.H: the participant, the data
-// names, the vertices) and ``interface()``: the coupled side; the coupled
-// faces are that side's boundary faces of this rank's boxes, one preCICE
-// vertex each (this rank's only), numbered box by box (x fastest).
+/// The coupled side (2 d + upper) and, per face, its preCICE vertex (-1 if not coupled); filled by couple_setup.
+/// Ref: Chourdakis et al. 2022, https://doi.org/10.12688/openreseurope.14445.2
 struct Interface
 {
     int side = -1;                                  // 2 d + upper
     Field index;                                    // vertex of a coupled face, -1 else
 };
+/// The coupling interface of this rank.
 inline Interface& interface() { static Interface i; return i; }
 
+/// Set up preCICE: the participant and one vertex per coupled boundary face of this rank's boxes on `side`, numbered box by box (x fastest); fills coupling() (rt_common.H) and interface().
 inline void couple_setup(const Mesh& M, const std::string& name, const std::string& config,
                          const std::string& mesh, const std::vector<std::string>& write,
                          const std::vector<std::string>& read, int side)
@@ -1776,6 +1800,7 @@ inline void couple_setup(const Mesh& M, const std::string& name, const std::stri
     cpl.participant->setMeshVertices(cpl.mesh, xyz, cpl.ids);
 }
 
+/// Face mask: 1 on the coupled faces.
 inline Field coupled_faces(const Mesh&)
 {
     const Field& I = interface().index;
@@ -1790,7 +1815,7 @@ inline Field coupled_faces(const Mesh&)
     return out;
 }
 
-// the inner cell's state at every coupled face (vertex order), on the host
+/// The inner cell's state at every coupled face (vertex order), on the host.
 inline Vertices interface_states(const Field& Q, const Mesh& M)
 {
     const auto& itf = interface();
@@ -1814,9 +1839,7 @@ inline Vertices interface_states(const Field& Q, const Mesh& M)
     return out;
 }
 
-// One Riemann problem per coupled face, posed low -> high (``kn`` =
-// numerical_face_sides): row 0 for the low side, row 1 for the high side;
-// each state's aux from the pointwise kernel on a zero template (false: zero)
+/// One Riemann problem per coupled face, posed low to high (kn = numerical_face_sides): row 0 for the low side, row 1 for the high side; each state's aux from the pointwise kernel on a zero template (false: zero).
 template<class K, class KA, class P>
 Field interface_flux(K kn, KA kaux, int side, const Field& Q, const Field& Qaux,
                      const Vertices& peer, const P& p, const Mesh& M)

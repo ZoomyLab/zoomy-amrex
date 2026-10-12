@@ -1,25 +1,7 @@
 #pragma once
-/*---------------------------------------------------------------------------*\
-    amr_amrex.H -- the AMR level loop of the symbolic hyperbolic solver
-    (amrex::AmrCore; one dt for every level, no subcycling) around the
-    printed single-level procedures of Solver.H (program.amr_procedures):
-    ``step`` (HyperbolicTemplate.step), ``dt_of`` (HyperbolicTemplate.dt),
-    ``initial_aux``, ``amr_w`` / ``amr_q`` (the reconstruction's variables),
-    ``rk_weights``.
-
-    A step: every level's halo and aux at t; dt = min over the levels' CFL
-    steps; levels advance coarse to fine with the same dt -- a finer level's
-    halo (Mesh::fill) takes its own boxes' and periodic cells as they are and
-    interpolates the coarser level's new state (conservative linear, in W =
-    amr_w(Q)) into the rest; then, fine to coarse: reflux (the coarse cells
-    next to a finer level get the finer faces' time-integrated terms instead
-    of their own: their own side of each face, Wm or Wp, weighted by the RK
-    stage weights over the step's last stages; the conservation laws' rows
-    only, reflux_rows), average_down and the stage's round-off hygiene
-    (amr_clean).
-    Regrid every ``regrid_int`` steps; tags: a state row above a threshold,
-    its undivided difference above one, or a fixed region.
-\*---------------------------------------------------------------------------*/
+/// \file
+/// The AMR level loop of the symbolic hyperbolic solver (amrex::AmrCore, one dt for every level, no subcycling) around the printed single-level procedures of Solver.H (step, dt_of, initial_aux, amr_w / amr_q, rk_weights).
+/// A step advances the levels coarse to fine, then refluxes and averages down fine to coarse; the grid is regridded by tags every regrid_int steps.
 #include <AMReX_AmrCore.H>
 #include <AMReX_FillPatchUtil.H>
 #include <AMReX_FluxRegister.H>
@@ -31,8 +13,7 @@
 
 namespace zs
 {
-// out-of-domain ghosts belong to the template's boundary blocks; for the
-// interpolation they are first-order extrapolations (BCRec foextrap)
+/// Fill functor for the out-of-domain ghosts: a no-op, since the template's boundary blocks own them (the interpolation sees first-order extrapolation, BCRec foextrap).
 struct NoFill
 {
     AMREX_GPU_DEVICE void operator()(const IV&, amrex::Array4<Real> const&, int, int,
@@ -41,10 +22,7 @@ struct NoFill
 };
 using PhysBC = amrex::PhysBCFunct<amrex::GpuBndryFuncFab<NoFill>>;
 
-// AMReX's own AMR routines (interpolation, flux registers, average_down,
-// regrid) iterate with MFIter over several GPU streams and rely on its
-// end-of-loop synchronisation, which the march's no-sync region switches off:
-// they run in this scope (synchronised before, the region restored after)
+/// Scope for AMReX's own AMR routines (interpolation, flux registers, average_down, regrid), which rely on MFIter's end-of-loop synchronisation: streams synchronised on entry and exit, the march's no-sync region lifted meanwhile.
 struct Synced
 {
     bool ns;
@@ -52,9 +30,11 @@ struct Synced
     ~Synced() { amrex::Gpu::streamSynchronize(); amrex::Gpu::setNoSyncRegion(ns); }
 };
 
-// mode 0: row > thr, 1: largest undivided difference of row > thr, 2: region
+/// Tagging rule: mode 0 row > thr, 1 largest undivided difference of row > thr, 2 the region [lo, hi].
 struct Tagging { int row = 0, mode = 0; Real thr = 0.0, lo[3] = {}, hi[3] = {}; };
 
+/// The AMR level loop on amrex::AmrCore: per-level Mesh, state Q, aux A and flux register, one dt for every level.
+/// Ref: Berger, Oliger 1984, https://doi.org/10.1016/0021-9991(84)90073-1
 struct Amr : public amrex::AmrCore
 {
     std::vector<std::unique_ptr<Mesh>> mesh;
@@ -68,6 +48,7 @@ struct Amr : public amrex::AmrCore
     Tagging tag;
     bool reflux = true;
 
+    /// Per-level storage, the BC types (periodic or foextrap) and the run inputs (LSQ tables, initial-data files, BC branches, parameters).
     Amr(const std::vector<std::string>& lsq_, const std::vector<std::string>& q0_,
         const std::string& qaux0_, const int br[6], const Col<NPAR>& p_)
         : lsq(lsq_), q0(q0_), qaux0(qaux0_), p(p_)
@@ -85,6 +66,7 @@ struct Amr : public amrex::AmrCore
             }
     }
 
+    /// Create or update level lev's Mesh (grid, LSQ table, refluxing log) and, above level 0, its halo fill and flux register.
     void setup_level(int lev, const amrex::BoxArray& ba, const amrex::DistributionMapping& dm)
     {
         if (!mesh[lev])
@@ -102,7 +84,7 @@ struct Amr : public amrex::AmrCore
                                                         System::n_state);
     }
 
-    // a field of level lev - 1 interpolated onto (ba, dm) of level lev (ghosts too)
+    /// A field of level lev - 1 interpolated onto (ba, dm) of level lev, ghosts too (conservative linear).
     Field interp(int lev, const Field& C, const amrex::BoxArray& ba,
                  const amrex::DistributionMapping& dm)
     {
@@ -118,7 +100,7 @@ struct Amr : public amrex::AmrCore
         return F;
     }
 
-    // level lev's state (W-space interpolation) and aux from level lev - 1
+    /// Level lev's state (interpolated in W = amr_w(Q)) and aux from level lev - 1; only the aux when `state` is false.
     std::pair<Field, Field> from_coarse(int lev, const amrex::BoxArray& ba,
                                         const amrex::DistributionMapping& dm, bool state)
     {
@@ -130,8 +112,7 @@ struct Amr : public amrex::AmrCore
         return {q, a};
     }
 
-    // the halo of a finer level: own and periodic cells exact, the rest from
-    // the coarser level's current state / aux (by the field's rows)
+    /// The halo of a finer level: its own and periodic cells exact, the rest from the coarser level's current state or aux (by the field's rows).
     Field fill_halo(int lev, const Field& X)
     {
         BL_PROFILE("zs::amr_fill_halo");
@@ -148,6 +129,7 @@ struct Amr : public amrex::AmrCore
         return F;
     }
 
+    /// AmrCore hook: build level lev from the initial-data files (level 0) or interpolated from the coarser level (optional per-level files).
     void MakeNewLevelFromScratch(int lev, Real, const amrex::BoxArray& ba,
                                  const amrex::DistributionMapping& dm) override
     {
@@ -166,6 +148,7 @@ struct Amr : public amrex::AmrCore
         load(qaux0, A[0], M);
     }
 
+    /// AmrCore hook: build a new level lev by interpolation from level lev - 1.
     void MakeNewLevelFromCoarse(int lev, Real, const amrex::BoxArray& ba,
                                 const amrex::DistributionMapping& dm) override
     {
@@ -174,6 +157,7 @@ struct Amr : public amrex::AmrCore
         Q[lev] = qa.first; A[lev] = qa.second;
     }
 
+    /// AmrCore hook: regrid level lev, keeping its own cells exact and interpolating the rest from the coarser level.
     void RemakeLevel(int lev, Real, const amrex::BoxArray& ba,
                      const amrex::DistributionMapping& dm) override
     {
@@ -186,11 +170,13 @@ struct Amr : public amrex::AmrCore
         Q[lev] = qa.first; A[lev] = qa.second;
     }
 
+    /// AmrCore hook: drop level lev's state, aux and flux register.
     void ClearLevel(int lev) override
     {
         Q[lev] = Field(); A[lev] = Field(); fr[lev].reset();
     }
 
+    /// AmrCore hook: tag the cells of level lev by the Tagging rule.
     void ErrorEst(int lev, amrex::TagBoxArray& tags, Real, int) override
     {
         const Mesh& M = *mesh[lev];
@@ -224,8 +210,7 @@ struct Amr : public amrex::AmrCore
         });
     }
 
-    // the time integral over the step of the face terms of level lev on the
-    // side of the cell below (Wm) or above (-Wp) each face, x dt x mult
+    /// Integral over the step's RK stages of the face terms logged by divergence on the cell below (Wm) or above (-Wp) each face, times mult.
     amrex::MultiFab face_integral(int lev, int d, bool below, Real mult)
     {
         const auto& log = *mesh[lev]->log;
@@ -241,7 +226,8 @@ struct Amr : public amrex::AmrCore
         return F;
     }
 
-    // level lev - 1 from level lev: reflux, then the covered cells' averages
+    /// Level lev - 1 from level lev: reflux the coarse cells next to level lev with the fine faces' time-integrated terms, then average down and clean round-off.
+    /// Ref: Berger, Colella 1989, https://doi.org/10.1016/0021-9991(89)90035-1
     void sync(int lev, Real dt)
     {
         BL_PROFILE("zs::amr_sync");
@@ -288,7 +274,7 @@ struct Amr : public amrex::AmrCore
         Q[lev - 1].ngv = 0;
     }
 
-    // every level's halo and aux at the current state
+    /// Every level's halo and aux at the current state.
     void refresh()
     {
         for (int l = 0; l <= finest_level; ++l)
@@ -299,6 +285,7 @@ struct Amr : public amrex::AmrCore
         }
     }
 
+    /// The time loop over all levels: one dt per step (min of the levels' CFL steps), regrid every regrid_int steps, write every dt_write; returns the end time.
     double march(double time_end, double dt_write, int regrid_int,
                  const std::function<void(double)>& write)
     {
@@ -333,11 +320,7 @@ struct Amr : public amrex::AmrCore
     }
 };
 
-// zs.amr = 1: inputs as the single-level run plus zs.lsq / zs.q0 per level
-// (q0 of a finer level optional: else interpolated), zs.dt_write, zs.regrid_int,
-// zs.reflux, zs.tag (mode row threshold) / zs.tag_region (lo.. hi..), and
-// AmrCore's amr.* / geometry.*.  Writes <out>/plt<k> (multi-level) and
-// <out>/<k>_l<lev>.bin per level (NaN where a level has no cells); final_l<lev>.bin.
+/// The AMR driver (zs.amr = 1): inputs as the single-level run plus zs.lsq / zs.q0 per level, zs.dt_write, zs.regrid_int, zs.reflux, zs.tag / zs.tag_lo / zs.tag_hi; writes plt<k> and <k>_l<lev>.bin per level and final_l<lev>.bin.
 inline void run_amr()
 {
     amrex::ParmParse pp("zs");
