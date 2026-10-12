@@ -1085,19 +1085,17 @@ Real lsq(const Geo& g, const A& u, const B& ub, int mode, const IV& c, int n, in
     {
         const int kind = g.smp[4*t];
         IV cc = c, in = c;
-        bool image = false;             // a boundary sample across a periodic side
         for (int a = 0; a < D; ++a)
         {
             const int o = g.smp[4*t + 1 + a], tw = cw[a] + o;
             cc[a] += o;
             // the face's inner cell (a boundary sample): clamped in the domain
             in[a] = c[a] + (tw < g.lo[a] ? g.lo[a] : (tw > g.hi[a] ? g.hi[a] : tw)) - cw[a];
-            image = image || (g.per[a] && (tw < g.lo[a] || tw > g.hi[a]));
         }
         Real delta;
         if (kind == 0) delta = u(cc, n) - uc;
-        else if (mode == 0) delta = (image ? u(cc, n) : ub(cc, n)) - uc;
-        else if (mode == 1) delta = 2.0*(image ? u(cc, n) : ub(cc, n)) - u(in, n) - uc;
+        else if (mode == 0) delta = ub(cc, n) - uc;
+        else if (mode == 1) delta = 2.0*ub(cc, n) - u(in, n) - uc;
         else delta = 0.0;
         s += g.w[t*g.nmon + m]*delta;
     }

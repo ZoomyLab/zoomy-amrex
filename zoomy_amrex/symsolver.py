@@ -400,7 +400,9 @@ def side_of(mesh, tag, dim):
 def lsq_table(nsm, degree, grid, periodic):
     """The LSQ stencils and weights of the zoomy mesh per cell class, from a
     proxy grid of the same spacing (classes: the distance to each side, up to
-    the stencil reach R; a periodic side as a boundary).  Text
+    the stencil reach R; along a periodic axis the interior class, its samples
+    across the seam the partner cells in the halo, as zoomy_core's wrapped
+    stencils).  Text
     read by ``zs::Mesh::load``."""
     dim, n, lo, h = grid["dim"], grid["n"], grid["lo"], grid["d"]
     np_ = [min(n[ax], 2 * degree + 3) for ax in range(dim)]
@@ -444,15 +446,15 @@ def lsq_table(nsm, degree, grid, periodic):
         if np_[ax] < n[ax] and np_[ax] < 2 * R + 1:
             raise RuntimeError(f"LSQ reach {R}: proxy grid too small")
 
-    def key(i, m, per):     # periodic sides keep the boundary stencils (as JAX:
-        return (min(i, R), min(m - 1 - i, R))   # the partner is the ghost sample)
+    def key(i, m, per):     # a periodic axis has no sides: the interior stencil,
+        return (R, R) if per else (min(i, R), min(m - 1 - i, R))   # wrapped by the halo
     keys = [sorted({key(i, np_[ax], periodic[ax]) for i in range(np_[ax])})
             for ax in range(dim)]
-    rep = {}
+    rep = {}                # each class: a proxy cell of it (the proxy is not periodic)
     for c in range(nc):
-        k = tuple(keys[ax].index(key(pg["ij"][ax][c], np_[ax], periodic[ax]))
-                  for ax in range(dim))
-        rep.setdefault(k, c)
+        kc = [key(pg["ij"][ax][c], np_[ax], False) for ax in range(dim)]
+        if all(kc[ax] in keys[ax] for ax in range(dim)):
+            rep.setdefault(tuple(keys[ax].index(kc[ax]) for ax in range(dim)), c)
     cls = [[keys[ax].index(key(i, n[ax], periodic[ax])) for i in range(n[ax])]
            for ax in range(dim)]
     out = [f"{R} {dim} {' '.join(map(str, n))} {' '.join(str(len(k)) for k in keys)} {len(mon)}",
