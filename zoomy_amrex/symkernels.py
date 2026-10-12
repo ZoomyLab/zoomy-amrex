@@ -1,16 +1,7 @@
-"""Device kernels for the symbolic solvers on AMReX: one ``struct <system>_t``
-per system, one ``static constexpr`` functor per kernel the printed solver
-references (``nsm.source`` in C++ is the functor ``nsm_t::source``).
-
-The kernels are the system's ``call`` table -- the same ``Function`` objects
-the JAX runtime lambdifies and foam prints (``zoomy_foam.symkernels``) -- in
-AMReX syntax: ``AMREX_GPU_HOST_DEVICE`` call operators on
-``amrex::SmallMatrix`` columns, so a block can call them inside
-``ParallelFor``.  Every kernel of a family takes the family's full argument
-list (the runtime calls all of them alike); it ignores what it does not
-declare.  ``family`` / ``n_out`` / ``n_in`` / ``n_aux`` tell the runtime the
-shapes at compile time.  The ghost kernel's ``boundary_data`` is the BC's
-input state ``Q`` (the template default: no coupling data).
+"""Device kernels of the symbolic solvers on AMReX: one ``struct <system>_t`` per system with a
+``static constexpr`` functor per kernel the printed solver references (``nsm.source`` is
+``nsm_t::source``).  The kernels are the system's ``call`` table (the functions JAX lambdifies and
+foam prints) in AMReX syntax, ``AMREX_GPU_HOST_DEVICE`` operators on ``amrex::SmallMatrix``.
 """
 import re
 
@@ -41,6 +32,7 @@ _SCALAR = {"time", "dt", "distance"}
 
 
 def family(f):
+    """Kernel family of the ``Function`` ``f`` (face, bc, recon, normal or cell), from its argument groups."""
     keys = set(f.args.keys())
     if "q_minus" in keys:
         return "face"
@@ -54,16 +46,26 @@ def family(f):
 
 
 def _m(n):
+    """``amrex::SmallMatrix`` column type of ``n`` entries."""
     return f"amrex::SmallMatrix<amrex::Real, {max(int(n), 1)}, 1>"
 
 
 class AmrexKernelPrinter(AmrexCore, GenericCppBase):
-    """AMReX syntax of the kernel bodies (``AmrexCore``, the opaque calls of
-    :class:`AmrexNumericsPrinter`); symbol maps from each kernel's own
-    argument groups."""
+    """AMReX syntax of the kernel bodies (``AmrexCore`` plus the opaque calls of
+    :class:`AmrexNumericsPrinter`), with symbol maps from each kernel's own argument groups.
+    """
     c_functions = AmrexNumericsPrinter.c_functions
 
     def kernel(self, f, sizes):
+        """Print ``struct <name>_k`` and its constexpr instance for the ``Function`` ``f``.  Every
+        kernel of a family takes the family's full argument list and ignores what it does not
+        declare.
+
+        Args:
+            sizes: entries per argument group of the system.
+        Returns:
+            The C++ text.
+        """
         self.symbol_maps = []
         fam = family(f)
         keys = _KEYS[fam]
@@ -112,11 +114,16 @@ def referenced(source, system):
 
 
 def write_kernels(systems, source, path, dimension, classes=None):
-    """``Kernels.H``: ``struct <name>_t`` + ``constexpr <name>_t <name>`` for
-    each ``(name, nsm)`` in ``systems``, with the kernels ``source`` uses.
-    ``classes`` ``{(name, "state"): closure class per state row}`` (the
-    topology's ``lsq_closure_class``; ANALYSIS 41): the 6th int of each
-    ``aux_derivatives`` entry, -1 without a closure."""
+    """Write ``Kernels.H`` to ``path``: ``struct <name>_t`` and its constexpr instance for each
+    ``(name, nsm)`` in ``systems``, with the kernels ``source`` uses.
+
+    Args:
+        classes: ``{(name, "state"): closure class per state row}`` (the topology's
+            ``lsq_closure_class``), the 6th int of each ``aux_derivatives`` entry; -1 without a
+            closure.
+    Returns:
+        ``path``.
+    """
     pr = AmrexKernelPrinter()
     first = systems[0][1]
     n_par = len(first.parameters.keys())
