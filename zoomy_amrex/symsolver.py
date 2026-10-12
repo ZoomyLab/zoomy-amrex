@@ -37,8 +37,12 @@ from zoomy_amrex.symkernels import write_kernels
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "Source"
 CACHE = Path(os.environ.get("ZOOMY_AMREX_SYMCACHE", ROOT / ".symcache"))
+# the superrepo's own images (containers/zoomy_amrex, with preCICE), else the
+# Zoomy checkout's
+_OWN = ROOT.parent.parent / "containers" / "zoomy_amrex"
 CONTAINERS = Path(os.environ.get("ZOOMY_AMREX_CONTAINERS",
-                                 Path.home() / "git/Zoomy/containers/zoomy_amrex"))
+                                 _OWN if (_OWN / "zoomy_amrex.sif").exists()
+                                 else Path.home() / "git/Zoomy/containers/zoomy_amrex"))
 SIF = {False: CONTAINERS / "zoomy_amrex.sif", True: CONTAINERS / "zoomy_amrex_gpu.sif"}
 BUILD_CPUS = os.environ.get("ZOOMY_AMREX_BUILD_CPUS", "32-63")
 RUN_CPUS = os.environ.get("ZOOMY_AMREX_RUN_CPUS", "16-31")
