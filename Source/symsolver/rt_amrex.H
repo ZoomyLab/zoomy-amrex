@@ -44,6 +44,9 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#ifdef ZS_PRECICE
+#include <precice/precice.hpp>
+#endif
 
 namespace zs
 {
@@ -94,12 +97,17 @@ struct Geo
     const Real* w;
 };
 
+struct Field;
 struct Mesh
 {
     amrex::Geometry geom;
     amrex::BoxArray ba;
     amrex::DistributionMapping dm;
     int NG = 2, R = 1;
+    // an AMR level: ``fill`` = its halo (ghosts from its own boxes and from the
+    // coarser level), ``log`` = the face terms of each divergence (refluxing)
+    std::function<Field(const Field&)> fill;
+    std::shared_ptr<std::vector<std::array<Field, 2>>> log;
     std::vector<std::array<int, 3>> mon;
     amrex::Gpu::DeviceVector<int> cls[3], off, smp;
     amrex::Gpu::DeviceVector<Real> w;
@@ -455,6 +463,7 @@ inline Field halo(const Field& X, const Mesh& M)
 {
     BL_PROFILE("zs::halo");
     if (X.face || X.ngv >= X.ng()) return X;
+    if (M.fill) return M.fill(X);
     X[0].FillBoundary(M.geom.periodicity());   // ghosts only: no value changes
     Field Y = X;
     Y.ngv = X.ng();
@@ -1241,6 +1250,7 @@ std::tuple<Field, Field> extrapolate(const Field& W_, const Field& Wb, const Fie
 inline Field divergence(const Field& Wm, const Field& Wp, const Mesh& M)
 {
     BL_PROFILE("zs::divergence");
+    if (M.log) M.log->push_back({Wm, Wp});
     Field out = cells_of(M, Wm.nq);
     const Geo g = M.g;
     auto o = out[0].arrays();
@@ -1712,5 +1722,199 @@ inline std::tuple<long> check_cfl(long tok, double dt_cfl, double dt)
     }
     return {tok + 1};
 }
+
+#ifdef ZS_PRECICE
+// ── preCICE ─────────────────────────────────────────────────────────────────
+// The app fills ``coupling()`` (couple_setup): the participant, the data
+// names and the coupled side; the coupled faces are that side's boundary
+// faces of this rank's boxes, one preCICE vertex each (this rank's only),
+// numbered box by box (x fastest).  Interface values live on the host as
+// rows x vertices; the effects only make preCICE API calls.
+struct Vertices { int nq = 0, n = 0; std::vector<double> v; };   // v[q n + j]
+struct Coupling
+{
+    std::unique_ptr<precice::Participant> participant;
+    std::string mesh;
+    std::vector<std::string> write, read;
+    int side = -1;                                  // 2 d + upper
+    Field index;                                    // vertex of a coupled face, -1 else
+    std::vector<precice::VertexID> ids;
+};
+inline Coupling& coupling() { static Coupling c; return c; }
+
+inline void couple_setup(const Mesh& M, const std::string& name, const std::string& config,
+                         const std::string& mesh, const std::vector<std::string>& write,
+                         const std::vector<std::string>& read, int side)
+{
+    auto& cpl = coupling();
+    cpl.mesh = mesh; cpl.write = write; cpl.read = read; cpl.side = side;
+    const int d = side/2, plane = (side & 1) ? M.g.hi[d] + 1 : M.g.lo[d];
+    cpl.index = faces_of(M, 1);
+    std::vector<int> first;                         // per local box: its first vertex
+    std::vector<double> xyz;
+    const int dims = std::max(D, 2);                // the preCICE mesh: 2-D at least
+    for (amrex::MFIter mfi(cpl.index[d]); mfi.isValid(); ++mfi)
+    {
+        first.push_back(int(xyz.size())/dims);
+        amrex::Box b = mfi.validbox();
+        if (b.smallEnd(d) > plane || b.bigEnd(d) < plane) continue;
+        b.setSmall(d, plane); b.setBig(d, plane);
+        amrex::LoopOnCpu(b, [&](int i, int j, int k)
+        {
+            const Col<3> X = face_centre(M.g, d, IV(AMREX_D_DECL(i, j, k)));
+            for (int a = 0; a < dims; ++a) xyz.push_back(a < D ? X(a, 0) : 0.0);
+        });
+    }
+    amrex::Gpu::DeviceVector<int> f0(first.size());
+    amrex::Gpu::copy(amrex::Gpu::hostToDevice, first.begin(), first.end(), f0.begin());
+    const int* fp = f0.data();
+    for (int a = 0; a < D; ++a)
+    {
+        auto o = cpl.index[a].arrays();
+        amrex::ParallelFor(cpl.index[a], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+        {
+            ZS_CELL;
+            if (a != d || c[d] != plane) { o[bx](c, 0) = -1.0; return; }
+            const auto lo = amrex::lbound(o[bx]), hi = amrex::ubound(o[bx]);
+            const int l[3] = {lo.x, lo.y, lo.z}, n[3] = {hi.x - lo.x + 1, hi.y - lo.y + 1, hi.z - lo.z + 1};
+            int idx = 0;
+            for (int e = D - 1; e >= 0; --e)
+                if (e != d) idx = idx*n[e] + (c[e] - l[e]);
+            o[bx](c, 0) = fp[bx] + idx;
+        });
+    }
+    amrex::Gpu::streamSynchronize();
+    cpl.ids.resize(xyz.size()/dims);
+    cpl.participant = std::make_unique<precice::Participant>(
+        name, config, amrex::ParallelDescriptor::MyProc(), amrex::ParallelDescriptor::NProcs());
+    cpl.participant->setMeshVertices(cpl.mesh, xyz, cpl.ids);
+}
+
+inline Field coupled_faces(const Mesh&)
+{
+    const Field& I = coupling().index;
+    Field out = like(I, 1);
+    for (int d = 0; d < D; ++d)
+    {
+        auto o = out[d].arrays();
+        auto x = I[d].const_arrays();
+        amrex::ParallelFor(out[d], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+        { ZS_CELL; o[bx](c, 0) = x[bx](c, 0) >= 0.0 ? 1.0 : 0.0; });
+    }
+    return out;
+}
+
+// the inner cell's state at every coupled face (vertex order), on the host
+inline Vertices interface_states(const Field& Q, const Mesh& M)
+{
+    const auto& cpl = coupling();
+    const int d = cpl.side/2, up = cpl.side & 1, nq = Q.nq, nv = int(cpl.ids.size());
+    amrex::Gpu::DeviceVector<double> v(size_t(nq)*std::max(nv, 1));
+    double* vp = v.data();
+    auto x = cpl.index[d].const_arrays();
+    auto q = Q[0].const_arrays();
+    amrex::ParallelFor(cpl.index[d], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        const int jv = int(x[bx](c, 0));
+        if (jv < 0) return;
+        const IV in = up ? c - unit(d) : c;
+        for (int r = 0; r < nq; ++r) vp[r*nv + jv] = q[bx](in, r);
+    });
+    Vertices out{nq, nv, std::vector<double>(size_t(nq)*nv)};
+    amrex::Gpu::copy(amrex::Gpu::deviceToHost, v.begin(), v.begin() + long(nq)*nv, out.v.begin());
+    amrex::Gpu::streamSynchronize();
+    (void)M;
+    return out;
+}
+
+// One Riemann problem per coupled face, posed low -> high (``kn`` =
+// numerical_face_sides): row 0 for the low side, row 1 for the high side;
+// each state's aux from the pointwise kernel on a zero template (false: zero)
+template<class K, class KA, class P>
+Field interface_flux(K kn, KA kaux, int side, const Field& Q, const Field& Qaux,
+                     const Vertices& peer, const P& p, const Mesh& M)
+{
+    const auto& cpl = coupling();
+    const int d = cpl.side/2, up = cpl.side & 1, nq = Q.nq, nv = peer.n;
+    Field out = faces_of(M, nq);
+    for (int a = 0; a < D; ++a) out[a].setVal(0.0);
+    amrex::Gpu::DeviceVector<double> pv(std::max<size_t>(peer.v.size(), 1));
+    amrex::Gpu::copy(amrex::Gpu::hostToDevice, peer.v.begin(), peer.v.end(), pv.begin());
+    const double* pp = pv.data();
+    const Geo g = M.g;
+    auto x = cpl.index[d].const_arrays();
+    auto q = Q[0].const_arrays();
+    auto o = out[d].arrays();
+    constexpr int NQ = K::n_in, NA = K::n_aux;
+    (void)Qaux;
+    amrex::ParallelFor(out[d], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        const int jv = int(x[bx](c, 0));
+        if (jv < 0) return;
+        const IV in = up ? c - unit(d) : c;
+        Col<NQ> own{}, other{};
+        for (int r = 0; r < NQ && r < nq; ++r) { own(r, 0) = q[bx](in, r); other(r, 0) = pp[r*nv + jv]; }
+        const Col<NQ>& lo = side == 0 ? own : other;
+        const Col<NQ>& hi = side == 0 ? other : own;
+        auto aux = [&](const Col<NQ>& s)
+        {
+            if constexpr (std::is_same_v<KA, bool>) return Col<NA>{};
+            else
+            {
+                const auto v = kaux(s, Col<KA::n_aux>{}, p, 0.0, 0.0, face_centre(g, d, c));
+                Col<NA> r{};
+                for (int m = 0; m < NA && m < KA::n_out; ++m) r(m, 0) = v(m, 0);
+                return r;
+            }
+        };
+        Real nn[3] = {0.0, 0.0, 0.0};
+        nn[d] = 1.0;                                // low -> high
+        const auto W = kn(lo, hi, aux(lo), aux(hi), p, normal<K::n_nrm>(nn));
+        for (int r = 0; r < nq; ++r) o[bx](c, r) = W(side*nq + r, 0);
+    });
+    amrex::Gpu::streamSynchronize();                // pv dies here
+    return out;
+}
+
+inline void couple_write_data(const Vertices& s)
+{
+    auto& cpl = coupling();
+    for (size_t i = 0; i < cpl.write.size(); ++i)
+        cpl.participant->writeData(cpl.mesh, cpl.write[i], cpl.ids,
+            std::vector<double>(s.v.begin() + long(i)*s.n, s.v.begin() + long(i + 1)*s.n));
+}
+inline std::tuple<long, bool> couple_init(long tok, const Vertices& s)
+{
+    auto& cpl = coupling();
+    if (cpl.participant->requiresInitialData()) couple_write_data(s);
+    cpl.participant->initialize();
+    return {tok + 1, cpl.participant->isCouplingOngoing()};
+}
+inline std::tuple<long, double> couple_max_dt(long tok)
+{ return {tok + 1, coupling().participant->getMaxTimeStepSize()}; }
+inline std::tuple<long, Vertices> couple_read(long tok)
+{
+    auto& cpl = coupling();
+    const int n = int(cpl.ids.size());
+    Vertices peer{int(cpl.read.size()), n, std::vector<double>(cpl.read.size()*n)};
+    std::vector<double> v(n);
+    for (size_t i = 0; i < cpl.read.size(); ++i)
+    {
+        cpl.participant->readData(cpl.mesh, cpl.read[i], cpl.ids, 0.0, v);
+        std::copy(v.begin(), v.end(), peer.v.begin() + long(i)*n);
+    }
+    return {tok + 1, peer};
+}
+inline std::tuple<long> couple_write(long tok, const Vertices& s)
+{ couple_write_data(s); return {tok + 1}; }
+inline std::tuple<long, bool> couple_advance(long tok, double dt)
+{
+    auto& cpl = coupling();
+    cpl.participant->advance(dt);
+    return {tok + 1, cpl.participant->isCouplingOngoing()};
+}
+#endif
 
 } // namespace zs

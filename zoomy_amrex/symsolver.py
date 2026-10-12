@@ -19,6 +19,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +30,8 @@ from zoomy_core.mesh import LSQMesh, ensure_lsq_mesh
 from zoomy_core.model.boundary_conditions import boundary_face_branches
 from zoomy_core.numerics import NumericalSystemModel
 from zoomy_core.solver.constants import ELLIPTIC_RTOL, elliptic_constants
-from zoomy_core.symsolver.program import chorin_program, chorin_systems, hyperbolic_program
+from zoomy_core.symsolver.program import (chorin_program, chorin_systems, hyperbolic_program,
+                                          hyperbolic_precice_program)
 from zoomy_amrex.symkernels import write_kernels
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,7 +42,8 @@ CONTAINERS = Path(os.environ.get("ZOOMY_AMREX_CONTAINERS",
 SIF = {False: CONTAINERS / "zoomy_amrex.sif", True: CONTAINERS / "zoomy_amrex_gpu.sif"}
 BUILD_CPUS = os.environ.get("ZOOMY_AMREX_BUILD_CPUS", "32-63")
 RUN_CPUS = os.environ.get("ZOOMY_AMREX_RUN_CPUS", "16-31")
-APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "UserFunctions.H", "ZoomyEig.H")
+APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "symsolver/amr_amrex.H",
+       "UserFunctions.H", "ZoomyEig.H")
 
 
 def _apptainer(gpu, script, binds=(), **kw):
@@ -75,6 +78,17 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
                                  doc="AMReX TinyProfiler build (a tree of its own).")
     build_only = param.Boolean(default=False,
                                doc="run() only builds (and caches) the binary.")
+    couple = param.Dict(default=None, allow_None=True, doc=(
+        "preCICE (a ZS_PRECICE build, a container with libprecice): dict("
+        "participant=, config=, mesh=, write=[..], read=[..], tag=, side=); "
+        "side 0: this domain is the low side of the interface."))
+    subcycling = param.Boolean(default=False, doc="preCICE: adaptive steps inside a window.")
+    amr = param.Dict(default=None, allow_None=True, doc=(
+        "AMR (one dt for all levels; amr_amrex.H): max_level, ratio (2), "
+        "regrid_int (0: the initial grids only), tag = (state name, 'value' | "
+        "'gradient', threshold) or region = (lo, hi), reflux (True), "
+        "blocking_factor (8), n_error_buf (2), grid_eff (0.7).  The CFL step "
+        "from the cells' wave speeds."))
 
     # ── printing ───────────────────────────────────────────────────────────
     def _systems(self, nsm):
@@ -97,7 +111,11 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
                     linsolve=self._linsolve(nsm))
 
     def _print(self, nsm, dimension):
-        return hyperbolic_program(nsm, **self._kw(nsm, dimension))
+        if self.couple:
+            return hyperbolic_precice_program(nsm, side=self.couple["side"],
+                                              subcycling=self.subcycling,
+                                              **self._kw(nsm, dimension))
+        return hyperbolic_program(nsm, amr=self.amr is not None, **self._kw(nsm, dimension))
 
     def _degree(self, nsm):
         return nsm.resolved_lsq_degree()
@@ -107,20 +125,21 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         """Print, write the build tree, make (cached).  Returns the binary."""
         self.source = self._print(nsm, dimension)
         CACHE.mkdir(parents=True, exist_ok=True)
-        tmp = CACHE / f"kernels_{os.getpid()}.H"
+        tmp = CACHE / f"kernels_{os.getpid()}_{threading.get_ident()}.H"   # per thread
         write_kernels(self._systems(nsm), self.source, tmp, dimension)
         files = {"Solver.H": self.source, "Kernels.H": tmp.read_text()}
         tmp.unlink()
         for f in APP:
             files[Path(f).name] = (SRC / f).read_text()
-        h = hashlib.sha256(f"{self.gpu}{self.tiny_profile}".encode())
+        cpl = bool(self.couple)
+        h = hashlib.sha256(f"{self.gpu}{self.tiny_profile}{cpl}".encode())
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
         binary = CACHE / "bin" / h.hexdigest()[:16] / "symAmrex.ex"
         if binary.exists():
             return binary
         tree = CACHE / (("gpu" if self.gpu else "cpu") + f"{dimension}d"
-                        + ("_tp" if self.tiny_profile else ""))
+                        + ("_tp" if self.tiny_profile else "") + ("_cpl" if cpl else ""))
         (tree / "Source").mkdir(parents=True, exist_ok=True)
         (tree / "Exec").mkdir(parents=True, exist_ok=True)
         with open(tree / ".lock", "w") as lock:
@@ -130,10 +149,10 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
                 if not p.exists() or p.read_text() != v:
                     p.write_text(v)
             (tree / "Source" / "Make.package").write_text(
-                "CEXE_sources += symAmrex.cpp\nCEXE_headers += rt_amrex.H Kernels.H "
+                "CEXE_sources += symAmrex.cpp\nCEXE_headers += rt_amrex.H amr_amrex.H Kernels.H "
                 "Solver.H UserFunctions.H ZoomyEig.H\n")
             (tree / "Exec" / "GNUmakefile").write_text(
-                _gnumakefile(self.gpu, self.tiny_profile, dimension))
+                _gnumakefile(self.gpu, self.tiny_profile, dimension, cpl))
             r = _apptainer(self.gpu, f"cd {tree}/Exec && taskset -c {BUILD_CPUS} "
                            f"make -j32 > make.log 2>&1; rc=$?; tail -30 make.log; "
                            f"exit $rc", capture_output=True, text=True)
@@ -148,10 +167,14 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         return binary
 
     # ── run ────────────────────────────────────────────────────────────────
-    def run(self, mesh, model, Q0, workdir, Qaux0=None):
+    def run(self, mesh, model, Q0, workdir, Qaux0=None, fine=()):
         """March ``Q0`` (mesh order); returns ``(time, Q)`` and keeps the
         snapshots in ``self.snapshots`` [(time, Q)] and the wall time of the
-        march in ``self.wall``."""
+        march in ``self.wall``.  AMR: ``fine`` = [(mesh_l, Q0_l)] the initial
+        state of level l on its whole (refined) domain (else interpolated);
+        ``Q`` is level 0 (the composite averaged down), ``self.initial`` its
+        initial state, ``self.levels`` each level's final state (NaN where it
+        has no cells; mesh_l order)."""
         nsm = (model if isinstance(model, NumericalSystemModel)
                else NumericalSystemModel.from_system_model(model))
         grid = cartesian(mesh)
@@ -171,6 +194,13 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
         to_grid(A0).tofile(case / "qaux0.bin")
         branch, periodic = sides(mesh, nsm, dim)
         (case / "lsq.txt").write_text(lsq_table(nsm, self._degree(nsm), grid, periodic))
+        amr = self._amr_inputs(case, nsm, grid, periodic, fine) if self.amr else ""
+        if self.couple:
+            c = self.couple
+            amr += (f"zs.precice = {c['participant']} {c['config']} {c['mesh']}\n"
+                    f"zs.precice_write = {' '.join(c['write'])}\n"
+                    f"zs.precice_read = {' '.join(c['read'])}\n"
+                    f"zs.precice_side = {side_of(mesh, c['tag'], dim)}\n")
         # boxes per rank: CPU ~8 (load balance across wet / dry / wall cells),
         # GPU ~1 (one launch covers all boxes; fewer, larger boxes)
         per = 1 if self.gpu else 8
@@ -185,7 +215,7 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
             f"zs.branch = {' '.join(map(str, branch))}\n"
             f"zs.lsq = lsq.txt\nzs.q0 = q0.bin\nzs.qaux0 = qaux0.bin\nzs.out = out\n"
             "amrex.the_arena_init_size = 1073741824\namrex.verbose = 0\n"
-            "tiny_profiler.device_synchronize_around_region = 1\n")
+            "tiny_profiler.device_synchronize_around_region = 1\n" + amr)
         launch = (f"mpirun --oversubscribe --bind-to none -n {self.ranks} "
                   if self.ranks > 1 or self.gpu else "")
         cpus = "" if self.gpu else f"taskset -c {RUN_CPUS} "
@@ -199,9 +229,55 @@ class SymbolicHyperbolicSolverAmrex(param.Parameterized):
                           if "march wall time" in ln), None)
         self.steps = next((int(ln.split()[-1]) for ln in log.splitlines()
                            if "loop iterations" in ln), None)
+        if self.amr:
+            self.levels = [_read(case / "out" / f"final_l{lv}.bin", g)[1]
+                           for lv, g in enumerate(self._grids)
+                           if (case / "out" / f"final_l{lv}.bin").exists()]
+            self.snapshots = []
+            self.initial = _read(case / "out" / "initial.bin", grid)[1]
+            return _read(case / "out" / "final.bin", grid)
         snaps = sorted((case / "out").glob("[0-9]*.bin"), key=lambda f: int(f.stem))
         self.snapshots = [_read(f, grid) for f in snaps]
         return _read(case / "out" / "final.bin", grid)
+
+    def _amr_inputs(self, case, nsm, grid, periodic, fine):
+        """Per-level LSQ tables and initial states, the AMR inputs."""
+        a = {**dict(ratio=2, regrid_int=0, reflux=True, blocking_factor=8, n_error_buf=2,
+                    grid_eff=0.7), **self.amr}
+        r, dim = int(a["ratio"]), grid["dim"]
+        self._grids, lsq, q0 = [], [], []
+        for lv in range(int(a["max_level"]) + 1):
+            n = [n * r**lv for n in grid["n"]]
+            g = dict(grid, n=n, d=[d / r**lv for d in grid["d"]], nc=int(np.prod(n)),
+                     order=np.arange(int(np.prod(n))))          # grid order
+            if 0 < lv <= len(fine):
+                g = cartesian(fine[lv - 1][0])
+                np.asarray(fine[lv - 1][1], dtype=np.float64)[:, g["order"]].tofile(
+                    case / f"q0_{lv}.bin")
+            self._grids.append(g)
+            (case / f"lsq_{lv}.txt").write_text(lsq_table(nsm, self._degree(nsm), g, periodic))
+            lsq.append(f"lsq_{lv}.txt")
+            q0.append("q0.bin" if lv == 0 else (f"q0_{lv}.bin" if lv <= len(fine) else "-"))
+        names = [str(v) for v in nsm.state]
+        tag = ""
+        if "tag" in a:
+            row, mode, thr = a["tag"]
+            tag = f"zs.tag = {['value', 'gradient'].index(mode)} {names.index(row)} {float(thr)!r}\n"
+        if "region" in a:
+            tag = (f"zs.tag_lo = {' '.join(map(repr, map(float, a['region'][0])))}\n"
+                   f"zs.tag_hi = {' '.join(map(repr, map(float, a['region'][1])))}\n")
+        mgs = self.max_grid_size or 32
+        f = lambda v: " ".join(repr(float(x)) for x in v)                  # noqa: E731
+        return (f"zs.amr = 1\nzs.lsq = {' '.join(lsq)}\nzs.q0 = {' '.join(q0)}\n{tag}"
+                f"zs.regrid_int = {int(a['regrid_int'])}\nzs.reflux = {int(bool(a['reflux']))}\n"
+                f"zs.dt_write = {float(self.dt_write or 0.0)!r}\n"
+                f"amr.n_cell = {' '.join(map(str, grid['n']))}\namr.max_level = {a['max_level']}\n"
+                f"amr.ref_ratio = {r}\namr.blocking_factor = {a['blocking_factor']}\n"
+                f"amr.max_grid_size = {mgs}\namr.n_error_buf = {a['n_error_buf']}\n"
+                f"amr.grid_eff = {a['grid_eff']!r}\namr.n_proper = 2\n"
+                f"geometry.coord_sys = 0\ngeometry.prob_lo = {f(grid['lo'])}\n"
+                f"geometry.prob_hi = {f(grid['hi'])}\n"
+                f"geometry.is_periodic = {' '.join(map(str, periodic))}\n")
 
 
 class SymbolicChorinSolverAmrex(SymbolicHyperbolicSolverAmrex):
@@ -232,6 +308,8 @@ class SymbolicChorinSolverAmrex(SymbolicHyperbolicSolverAmrex):
                     maxiter=self.pressure_maxit, accept=max(1e-6, 10.0 * tol))
 
     def _print(self, nsm, dimension):
+        if self.amr is not None:
+            raise NotImplementedError("AMR: the hyperbolic template only")
         newton = (None if self.pressure_solve == "linear" else
                   (sp.Float(self.pressure_newton_tol), int(self.pressure_newton_maxit)))
         return chorin_program(nsm, self.press, self.corr, time_order=self.time_order,
@@ -253,13 +331,15 @@ def cartesian(mesh):
     dim = int(mesh.dimension)
     nc = int(mesh.n_inner_cells)
     cc = np.asarray(mesh.cell_centers)[:dim, :nc]
+    vx = np.asarray(mesh.vertex_coordinates)[:dim]
     lo, hi, n, d = [], [], [], []
     for ax in range(dim):
-        u = np.unique(np.round(cc[ax], 9))
-        h = float(np.mean(np.diff(u))) if len(u) > 1 else 1.0
+        u = np.unique(np.round(cc[ax], 9))          # the distinct lines (count only)
+        a, b = float(vx[ax].min()), float(vx[ax].max())       # the domain: its vertices
+        h = (b - a) / len(u)
         if len(u) > 1 and not np.allclose(np.diff(u), h, rtol=1e-6, atol=0):
             raise NotImplementedError("zoomy_amrex symsolver: uniform Cartesian grids only")
-        lo.append(float(u.min() - h / 2)); hi.append(float(u.max() + h / 2))
+        lo.append(a); hi.append(b)
         n.append(len(u)); d.append(h)
     if int(np.prod(n)) != nc:
         raise NotImplementedError("zoomy_amrex symsolver: a full Cartesian grid only")
@@ -300,6 +380,17 @@ def sides(mesh, nsm, dim):
             branch.append(int(vals[0]))
         periodic.append(int(per))
     return branch + [-1] * (6 - len(branch)), periodic
+
+
+def side_of(mesh, tag, dim):
+    """The side (2 axis + upper) of the boundary faces tagged ``tag``."""
+    names = list(mesh.boundary_conditions_sorted_names)
+    nums = np.asarray(mesh.boundary_face_function_numbers, dtype=int)
+    faces = np.asarray(mesh.boundary_face_face_indices, dtype=int)
+    hit = [i for i in range(len(nums)) if names[nums[i]] == tag]
+    n = np.asarray(mesh.face_normals)[:dim, faces[hit]].mean(axis=1)
+    ax = int(np.argmax(np.abs(n)))
+    return 2 * ax + int(n[ax] > 0)
 
 
 def lsq_table(nsm, degree, grid, periodic):
@@ -381,11 +472,16 @@ def _read(path, grid):
     return float(time), out
 
 
-def _gnumakefile(gpu, tiny_profile=False, dim=2):
+def _gnumakefile(gpu, tiny_profile=False, dim=2, precice=False):
     import importlib.util
     spec = importlib.util.spec_from_file_location("_zoomy_amrex_build", ROOT / "build.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.GNUMAKEFILE.format(amrex_home="/opt/amrex", dim=dim, use_mpi="TRUE",
-                                  use_cuda="TRUE" if gpu else "FALSE", cuda_arch="89",
-                                  tiny_profile="TRUE" if tiny_profile else "FALSE")
+    mk = mod.GNUMAKEFILE.format(amrex_home="/opt/amrex", dim=dim, use_mpi="TRUE",
+                                use_cuda="TRUE" if gpu else "FALSE", cuda_arch="89",
+                                tiny_profile="TRUE" if tiny_profile else "FALSE")
+    if precice:                         # the container's libprecice (pkg-config)
+        mk = mk.replace("include ../Source/Make.package",
+                        "DEFINES += -DZS_PRECICE\nLIBRARIES += -lprecice\n"
+                        "include ../Source/Make.package")
+    return mk

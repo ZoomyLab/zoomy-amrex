@@ -1,6 +1,8 @@
 /*---------------------------------------------------------------------------*\
     symAmrex -- runs a printed symbolic solver (Solver.H) on a single-level
-    AMReX grid (rt_amrex.H, CPU / GPU / MPI).
+    AMReX grid (rt_amrex.H, CPU / GPU / MPI), or with zs.amr = 1 on an AMR
+    hierarchy (amr_amrex.H); built with ZS_PRECICE, one preCICE participant
+    (zs.precice*, rt_amrex.H couple_setup).
 
     inputs (ParmParse, prefix zs.):  n_cell, prob_lo, prob_hi, max_grid_size,
     time_end, branch (BC branch of x-lo x-hi y-lo y-hi z-lo z-hi), periodic (per
@@ -70,6 +72,7 @@ void dump(const std::string& path, double time, const zs::Field& F, const zs::Me
     const amrex::Box dom = M.geom.Domain();
     amrex::MultiFab all(amrex::BoxArray(dom), amrex::DistributionMapping(amrex::Vector<int>{0}),
                         F.nq, 0);
+    all.setVal(std::numeric_limits<double>::quiet_NaN());     // cells the level lacks
     all.ParallelCopy(F[0], 0, 0, F.nq);
     if (!amrex::ParallelDescriptor::IOProcessor()) return;
     amrex::FArrayBox host(dom, F.nq, amrex::The_Pinned_Arena());
@@ -84,10 +87,22 @@ void dump(const std::string& path, double time, const zs::Field& F, const zs::Me
 }
 }
 
+#ifdef ZS_AMR_PROCEDURES                // the program has the AMR procedures
+#include "amr_amrex.H"
+#endif
+
 int main(int argc, char* argv[])
 {
     amrex::Initialize(argc, argv);
     amrex::ExecOnFinalize(zs::close_pool);
+    int amr = 0;
+    amrex::ParmParse("zs").query("amr", amr);
+#ifdef ZS_AMR_PROCEDURES
+    if (amr) zs::run_amr();
+    else
+#else
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(!amr, "symAmrex: a program without AMR procedures");
+#endif
     {
         amrex::ParmParse pp("zs");
         amrex::Vector<int> n_cell, branch(6, -1), periodic(AMREX_SPACEDIM, 0);
@@ -149,6 +164,19 @@ int main(int argc, char* argv[])
         };
 
         Qaux = std::get<0>(zs::initial_aux(Q, Qaux, p, std::cref(M), 0L));
+#ifdef ZS_PRECICE
+        {   // zs.precice = participant config mesh; zs.precice_write / _read: data
+            // names; zs.precice_side: the coupled side (2 d + upper)
+            amrex::Vector<std::string> pc, wr, rd;
+            int side = -1;
+            pp.getarr("precice", pc);
+            pp.getarr("precice_write", wr);
+            pp.getarr("precice_read", rd);
+            pp.get("precice_side", side);
+            zs::couple_setup(M, pc[0], pc[1], pc[2], {wr.begin(), wr.end()},
+                             {rd.begin(), rd.end()}, side);
+        }
+#endif
         amrex::ParallelDescriptor::Barrier();
         const auto t0 = std::chrono::steady_clock::now();
         // the blocks synchronise where they read results on the host
@@ -164,6 +192,9 @@ int main(int argc, char* argv[])
             std::chrono::steady_clock::now() - t0).count();
         amrex::Print() << "symAmrex: march wall time " << wall << " s\n"
                        << "symAmrex: loop iterations (steps) " << zs::loop_iterations() << "\n";
+#ifdef ZS_PRECICE
+        zs::coupling().participant->finalize();
+#endif
         dump(out + "/final.bin", std::get<0>(res), std::get<1>(res), M);
         amrex::Print() << "symAmrex: t = " << std::get<0>(res) << "\n";
     }
