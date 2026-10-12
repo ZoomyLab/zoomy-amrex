@@ -1642,6 +1642,7 @@ Field linsolve(F op, const Field& b)
 
 // ── diffusion ───────────────────────────────────────────────────────────────
 /// div(A : grad X) per cell (zoomy_core's diffusion block, a TPFA): per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells' tensors, X_out the ghost across a boundary face and the partner cell across a periodic side; not refluxed (no AMR).
+/// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 template<class K, class G, class P, class T>
 Field diffusion(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
                 const Mesh& M)
