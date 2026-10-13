@@ -605,7 +605,7 @@ def hypre_prefix(gpu):
         return prefix
     if not HYPRE_SCRIPT.exists():
         raise RuntimeError(f"no hypre in {prefix}: build it with build_hypre_cuda.sh {variant} "
-                           "(Zoomy containers/zoomy_amrex), or linear_solver='gmres'")
+                           "(Zoomy containers/zoomy_amrex), or linear_solver=LinearSolver.gmres")
     HYPRE_CACHE.mkdir(parents=True, exist_ok=True)
     with open(HYPRE_CACHE / f".hypre-{variant}.lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

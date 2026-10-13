@@ -16,7 +16,7 @@ import time
 import numpy as np
 import pytest
 import zoomy_core.model.initial_conditions as IC
-from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.numerics import Limiter, NumericalSystemModel, ReconstructionSpec
 from zoomy_core.systemmodel.system_model import SystemModel
 
 from tests import models, refs
@@ -41,7 +41,7 @@ def test_amrex_numpy_parity(overwrite, N_CELLS):
     sm = SystemModel.from_model(model)
     sm.initial_conditions = IC.UserFunction(function=stoker_ic)
     nsm = NumericalSystemModel.from_system_model(
-        sm, reconstruction=ReconstructionSpec(order=1, limiter="minmod"))
+        sm, reconstruction=ReconstructionSpec(order=1, limiter=Limiter.minmod))
     print(describe(nsm))
 
     settings = {"dimension": 1, "domain": list(DOMAIN), "n_cells": N_CELLS,
