@@ -1,12 +1,17 @@
 /// \file
 /// symAmrex: runs a printed symbolic solver (Solver.H) on a single-level AMReX grid (rt_amrex.H; CPU / GPU / MPI), or with zs.amr = 1 on an AMR hierarchy (amr_amrex.H), optionally as one preCICE participant.
-/// Inputs are the ParmParse zs.* keys (n_cell, prob_lo / prob_hi, branch, periodic, lsq, q0 / qaux0, out); it writes each io.write snapshot as plotfile plt<k> and raw dump <k>.bin, and the final state as final.bin.
+/// Inputs are the ParmParse zs.* keys (n_cell, prob_lo / prob_hi, branch, periodic, lsq, q0 / qaux0, out, time_start, restart, checkpoint); it writes each io.write snapshot as plotfile plt<k> and raw dump <k>.bin, the final state as final.bin and each io.save_state as the checkpoint directory chk<t>.
 #include <AMReX.H>
 #include <AMReX_ParmParse.H>
 #include <AMReX_PlotFileUtil.H>
+#include <AMReX_Utility.H>
+#include <AMReX_VisMF.H>
 
 #include <chrono>
 #include <cstdio>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 
 #include "rt_amrex.H"
@@ -75,6 +80,66 @@ void dump(const std::string& path, double time, const zs::Field& F, const zs::Me
     std::fwrite(host.dataPtr(), sizeof(double), size_t(F.nq)*dom.numPts(), f);
     std::fclose(f);
 }
+
+/// The restart state as an AMReX checkpoint directory: Header (format, time, rows and valid ghost
+/// layers of Q and Qaux, the BoxArray) and the MultiFabs Q, Qaux (VisMF: every rank its own boxes,
+/// ghost cells included).
+void save_state(const std::string& dir, double time, const zs::Field& Q, const zs::Field& Qaux,
+                const zs::Mesh& M)
+{
+    amrex::UtilCreateCleanDirectory(dir, true);
+    amrex::VisMF::Write(Q[0], dir + "/Q");
+    amrex::VisMF::Write(Qaux[0], dir + "/Qaux");
+    if (amrex::ParallelDescriptor::IOProcessor())
+    {
+        std::ofstream h(dir + "/Header");
+        h << "zoomy-restart-1\n" << std::setprecision(17) << time << "\n" << Q.nq << " " << Q.ngv
+          << " " << Qaux.nq << " " << Qaux.ngv << "\n";
+        M.ba.writeOn(h);
+        h << "\n";
+    }
+    amrex::ParallelDescriptor::Barrier();
+}
+
+/// Read a save_state checkpoint into Q, Qaux; returns its time.  The same BoxArray: the boxes with
+/// their ghost cells as saved; another one: the valid cells redistributed, the halo refilled.
+double load_state(const std::string& dir, zs::Field& Q, zs::Field& Qaux, const zs::Mesh& M)
+{
+    std::ifstream h(dir + "/Header");
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(h.good(), "symAmrex: no restart state " + dir + "/Header");
+    std::string fmt;
+    double time = 0.0;
+    int nq = -1, ngq = 0, na = -1, nga = 0;
+    amrex::BoxArray ba;
+    h >> fmt >> time >> nq >> ngq >> na >> nga;
+    ba.readFrom(h);
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(fmt == "zoomy-restart-1" && nq == Q.nq && na == Qaux.nq,
+                                     "symAmrex: " + dir + " is not a restart state of this model");
+    const bool same = ba == M.ba;
+    for (auto [F, name, ngv] : {std::make_tuple(&Q, "Q", ngq), std::make_tuple(&Qaux, "Qaux", nga)})
+    {
+        if (same)
+        {
+            amrex::VisMF::Read((*F)[0], dir + "/" + name);
+            F->ngv = ngv;
+            continue;
+        }
+        amrex::MultiFab tmp;
+        amrex::VisMF::Read(tmp, dir + "/" + name);
+        (*F)[0].ParallelCopy(tmp, 0, 0, (*F)[0].nComp());
+        F->ngv = 0;
+        *F = zs::halo(*F, M);
+    }
+    return time;
+}
+
+/// Directory name of a time (12 significant digits).
+std::string time_name(double t)
+{
+    std::ostringstream s;
+    s << std::setprecision(12) << t;
+    return s.str();
+}
 }
 
 #ifdef ZS_AMR_PROCEDURES                // the program has the AMR procedures
@@ -99,8 +164,8 @@ int main(int argc, char* argv[])
         amrex::Vector<int> n_cell, branch(6, -1), periodic(AMREX_SPACEDIM, 0);
         amrex::Vector<amrex::Real> lo, hi;
         int max_grid_size = 64;
-        double time_end = 0.0;
-        std::string lsq, q0, qaux0, out = ".";
+        double time_end = 0.0, time_start = 0.0;
+        std::string lsq, q0, qaux0, out = ".", restart, checkpoint;
         pp.getarr("n_cell", n_cell);
         pp.getarr("prob_lo", lo);
         pp.getarr("prob_hi", hi);
@@ -114,6 +179,10 @@ int main(int argc, char* argv[])
         pp.query("q0", q0);
         pp.query("qaux0", qaux0);
         pp.query("out", out);
+        pp.query("time_start", time_start);
+        pp.query("restart", restart);           // a save_state checkpoint directory
+        checkpoint = out;
+        pp.query("checkpoint", checkpoint);     // where save_state writes chk<t>
 
         amrex::IntVect hi_cell;
         amrex::Array<int, AMREX_SPACEDIM> per;
@@ -155,6 +224,22 @@ int main(int argc, char* argv[])
         };
 
         Qaux = std::get<0>(zs::initial_aux(Q, Qaux, p, std::cref(M), 0L));
+        if (!restart.empty())
+        {
+            zs::Field Qr = zs::cells_of(M, Q.nq), Ar = zs::cells_of(M, Qaux.nq);
+            const double tr = load_state(restart, Qr, Ar, M);
+            zs::loader() = [Qr, Ar, tr](double& t, zs::Field& q, zs::Field& a)
+            {
+                t = tr;
+                q = Qr;
+                a = Ar;
+            };
+        }
+        amrex::UtilCreateDirectory(checkpoint, 0755);
+        zs::saver() = [&](double t, const zs::Field& q, const zs::Field& qa)
+        {
+            save_state(checkpoint + "/chk" + time_name(t), t, q, qa, M);
+        };
 #ifdef ZS_PRECICE
         {   // zs.precice = participant config mesh; zs.precice_write / _read: data
             // names; zs.precice_side: the coupled side (2 d + upper)
@@ -175,8 +260,9 @@ int main(int argc, char* argv[])
         const auto res = [&]
         {
             amrex::Gpu::NoSyncRegion no_sync;
-            return zs::march(Q, Qaux, p, time_end, std::cref(M));
+            return zs::march(Q, Qaux, p, time_start, time_end, std::cref(M));
         }();
+        zs::loader() = nullptr;                  // its Fields before amrex::Finalize
         amrex::Gpu::streamSynchronize();
         amrex::ParallelDescriptor::Barrier();
         const double wall = std::chrono::duration<double>(
