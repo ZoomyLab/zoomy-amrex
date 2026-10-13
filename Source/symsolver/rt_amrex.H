@@ -557,13 +557,14 @@ template<class... I> Rows rows_of(const std::tuple<I...>& t)
     return R;
 }
 
-/// Device view of a row subset (put / take are lazy too): row n is row R.r[n] of the field.
+/// Device view of a row subset (put / take are lazy too): row n is row R.r[n] of the field; a
+/// one-row subset broadcasts, like a one-row field.
 struct DRows
 {
     DLeaf a;
     Rows R;
     AMREX_GPU_HOST_DEVICE Real operator()(int bx, const IV& c, int n) const
-    { return a.a[bx](c, R.r[n]); }
+    { return a.a[bx](c, R.r[R.n == 1 ? 0 : n]); }
 };
 /// Expression node for take: a row view of src, no copy.
 struct XRows
@@ -1256,6 +1257,41 @@ std::tuple<Field, Field> extrapolate(const Field& W_, const Field& G_, const P& 
         });
     }
     return {L, R};
+}
+
+/// Cell mask: 1 where the depth Q[depth] + phi[depth] G[w] . r_f falls below -(1/tol - 1) Q[depth] at a face, (depth, w) = rows: the a-priori front detector (ReconstructionSpec.front_tol).
+/// Ref: Gallardo, Pares, Castro 2007, https://doi.org/10.1016/j.jcp.2007.08.007
+template<class P, class... I>
+Field front_cells(const Field& Q, const Field& G, const P& phi_, const std::tuple<I...>& rows,
+                  Real tol, const Mesh& M)
+{
+    BL_PROFILE("zs::front_cells");
+    const Rows R = rows_of(rows);
+    const int dr = R.r[0], wr = R.r[1];
+    Field out = like(Q, 1);
+    out.ngv = 0;
+    const Geo g = M.g;
+    Src phi;
+    Field keep;                         // phi's storage lives through the launch
+    if constexpr (std::is_arithmetic_v<P>) phi = src(phi_, 0);
+    else { keep = Field(phi_); phi = src(keep, 0); }
+    auto o = out[0].arrays();
+    auto q = Q[0].const_arrays();
+    auto gg = G[0].const_arrays();
+    amrex::ParallelFor(out[0], IV(0),
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        const Real h = q[bx](c, dr);
+        Real low = h;                   // the face centres: +- dx/2 along each axis
+        for (int a = 0; a < D; ++a)
+        {
+            const Real s = phi(bx, c, dr)*gg[bx](c, D*wr + a)*0.5*g.dx[a];
+            low = amrex::min(low, h - std::abs(s));
+        }
+        o[bx](c, 0) = low < h*(1.0 - 1.0/tol) ? 1.0 : 0.0;
+    });
+    return out;
 }
 
 /// Per cell sum_f |f| W / |V| over its faces: Wm where it owns the face, Wp where it is the other cell; the face terms are logged for refluxing on an AMR level.
