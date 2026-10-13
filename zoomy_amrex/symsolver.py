@@ -1,6 +1,6 @@
 """Driver of the symbolic solvers on AMReX: prints the C++ solver, builds it in the AMReX apptainer,
 runs it on the mesh's uniform Cartesian grid and reads the result back.  Sits behind the C++ solver
-template (:mod:`zoomy_core.symsolver.backend_cxx`) and in front of ``Source/symsolver``.
+template (`zoomy_core.symsolver.backend_cxx`) and in front of `Source/symsolver`.
 """
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "symsolver/amr_amrex.H"
 
 
 def _apptainer(gpu, script, binds=(), **kw):
-    """Run the shell ``script`` in the CPU or GPU AMReX apptainer with the cache and ``binds``
+    """Run the shell `script` in the CPU or GPU AMReX apptainer with the cache and `binds`
     mounted.
     """
     cmd = ["apptainer", "exec", "--cleanenv", *(["--nv"] if gpu else [])]
@@ -60,8 +60,8 @@ _AMREX_SOLVERS = [LinearSolver.hypre, LinearSolver.gmres]
 
 
 class AmrexDriver(param.Parameterized):
-    """Builds, launches and reads back the AMReX C++ solver of a ``backend_cxx`` template: build
-    tree, Cartesian case with LSQ tables and inputs, optional AMR levels, ``mpirun``.
+    """Builds, launches and reads back the AMReX C++ solver of a `backend_cxx` template: build
+    tree, Cartesian case with LSQ tables and inputs, optional AMR levels, `mpirun`.
 
     References:
         Zhang et al. 2019, https://doi.org/10.21105/joss.01370
@@ -96,10 +96,10 @@ class AmrexDriver(param.Parameterized):
     # ── build ──────────────────────────────────────────────────────────────
     def build(self, nsm, dimension, classes=None):
         """Print the solver, write the build tree and make it, cached by a hash of the sources.
-        Called by :meth:`run`.
+        Called by `run`.
 
         Args:
-            classes: boundary-closure classes of the case (:func:`lsq_fit`); without, no closure in
+            classes: boundary-closure classes of the case (`lsq_fit`); without, no closure in
                 the derivative aux.
         Returns:
             Path of the binary.
@@ -156,16 +156,16 @@ class AmrexDriver(param.Parameterized):
 
     # ── run ────────────────────────────────────────────────────────────────
     def run(self, mesh, model, Q0, workdir, Qaux0=None, fine=()):
-        """March ``Q0`` (mesh order) to ``time_end`` and return ``(time, Q)``; snapshots, wall time
-        and (AMR) per-level states stay in ``self.snapshots``, ``self.wall``, ``self.initial`` and
-        ``self.levels``.
+        """March `Q0` (mesh order) to `time_end` and return `(time, Q)`; snapshots, wall time
+        and (AMR) per-level states stay in `self.snapshots`, `self.wall`, `self.initial` and
+        `self.levels`.
 
         Args:
-            fine: AMR only, ``[(mesh_l, Q0_l)]`` the initial state of level l on its refined domain
+            fine: AMR only, `[(mesh_l, Q0_l)]` the initial state of level l on its refined domain
                 (else interpolated).
         Returns:
-            ``(time, Q)`` with ``Q`` on level 0 (the composite averaged down); the binary if
-                ``build_only``.
+            `(time, Q)` with `Q` on level 0 (the composite averaged down); the binary if
+                `build_only`.
         """
         nsm = self._prepare(mesh, model)
         if (self.amr or self.couple) and (self.restart_from is not None
@@ -254,7 +254,7 @@ class AmrexDriver(param.Parameterized):
         return _read(case / "out" / "final.bin", grid)
 
     def _lsq_fit(self, nsm, grid, branch):
-        """LSQ fits of ``grid`` with the boundary closure of every system the template
+        """LSQ fits of `grid` with the boundary closure of every system the template
         differentiates.
         """
         return lsq_fit(nsm, [s for _, s in self._systems(nsm)[1:]], self._degree(nsm),
@@ -320,9 +320,9 @@ class SymbolicChorinSolverAmrex(AmrexDriver, CxxChorinBackend):
 
 # ── the grid ────────────────────────────────────────────────────────────────
 def cartesian(mesh):
-    """The mesh's uniform Cartesian grid (1-3-D) as a dict: ``lo, hi, n, d``, the grid order of the
+    """The mesh's uniform Cartesian grid (1-3-D) as a dict: `lo, hi, n, d`, the grid order of the
     cells (x fastest) and each cell's grid index.  Anything but a full uniform grid raises
-    ``NotImplementedError``.
+    `NotImplementedError`.
     """
     dim = int(mesh.dimension)
     nc = int(mesh.n_inner_cells)
@@ -380,7 +380,7 @@ def sides(mesh, nsm, dim):
 
 
 def side_of(mesh, tag, dim):
-    """The side (``2 * axis + upper``) of the boundary faces tagged ``tag``."""
+    """The side (`2 * axis + upper`) of the boundary faces tagged `tag`."""
     names = list(mesh.boundary_conditions_sorted_names)
     nums = np.asarray(mesh.boundary_face_function_numbers, dtype=int)
     faces = np.asarray(mesh.boundary_face_face_indices, dtype=int)
@@ -391,22 +391,22 @@ def side_of(mesh, tag, dim):
 
 
 def _owner(nsm):
-    """The name a system's closure classes are keyed by (``lsq_closure_class``)."""
+    """The name a system's closure classes are keyed by (`lsq_closure_class`)."""
     return getattr(nsm, "_symbolic_name", None) or "nsm"
 
 
 def lsq_fit(nsm, systems, degree, grid, branch):
-    """LSQ topology and geometry (``lsq_gradQ``; for degree >= 2 also the boundary closure
-    ``lsq_closure``) of a proxy mesh with ``grid``'s spacing, its sides carrying the case's BC
+    """LSQ topology and geometry (`lsq_gradQ`; for degree >= 2 also the boundary closure
+    `lsq_closure`) of a proxy mesh with `grid`'s spacing, its sides carrying the case's BC
     branches.  Closure classes are renumbered by the kinds of the six sides, so a class has the same
-    id on every proxy (grid size, AMR level) and in ``Kernels.H``.
+    id on every proxy (grid size, AMR level) and in `Kernels.H`.
 
     Args:
-        systems: further systems the template differentiates besides ``nsm``.
-        branch: BC branch per side (:func:`sides`; -1: periodic, no closure).
+        systems: further systems the template differentiates besides `nsm`.
+        branch: BC branch per side (`sides`; -1: periodic, no closure).
     Returns:
-        dict ``proxy, np, topo, geom, order, classes``; ``classes`` maps ``(owner, kind)`` (``kind``
-        ``"state"`` or ``"reconstruction"``) to the class per row.
+        dict `proxy, np, topo, geom, order, classes`; `classes` maps `(owner, kind)` (`kind`
+        `"state"` or `"reconstruction"`) to the class per row.
     References:
         Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
     """
@@ -437,12 +437,12 @@ def lsq_fit(nsm, systems, degree, grid, branch):
 
 def lsq_table(fit, grid, periodic, owner):
     """Text table of the LSQ stencils and weights per cell class (distance to each side, up to the
-    stencil reach), read by ``zs::Mesh::load``.  Each class has the base list and one list per
+    stencil reach), read by `zs::Mesh::load`.  Each class has the base list and one list per
     boundary-closure class; a periodic axis uses the interior class, its seam samples being halo
     cells.
 
     Args:
-        fit: result of :func:`lsq_fit`.
+        fit: result of `lsq_fit`.
         owner: system whose reconstruction classes (the O2 gradient) follow the monomials.
     Returns:
         The table as text.
@@ -468,7 +468,7 @@ def lsq_table(fit, grid, periodic, owner):
     d = np.asarray(h)
 
     def samples(c, W):      # W (R, n_mon) in lsq_gradQ's layout: stencil cells, boundary slots
-        """Samples ``(kind, offset, weights)`` of cell ``c`` from the rows ``W`` of ``lsq_gradQ``'s
+        """Samples `(kind, offset, weights)` of cell `c` from the rows `W` of `lsq_gradQ`'s
         layout (kind 1: boundary ghost).
         """
         row, smp = 0, []
@@ -488,7 +488,7 @@ def lsq_table(fit, grid, periodic, owner):
         return smp
 
     def lists(c):           # the base list, then the closure classes' (None: the base)
-        """The base sample list of cell ``c``, then one per closure class (None: the base list
+        """The base sample list of cell `c`, then one per closure class (None: the base list
         applies).
         """
         out = [samples(c, A[c])]
@@ -504,8 +504,8 @@ def lsq_table(fit, grid, periodic, owner):
             raise RuntimeError(f"LSQ reach {R}: proxy grid too small")
 
     def key(i, m, per):     # a periodic axis has no sides: the interior stencil,
-        """Class of index ``i`` of ``m`` cells along an axis: distance to each side up to the reach
-        ``R``; a periodic axis has the interior class.
+        """Class of index `i` of `m` cells along an axis: distance to each side up to the reach
+        `R`; a periodic axis has the interior class.
         """
         return (R, R) if per else (min(i, R), min(m - 1 - i, R))   # wrapped by the halo
     keys = [sorted({key(i, np_[ax], periodic[ax]) for i in range(np_[ax])})
@@ -560,7 +560,7 @@ def restart_dir(path):
 
 
 def _read(path, grid):
-    """Read an output file of the app; returns ``(time, Q)`` with ``Q`` in mesh order."""
+    """Read an output file of the app; returns `(time, Q)` with `Q` in mesh order."""
     raw = np.fromfile(path, dtype=np.float64)
     dim = grid["dim"]
     time, nq = raw[0], int(raw[1])
@@ -571,8 +571,8 @@ def _read(path, grid):
 
 
 def hypre_prefix(gpu):
-    """The hypre install of the CPU or GPU build (``~/.cache/zoomy/hypre-{cpu,cuda}-3.2.0``),
-    built first by ``containers/zoomy_amrex/build_hypre_cuda.sh`` when missing.
+    """The hypre install of the CPU or GPU build (`~/.cache/zoomy/hypre-{cpu,cuda}-3.2.0`),
+    built first by `containers/zoomy_amrex/build_hypre_cuda.sh` when missing.
 
     References:
         Falgout, Yang 2002, https://doi.org/10.1007/3-540-47789-6_66
@@ -601,7 +601,7 @@ def hypre_prefix(gpu):
 
 def _gnumakefile(gpu, tiny_profile=False, dim=2, precice=False, hypre=None):
     """Text of the AMReX GNUmakefile (CPU or GPU, dimension, optional preCICE, optional hypre
-    install ``hypre``)."""
+    install `hypre`)."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("_zoomy_amrex_build", ROOT / "build.py")
     mod = importlib.util.module_from_spec(spec)

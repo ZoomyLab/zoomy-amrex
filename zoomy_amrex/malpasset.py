@@ -2,28 +2,28 @@
 """Project the Malpasset triangular benchmark onto a structured AMReX grid.
 
 The benchmark ships as an unstructured triangular mesh
-(``data/malpasset/geo_malpasset-small.msh``) carrying, as gmsh ``$NodeData``,
-the survey bathymetry ``B`` and the reservoir-full initial condition
-(``H`` depth, ``U``/``V`` velocity — both zero, water at rest).  AMReX is a
+(`data/malpasset/geo_malpasset-small.msh`) carrying, as gmsh `$NodeData`,
+the survey bathymetry `B` and the reservoir-full initial condition
+(`H` depth, `U`/`V` velocity — both zero, water at rest).  AMReX is a
 *structured* (rectangular) framework, so we:
 
 1. take the axis-aligned bounding box of the triangulation as the rectangular
    ("quadrilateral") AMReX domain — the simplest way to embed the irregular
    catchment without embedded boundaries (EB);
-2. interpolate ``B`` and ``H`` from the triangle vertices onto the structured
+2. interpolate `B` and `H` from the triangle vertices onto the structured
    cell centres with a linear *triangle* interpolant
-   (``matplotlib.tri.LinearTriInterpolator``), which masks points that fall
+   (`matplotlib.tri.LinearTriInterpolator`), which masks points that fall
    *outside* the actual (non-convex) mesh — so the real, irregular boundary is
    respected, not just the convex hull;
 3. turn the masked exterior into a closed wall by raising the bed there above
    the reservoir surface and leaving it dry.
 
-The result is two row-major ``float64`` ``.raw`` rasters (bed → state comp 0,
-depth → state comp 1) laid out exactly as ``init_solution.cpp`` expects
-(``idx = i + nx*j``), plus the geometry the driver needs.
+The result is two row-major `float64` `.raw` rasters (bed → state comp 0,
+depth → state comp 1) laid out exactly as `init_solution.cpp` expects
+(`idx = i + nx*j`), plus the geometry the driver needs.
 
-Wet/dry on the structured grid is handled by the driver's ``h_min`` flux floor
-+ negative-depth clamp (see ``Source/constants.H`` / ``make_rhs.H``); here we
+Wet/dry on the structured grid is handled by the driver's `h_min` flux floor
++ negative-depth clamp (see `Source/constants.H` / `make_rhs.H`); here we
 only set the static bathymetry and the still-water IC.
 """
 import os
@@ -51,16 +51,16 @@ def _read_mesh(msh_path):
 
 def prepare_rasters(msh_path, out_dir, ncell_x=180, ncell_y=96,
                     wall_above=5.0, pad_frac=0.0, subsample=4, bed_agg="min"):
-    """Write ``bed.raw`` + ``depth.raw`` and return the AMReX geometry dict.
+    """Write `bed.raw` + `depth.raw` and return the AMReX geometry dict.
 
-    Depth is ``max(0, surface - bed)``; the still-water surface (reservoir eta=100, sea eta=0) is preserved.
+    Depth is `max(0, surface - bed)`; the still-water surface (reservoir eta=100, sea eta=0) is preserved.
 
     Args:
         ncell_x, ncell_y: Structured resolution.
         wall_above: Exterior wall bed = max reservoir surface + this (metres).
         pad_frac: Optional bounding-box padding as a fraction of each span.
         subsample: Sub-grid factor per cell for the bathymetry aggregation.
-        bed_agg: ``"min"`` keeps the lowest sub-grid point (channel-preserving, keeps the narrow gorge open at coarse resolution); ``"mean"`` is the plain cell average.
+        bed_agg: `"min"` keeps the lowest sub-grid point (channel-preserving, keeps the narrow gorge open at coarse resolution); `"mean"` is the plain cell average.
     """
     from matplotlib.tri import Triangulation, LinearTriInterpolator
 

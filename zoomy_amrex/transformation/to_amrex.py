@@ -1,7 +1,7 @@
-"""Printers of a frozen :class:`SystemModel` for the AMReX C++ drivers: ``Model.H`` (source,
-Jacobians, aux update, eigenvalues, BC and Chorin kernels) and ``Numerics.H`` (core's
-``AmrexNumerics``).  Opaque calls (``eigensystem``, ``eigenvalues``, ``solve``, ...) are routed to
-the hand-written ``UserFunctions.H``, as foam does.
+"""Printers of a frozen `SystemModel` for the AMReX C++ drivers: `Model.H` (source,
+Jacobians, aux update, eigenvalues, BC and Chorin kernels) and `Numerics.H` (core's
+`AmrexNumerics`).  Opaque calls (`eigensystem`, `eigenvalues`, `solve`, ...) are routed to
+the hand-written `UserFunctions.H`, as foam does.
 """
 
 import functools
@@ -17,7 +17,7 @@ from zoomy_core.transformation.to_amrex import AmrexCore, AmrexNumerics
 # produce an ``int`` that breaks ``amrex::max(int, double)``.  Core's default
 # emits raw ``(c ? t : f)``; we override only the type.
 def _conditional_real(p, c, t, f):
-    """Print ``conditional`` with both branches cast to ``amrex::Real`` (else ``amrex::max`` sees an
+    """Print `conditional` with both branches cast to `amrex::Real` (else `amrex::max` sees an
     int).
     """
     return (f"(({p.doprint(c)}) ? (amrex::Real({p.doprint(t)})) "
@@ -28,7 +28,7 @@ def _conditional_real(p, c, t, f):
 # ``d/dh Max(h, c) = Heaviside(h - c, 1/2)`` (the friction h-floor). C++ has no
 # Heaviside; lower it to a branch with the same value-at-zero ``h0``.
 def _heaviside_real(p, x, *h0):
-    """Print the two-argument ``Heaviside(x, h0)`` as a branch with value ``h0`` at zero."""
+    """Print the two-argument `Heaviside(x, h0)` as a branch with value `h0` at zero."""
     xv = p.doprint(x)
     h0v = p.doprint(h0[0]) if h0 else "0.5"
     return (f"(({xv}) > 0.0 ? amrex::Real(1.0) "
@@ -36,10 +36,10 @@ def _heaviside_real(p, x, *h0):
 
 
 def _emit_user_call(name):
-    """Return a ``c_functions`` printer emitting the opaque call ``amrex_user::<name>(args)``."""
+    """Return a `c_functions` printer emitting the opaque call `amrex_user::<name>(args)`."""
 
     def _printer(p, *args):
-        """Print the opaque call ``amrex_user::<name>(args)``."""
+        """Print the opaque call `amrex_user::<name>(args)`."""
         return f"amrex_user::{name}({', '.join(p.doprint(a) for a in args)})"
 
     return _printer
@@ -63,8 +63,8 @@ def _emit_user_call(name):
 # searched.  Without these three entries ``--model vam`` fails to compile with
 # "'eigenvalues' was not declared in this scope".
 class AmrexNumericsPrinter(AmrexNumerics):
-    """Core's ``AmrexNumerics`` with real-valued ``conditional`` / ``Heaviside`` and the opaque
-    eigen- and solve calls routed to ``amrex_user``.
+    """Core's `AmrexNumerics` with real-valued `conditional` / `Heaviside` and the opaque
+    eigen- and solve calls routed to `amrex_user`.
     """
     c_functions = {**AmrexNumerics.c_functions, "conditional": _conditional_real,
                    "Heaviside": _heaviside_real,
@@ -75,8 +75,8 @@ class AmrexNumericsPrinter(AmrexNumerics):
 
 
 class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
-    """Emit ``Model.H`` (operators, BC kernels, state-row map, Chorin metadata) from a frozen
-    :class:`SystemModel`.  Called by :func:`generate_headers` and :func:`write_chorin_headers`.
+    """Emit `Model.H` (operators, BC kernels, state-row map, Chorin metadata) from a frozen
+    `SystemModel`.  Called by `generate_headers` and `write_chorin_headers`.
     """
 
     _wrapper_name = "Model"
@@ -95,7 +95,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
     }
 
     def _detect_has_diffusion(self):
-        """Whether the model's ``diffusion_matrix`` is non-zero (sets ``Model::has_diffusion``)."""
+        """Whether the model's `diffusion_matrix` is non-zero (sets `Model::has_diffusion`)."""
         import sympy as _sp
         expr = getattr(self.sm, "diffusion_matrix", None)
         if expr is None:
@@ -106,15 +106,15 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
     def __init__(self, sm, *, analytical_eigenvalues=True, wrapper_name="Model",
                  time_position_ops=False):
-        """Bind the SystemModel ``sm`` and register the Q, Qaux, n, p, X and time symbol maps;
-        ``dt`` is appended to ``p`` when an operator uses it.
+        """Bind the SystemModel `sm` and register the Q, Qaux, n, p, X and time symbol maps;
+        `dt` is appended to `p` when an operator uses it.
 
         Args:
             analytical_eigenvalues: print the model's eigenvalues; else zeros (the backend then uses
                 a numerical spectral radius).
             wrapper_name: name of the emitted struct.
-            time_position_ops: ``source`` / ``update_aux_variables`` take ``(time, X)`` (hyperbolic
-                ``Model.H`` only).
+            time_position_ops: `source` / `update_aux_variables` take `(time, X)` (hyperbolic
+                `Model.H` only).
         """
         super().__init__()
         self.sm = sm
@@ -160,8 +160,8 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         self.symbol_maps.append({sm.time: "time"})
 
     def _uses_symbol(self, sym):
-        """True if ``sym`` appears in any printed operator (decides whether ``dt`` is appended to
-        ``p``).
+        """True if `sym` appears in any printed operator (decides whether `dt` is appended to
+        `p`).
         """
         import sympy as sp
         for attr in ("flux", "source", "nonconservative_matrix", "eigenvalues",
@@ -181,7 +181,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
     # ── type / signature helpers ────────────────────────────────────────────
     def _t(self, n):
-        """Array type of ``n`` entries."""
+        """Array type of `n` entries."""
         return self.get_array_type((n,))
 
     def _args(self, *names):
@@ -201,13 +201,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return ",\n        ".join(tbl[a] for a in names)
 
     def _registry_argnames(self, name):
-        """Argument names of operator ``name`` from ``Function.args``, minus ``dt`` (it rides in
-        ``p``).
+        """Argument names of operator `name` from `Function.args`, minus `dt` (it rides in
+        `p`).
         """
         return tuple(k for k in self._operator_arg_keys(name) if k != "dt")
 
     def _kernel(self, name, expr, shape, argnames):
-        """Print one operator as a device function of the arguments ``argnames``."""
+        """Print one operator as a device function of the arguments `argnames`."""
         # Bed/surface-trace ``Subs(f(ζ),ζ,0|1)`` nodes are resolved centrally at
         # the SystemModel → NumericalSystemModel seam (REQ-130,
         # numerical_system_model._resolve_boundary_traces) and guarded there, so
@@ -218,27 +218,27 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
     # ── expression builders ─────────────────────────────────────────────────
     def _vec(self, elements):
-        """Column ``sp.Array`` of ``elements``."""
+        """Column `sp.Array` of `elements`."""
         return sp.Array(list(elements)).reshape(len(elements), 1)
 
     def _zeros(self, n):
-        """Zero column of length ``n``."""
+        """Zero column of length `n`."""
         return self._vec([sp.Integer(0)] * n)
 
     def _identity_flat(self, n):
-        """The ``n x n`` identity, flattened to a column."""
+        """The `n x n` identity, flattened to a column."""
         return self._vec([sp.Integer(1) if r == c else sp.Integer(0)
                           for r in range(n) for c in range(n)])
 
     def _flatten_dir_major(self, arr, n_rows):
-        """Flatten an ``(n_rows, ..., dim)`` tensor in direction-major order to a column."""
+        """Flatten an `(n_rows, ..., dim)` tensor in direction-major order to a column."""
         flat = [arr[(*idx, d)]
                 for d in range(self.dim)
                 for idx in self._row_indices(arr, n_rows)]
         return self._vec(flat)
 
     def _row_indices(self, arr, n_rows):
-        """All index tuples of ``arr`` without its trailing direction axis."""
+        """All index tuples of `arr` without its trailing direction axis."""
         import itertools
         inner = arr.shape[:-1]  # drop the trailing dim axis
         return list(itertools.product(*(range(s) for s in inner)))
@@ -251,7 +251,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return self._vec(flat), self.n_eq * self.dim
 
     def _expr_matrix(self, mat):
-        """An ``(n_eq, n_state, dim)`` matrix flattened direction-major, as a column and its length."""
+        """An `(n_eq, n_state, dim)` matrix flattened direction-major, as a column and its length."""
         # (n_eq, n_state, dim) -> dir-major flat (dim * n_eq * n_state)
         flat = [mat[i, j, d]
                 for d in range(self.dim)
@@ -302,7 +302,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return self._vec([ua[i, 0] for i in range(self.n_aux)]), self.n_aux
 
     def _bc_definition(self, attr):
-        """The Piecewise body of the SystemModel BC ``Function`` slot ``attr``, or None."""
+        """The Piecewise body of the SystemModel BC `Function` slot `attr`, or None."""
         fn = getattr(self.sm, attr, None)
         if fn is None:
             return None
@@ -315,13 +315,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
     # ── header / footer ─────────────────────────────────────────────────────
     def get_includes(self):
-        """AMReX includes of ``Model.H``."""
+        """AMReX includes of `Model.H`."""
         return ('#include <AMReX_Array4.H>\n'
                 '#include <AMReX_Vector.H>\n'
                 '#include <AMReX_SmallMatrix.H>')
 
     def _file_header(self, bc_tags):
-        """Top of ``Model.H``: sizes, state-row map (b, h, depth-scaled, discharge), BC tags,
+        """Top of `Model.H`: sizes, state-row map (b, h, depth-scaled, discharge), BC tags,
         parameters.
         """
         # parameter_names/default_parameters follow self._param_names (which may
@@ -417,7 +417,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
 
     # ── top-level emission ───────────────────────────────────────────────────
     def create_code(self):
-        """Print the whole ``Model.H`` struct: every operator kernel (zero stubs for the slots the
+        """Print the whole `Model.H` struct: every operator kernel (zero stubs for the slots the
         driver does not read), the BC kernels and, on a Chorin sub-model, the pressure-operator
         kernels and metadata.
         """
@@ -574,13 +574,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return "\n".join(blocks)
 
     def _pressure_op_kernels(self, op):
-        """Print ``pressure_{A0,Axx,Ayy,Ax,Ay}``, ``pressure_rhs`` and ``n_press`` of operator
-        ``op``.
+        """Print `pressure_{A0,Axx,Ayy,Ax,Ay}`, `pressure_rhs` and `n_press` of operator
+        `op`.
         """
         import sympy as sp
         NP = len(op.P_modes)
         def flat(M):
-            """Row-major flattening of the ``NP x NP`` coefficient ``M`` (zeros if None)."""
+            """Row-major flattening of the `NP x NP` coefficient `M` (zeros if None)."""
             if M is None: return [sp.Integer(0)] * (NP * NP)
             return [sp.sympify(M[k][l]) for k in range(NP) for l in range(NP)]
         out = []
@@ -596,13 +596,13 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         return out
 
     def _chorin_meta(self):
-        """Chorin sub-model metadata: evolved rows ``e2s`` and aux tables ``deriv_aux``,
-        ``input_aux``.
+        """Chorin sub-model metadata: evolved rows `e2s` and aux tables `deriv_aux`,
+        `input_aux`.
         """
         sm = self.sm
         e2s = list(getattr(sm, "equation_to_state_index", range(self.n_eq)))
         def _rows(reg):
-            """Table rows ``(aux_row, state_index, x_order, y_order)`` of an aux registry."""
+            """Table rows `(aux_row, state_index, x_order, y_order)` of an aux registry."""
             # (aux_row, state_index, x_order, y_order): the full spatial multi-
             # index so the driver can FD-fill x- and y-derivatives generically
             # (1-horizontal models carry a 1-tuple multi_index -> y_order 0).
@@ -616,7 +616,7 @@ class AmrexSystemModelPrinter(AmrexCore, GenericCppBase):
         live = _rows(getattr(sm, "aux_registry", None))
         frozen = _rows(getattr(sm, "aux_input_registry", None))
         def _arr(name, rows):
-            """C++ table ``n_<name>`` / ``<name>`` for ``rows``."""
+            """C++ table `n_<name>` / `<name>` for `rows`."""
             if not rows:
                 return (f"    static constexpr int n_{name} = 0;\n"
                         f"    static constexpr int {name}[1][4] = {{{{0,0,0,0}}}};")
@@ -647,24 +647,24 @@ _SOURCE_DIR = _Path(__file__).resolve().parents[2] / "Source"
 
 
 def _stage_user_functions(out, write):
-    """Copy the hand-written kernel headers into ``out`` through the write-if-changed helper
-    ``write``.
+    """Copy the hand-written kernel headers into `out` through the write-if-changed helper
+    `write`.
     """
     for name in _USER_FN_SOURCES:
         write(out / name, (_SOURCE_DIR / name).read_text())
 
 
 def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
-    """Generate ``Model.H``, ``Numerics.H`` and the user-function headers into ``out_dir`` from a
-    frozen SystemModel.  Files are rewritten only when their text changes, so ``make`` does not
+    """Generate `Model.H`, `Numerics.H` and the user-function headers into `out_dir` from a
+    frozen SystemModel.  Files are rewritten only when their text changes, so `make` does not
     recompile.
 
     Args:
         sm: frozen SystemModel.
-        riemann: :class:`zoomy_core.fvm.riemann_solvers.Numerics` subclass; default
-            ``NonconservativeRusanov``.
+        riemann: `zoomy_core.fvm.riemann_solvers.Numerics` subclass; default
+            `NonconservativeRusanov`.
     Returns:
-        ``out_dir`` as a Path.
+        `out_dir` as a Path.
     """
     from pathlib import Path
     out = Path(out_dir)
@@ -683,7 +683,7 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
     # that takes 2 s (60 s sim) to 26 s (600 s sim).  Skipping the write when the
     # content is unchanged lets make no-op, so a re-run is just the solve.
     def _write_if_changed(path, code):
-        """Write ``code`` to ``path`` unless identical (keeps the mtime, so ``make`` does not
+        """Write `code` to `path` unless identical (keeps the mtime, so `make` does not
         rebuild).
         """
         try:
@@ -703,15 +703,15 @@ def generate_headers(sm, out_dir, *, riemann=None, analytical_eigenvalues=True):
 
 
 def write_chorin_headers(split, out_dir):
-    """Generate ``ModelPred.H`` / ``ModelPress.H`` / ``ModelCorr.H``, ``NumericsPred.H`` and the
+    """Generate `ModelPred.H` / `ModelPress.H` / `ModelCorr.H`, `NumericsPred.H` and the
     user-function headers for the C++ Chorin driver (predictor, pressure solve, corrector).  An
-    unresolved boundary trace in the emitted C++ raises ``ValueError``.
+    unresolved boundary trace in the emitted C++ raises `ValueError`.
 
     Args:
-        split: the model's own ``chorin_split(system_model=sm)`` result (``SM_pred``, ``SM_press``,
-            ``SM_corr``).
+        split: the model's own `chorin_split(system_model=sm)` result (`SM_pred`, `SM_press`,
+            `SM_corr`).
     Returns:
-        ``out_dir`` as a Path.
+        `out_dir` as a Path.
     References:
         Chorin 1968, https://doi.org/10.1090/S0025-5718-1968-0242392-2
     """
@@ -720,7 +720,7 @@ def write_chorin_headers(split, out_dir):
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
 
     def _write_if_changed(path, code):
-        """Write ``code`` to ``path`` unless identical (keeps the mtime, so ``make`` does not
+        """Write `code` to `path` unless identical (keeps the mtime, so `make` does not
         rebuild).
         """
         try:

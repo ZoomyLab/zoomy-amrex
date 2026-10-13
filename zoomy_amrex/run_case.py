@@ -1,18 +1,18 @@
-"""``zoomy_amrex.run_case`` — importable structured-grid entry point + VTK output.
+"""`zoomy_amrex.run_case` — importable structured-grid entry point + VTK output.
 
 Runs a model on a structured AMReX grid and writes a **ParaView-ready VTK series**
-(``.pvd`` + per-snapshot/-level ``.vtu``).  One call handles both solver families:
+(`.pvd` + per-snapshot/-level `.vtu`).  One call handles both solver families:
 
-  * standard hyperbolic (SWE / SME) via the AmrCore driver (``main.cpp``);
+  * standard hyperbolic (SWE / SME) via the AmrCore driver (`main.cpp`);
   * non-hydrostatic VAM / ML-VAM via the Chorin pressure-projection driver
-    (``chorin_main.cpp`` / ``chorin_amr.cpp``) — auto-selected when the model
-    exposes ``chorin_split``.
+    (`chorin_main.cpp` / `chorin_amr.cpp`) — auto-selected when the model
+    exposes `chorin_split`.
 
-The case scripts under ``thesis/cases/amrex`` are thin: build a model (+IC/BC),
-give a ``settings`` dict (domain / n_cells / dimension / time_end / amr / …), call
-``run_case`` → a ``.pvd`` for ParaView.  This is the same entry point the GUI/CLI
+The case scripts under `thesis/cases/amrex` are thin: build a model (+IC/BC),
+give a `settings` dict (domain / n_cells / dimension / time_end / amr / …), call
+`run_case` → a `.pvd` for ParaView.  This is the same entry point the GUI/CLI
 server adapter uses.  AMReX emits VTK only; a store-HDF5 (for the GUI viz) is
-obtained from the shared ``zoomy_prepost.vtk_to_hdf5`` on this VTK if ever needed.
+obtained from the shared `zoomy_prepost.vtk_to_hdf5` on this VTK if ever needed.
 """
 from __future__ import annotations
 import os
@@ -33,7 +33,7 @@ IDX_B, IDX_H = 0, 1                  # structured state layout: [b, h, ...]
 
 @functools.lru_cache(maxsize=1)
 def _bld():
-    """Lazily import the sibling CLI ``build.py`` by path (not a package module)
+    """Lazily import the sibling CLI `build.py` by path (not a package module)
     so its write_inputs / GNUMAKEFILE / chorin machinery is reused, not duplicated."""
     spec = importlib.util.spec_from_file_location("_zoomy_amrex_build", _ROOT / "build.py")
     mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
@@ -43,9 +43,9 @@ def _bld():
 def _nsm(model):
     """Promote a raw Model to a NumericalSystemModel (SWE/SME), or return an
     already-built (Numerical)SystemModel as-is.  A Chorin model is built via
-    ``SystemModel.from_model(model)`` in the caller instead — REQ-143/164:
-    ``Model.system_model`` was deleted, so this no longer probes for it (a
-    SystemModel is identified positively by ``.state``; raw SWE/SME Models
+    `SystemModel.from_model(model)` in the caller instead — REQ-143/164:
+    `Model.system_model` was deleted, so this no longer probes for it (a
+    SystemModel is identified positively by `.state`; raw SWE/SME Models
     have none)."""
     from zoomy_core.numerics.numerical_system_model import NumericalSystemModel
     from zoomy_core.systemmodel.operations import guard_eigenvalue_powers
@@ -116,8 +116,8 @@ def _write_ic_rasters(model, sm, geom, dim, out_dir):
 
 
 def gmsh_to_rasters(msh_path, out_dir, geom):
-    """Project a gmsh ``.msh`` + its ``$NodeData`` (bed/depth) onto the structured
-    grid — generalises ``malpasset.prepare_rasters`` (REQ-89).  Returns dem/release."""
+    """Project a gmsh `.msh` + its `$NodeData` (bed/depth) onto the structured
+    grid — generalises `malpasset.prepare_rasters` (REQ-89).  Returns dem/release."""
     from .malpasset import prepare_rasters
     info = prepare_rasters(msh_path, out_dir, ncell_x=geom["nx"], ncell_y=geom["ny"])
     return (str(Path(info["dem_file"]).resolve()),
@@ -126,9 +126,9 @@ def gmsh_to_rasters(msh_path, out_dir, geom):
 
 # ── VTK postprocessing (always run; ParaView-ready) ─────────────────────────
 def _plotfiles_to_vtk(exec_dir, geom, dim, names, out_dir):
-    """Convert the AMReX plotfiles to a ParaView ``.pvd`` + per-snapshot/-level
-    ``.vtu`` (structured quad/line grids, cell data = state variables by name).
-    Handles AMR: one ``.vtu`` per refinement level (loaded as parts in ParaView)."""
+    """Convert the AMReX plotfiles to a ParaView `.pvd` + per-snapshot/-level
+    `.vtu` (structured quad/line grids, cell data = state variables by name).
+    Handles AMR: one `.vtu` per refinement level (loaded as parts in ParaView)."""
     import re, sys, meshio
     sys.path.insert(0, str(_ROOT))
     from deliverable import read_levels
@@ -186,20 +186,20 @@ def _amrex_home():
 def _cuda_opts():
     """GPU build knobs from the environment (default CPU, backward-compatible).
 
-    Set ``ZOOMY_AMREX_CUDA=1`` (baked into the GPU container's %environment) to
-    compile the AMReX driver with ``USE_CUDA=TRUE`` — the whole SWE/SME device
-    path (make_rhs, MOOD, update_variables) is already ``AMREX_GPU_*``-annotated.
-    ``ZOOMY_AMREX_CUDA_ARCH`` picks the SM arch (default 89 = Ada / L40S).  The
-    GPU container still needs ``apptainer --nv`` at run time to see the device."""
+    Set `ZOOMY_AMREX_CUDA=1` (baked into the GPU container's %environment) to
+    compile the AMReX driver with `USE_CUDA=TRUE` — the whole SWE/SME device
+    path (make_rhs, MOOD, update_variables) is already `AMREX_GPU_*`-annotated.
+    `ZOOMY_AMREX_CUDA_ARCH` picks the SM arch (default 89 = Ada / L40S).  The
+    GPU container still needs `apptainer --nv` at run time to see the device."""
     on = os.environ.get("ZOOMY_AMREX_CUDA", "").strip().lower() in ("1", "true", "yes", "on")
     return ("TRUE" if on else "FALSE"), os.environ.get("ZOOMY_AMREX_CUDA_ARCH", "89")
 
 
 def _resolve_riemann(spec):
-    """``settings['riemann']`` -> a ``riemann_solvers.Numerics`` subclass.
+    """`settings['riemann']` -> a `riemann_solvers.Numerics` subclass.
 
-    Accepts a class directly, a class name (e.g. ``"PositiveNonconservativeHLL"``),
-    or ``None`` (the printer's default ``NonconservativeRusanov``). Lets a case pick
+    Accepts a class directly, a class name (e.g. `"PositiveNonconservativeHLL"`),
+    or `None` (the printer's default `NonconservativeRusanov`). Lets a case pick
     a less-diffusive flux (HLL/HLLC/Roe) without editing the printer."""
     if spec is None or isinstance(spec, type):
         return spec
@@ -211,7 +211,7 @@ def _run_hyperbolic(model, sm, settings, geom, dim, bdir, dem, rel, state_raster
     """Build+stage the EXPLICIT HYPERBOLIC driver — for ANY hyperbolic model, not
     just SWE. SME and non-Chorin VAM route here too; the pressure-projection
     (Chorin) models are the only ones that go to _run_chorin instead. Was named
-    ``_run_swe``, which read as SWE-only and was misleading."""
+    `_run_swe`, which read as SWE-only and was misleading."""
     src = bdir / "Source"; ex = bdir / "Exec"
     # Model.H / Numerics.H / UserFunctions.H are GENERATED below by
     # generate_headers().  The repo's Source/ also carries checked-in copies of
@@ -344,14 +344,14 @@ def _run_chorin(model, sm, settings, geom, dim, bdir, dem, rel):
 
 
 def run_case(model, settings, output_dir, on_progress=None):
-    """Run ``model`` on a structured AMReX grid built from ``settings``; write a
-    ParaView ``.pvd`` (+ ``.vtu`` series) and return its path.
+    """Run `model` on a structured AMReX grid built from `settings`; write a
+    ParaView `.pvd` (+ `.vtu` series) and return its path.
 
-    settings: ``dimension`` (1|2), ``domain`` ([x0,x1] or [x0,x1,y0,y1]),
-    ``n_cells`` (nx or [nx,ny]), ``time_end``, ``cfl``, ``spatial_order``,
-    ``output_snapshots``, ``max_level`` (AMR; 0 = single level), optional
-    ``mesh_msh`` (gmsh + $NodeData IC), and for Chorin models optional
-    ``inflow`` / ``pin_all`` / ``params``.  The solver family (standard vs Chorin)
+    settings: `dimension` (1|2), `domain` ([x0,x1] or [x0,x1,y0,y1]),
+    `n_cells` (nx or [nx,ny]), `time_end`, `cfl`, `spatial_order`,
+    `output_snapshots`, `max_level` (AMR; 0 = single level), optional
+    `mesh_msh` (gmsh + $NodeData IC), and for Chorin models optional
+    `inflow` / `pin_all` / `params`.  The solver family (standard vs Chorin)
     is auto-selected from the model."""
     out = Path(output_dir); out.mkdir(parents=True, exist_ok=True)
     dim, geom = _grid(settings)

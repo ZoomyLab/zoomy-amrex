@@ -1,7 +1,7 @@
-"""Device kernels of the symbolic solvers on AMReX: one ``struct <system>_t`` per system with a
-``static constexpr`` functor per kernel the printed solver references (``nsm.source`` is
-``nsm_t::source``).  The kernels are the system's ``call`` table (the functions JAX lambdifies and
-foam prints) in AMReX syntax, ``AMREX_GPU_HOST_DEVICE`` operators on ``amrex::SmallMatrix``.
+"""Device kernels of the symbolic solvers on AMReX: one `struct <system>_t` per system with a
+`static constexpr` functor per kernel the printed solver references (`nsm.source` is
+`nsm_t::source`).  The kernels are the system's `call` table (the functions JAX lambdifies and
+foam prints) in AMReX syntax, `AMREX_GPU_HOST_DEVICE` operators on `amrex::SmallMatrix`.
 """
 import re
 
@@ -32,7 +32,7 @@ _SCALAR = {"time", "dt", "distance"}
 
 
 def family(f):
-    """Kernel family of the ``Function`` ``f`` (face, bc, recon, normal or cell), from its argument
+    """Kernel family of the `Function` `f` (face, bc, recon, normal or cell), from its argument
     groups.
     """
     keys = set(f.args.keys())
@@ -48,18 +48,18 @@ def family(f):
 
 
 def _m(n):
-    """``amrex::SmallMatrix`` column type of ``n`` entries."""
+    """`amrex::SmallMatrix` column type of `n` entries."""
     return f"amrex::SmallMatrix<amrex::Real, {max(int(n), 1)}, 1>"
 
 
 class AmrexKernelPrinter(AmrexCore, GenericCppBase):
-    """AMReX syntax of the kernel bodies (``AmrexCore`` plus the opaque calls of
-    :class:`AmrexNumericsPrinter`), with symbol maps from each kernel's own argument groups.
+    """AMReX syntax of the kernel bodies (`AmrexCore` plus the opaque calls of
+    `AmrexNumericsPrinter`), with symbol maps from each kernel's own argument groups.
     """
     c_functions = AmrexNumericsPrinter.c_functions
 
     def kernel(self, f, sizes):
-        """Print ``struct <name>_k`` and its constexpr instance for the ``Function`` ``f``.  Every
+        """Print `struct <name>_k` and its constexpr instance for the `Function` `f`.  Every
         kernel of a family takes the family's full argument list and ignores what it does not
         declare.
 
@@ -111,20 +111,20 @@ class AmrexKernelPrinter(AmrexCore, GenericCppBase):
 
 
 def referenced(source, system):
-    """Kernel names ``<system>.<name>`` used by the printed solver."""
+    """Kernel names `<system>.<name>` used by the printed solver."""
     return sorted(set(re.findall(rf"\b{system}\.(\w+)", source)))
 
 
 def write_kernels(systems, source, path, dimension, classes=None):
-    """Write ``Kernels.H`` to ``path``: ``struct <name>_t`` and its constexpr instance for each
-    ``(name, nsm)`` in ``systems``, with the kernels ``source`` uses.
+    """Write `Kernels.H` to `path`: `struct <name>_t` and its constexpr instance for each
+    `(name, nsm)` in `systems`, with the kernels `source` uses.
 
     Args:
-        classes: ``{(name, "state"): closure class per state row}`` (the topology's
-            ``lsq_closure_class``), the 6th int of each ``aux_derivatives`` entry; -1 without a
+        classes: `{(name, "state"): closure class per state row}` (the topology's
+            `lsq_closure_class`), the 6th int of each `aux_derivatives` entry; -1 without a
             closure.
     Returns:
-        ``path``.
+        `path`.
     """
     pr = AmrexKernelPrinter()
     first = systems[0][1]

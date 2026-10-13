@@ -1,28 +1,28 @@
 """Emit zoomy_core's march constants into a C++ header (mandate 6a).
 
 The user law: **no numerical constant is hard-coded in a backend**. amrex's
-ComputeDt computed ``dt = cfl * dx / lambda``, i.e. it had re-derived core's CFL
-law and lost two factors of it: the mesh-dimension divisor ``d`` and the
-reconstruction-degree divisor ``(2k+1)``. Core's law is
+ComputeDt computed `dt = cfl * dx / lambda`, i.e. it had re-derived core's CFL
+law and lost two factors of it: the mesh-dimension divisor `d` and the
+reconstruction-degree divisor `(2k+1)`. Core's law is
 
     dt = c_cfl * 2 * r_in / (c_cfl_dimension * c_cfl_degree_factor * lambda)
 
-and for a Cartesian FV cell ``r_in = dx/2``, so it collapses to
-``c_cfl * dx / (d * (2k+1) * lambda)``. Measured consequence of the omission:
+and for a Cartesian FV cell `r_in = dx/2`, so it collapses to
+`c_cfl * dx / (d * (2k+1) * lambda)`. Measured consequence of the omission:
 1-D order 1 was correct by coincidence (d = 1, 2k+1 = 1), while 2-D order 2 was
 taking steps **6x larger** than the law allows.
 
-The fix is NOT to write ``/ (2.0 * 3.0)`` in the driver — that would satisfy
+The fix is NOT to write `/ (2.0 * 3.0)` in the driver — that would satisfy
 6a's letter while re-creating exactly the drift it exists to stop. The values
 come from core.
 
 SCOPE, stated plainly: only the three CFL constants are consumed today.
-``march_constants`` also resolves ``c_kp_eps`` / ``c_eps_h`` / ``c_dt_max`` /
-``c_mood_h_bound``, and those sites in this backend are still literal — a
+`march_constants` also resolves `c_kp_eps` / `c_eps_h` / `c_dt_max` /
+`c_mood_h_bound`, and those sites in this backend are still literal — a
 REPORTED remainder of 6a here (cid=79 has the full inventory), not a claim that
 6a is finished for amrex.
 
-Mirrors ``zoomy_foam/_constants.py`` deliberately: same shape, same failure
+Mirrors `zoomy_foam/_constants.py` deliberately: same shape, same failure
 modes, so the two backends stay comparable under the blueprint audit.
 """
 from __future__ import annotations
@@ -43,12 +43,12 @@ _CTYPE = {
 
 def march_constants_for(nsm, *, cfl: float = 0.9, dimension: int = 1,
                         degree: int = 0):
-    """Resolve core's march constants for ``nsm``.
+    """Resolve core's march constants for `nsm`.
 
     Thin, deliberate wrapper: the resolution logic lives in core and is never
-    re-implemented here. ``cfl`` is the user's pure SAFETY FACTOR (law: 0.9)
+    re-implemented here. `cfl` is the user's pure SAFETY FACTOR (law: 0.9)
     — NOT an effective Courant number. The dimensional reduction is
-    ``c_cfl_dimension``'s job, so passing 0.45 for a 2-D case would apply the
+    `c_cfl_dimension`'s job, so passing 0.45 for a 2-D case would apply the
     factor twice and halve every step.
     """
     from zoomy_core.solver.constants import march_constants
@@ -57,7 +57,7 @@ def march_constants_for(nsm, *, cfl: float = 0.9, dimension: int = 1,
 
 
 def render(consts) -> str:
-    """Render the consumed constants as a ``ZoomyConstants`` namespace."""
+    """Render the consumed constants as a `ZoomyConstants` namespace."""
     lines = [
         "#pragma once",
         "#include <AMReX_REAL.H>",
@@ -89,7 +89,7 @@ def render(consts) -> str:
 
 
 def write_march_constants(nsm, out: Path, **kw) -> Path:
-    """Emit ``MarchConstants.H`` next to the other generated headers."""
+    """Emit `MarchConstants.H` next to the other generated headers."""
     out = Path(out)
     out.write_text(render(march_constants_for(nsm, **kw)))
     return out

@@ -1,30 +1,32 @@
-"""``zoomy_amrex.solvers`` — param.Parameterized solver wrappers (gui REQ-131).
+"""`zoomy_amrex.solvers` — param.Parameterized solver wrappers (gui REQ-131).
 
 The GUI/CLI-facing entry point for the AMReX backend.  Two solver families, both
-driving the existing ``run_case`` machinery (codegen → AMReX ``inputs`` deck →
+driving the existing `run_case` machinery (codegen → AMReX `inputs` deck →
 make → run → VTK):
 
-  * :class:`HyperbolicSolver` — explicit finite-volume march (SWE / SME) on the
+  * `HyperbolicSolver` — explicit finite-volume march (SWE / SME) on the
     AmrCore driver.
-  * :class:`SplitSolver` — N sequential system models + pressure projection
+  * `SplitSolver` — N sequential system models + pressure projection
     (Chorin pressure-corrector; NOT VAM-specific), auto-selected for models that
-    expose ``chorin_split``.
+    expose `chorin_split`.
 
-Usage (identical shape across all backends)::
+Usage (identical shape across all backends):
 
+```
     from zoomy_amrex.solvers import HyperbolicSolver
     solver = HyperbolicSolver(CFL=0.45, order=2)
     solver.solve(model, mesh, settings)      # -> VTK series in settings.output.directory
+```
 
 Design (gui REQ-131, user-approved 2026-07-13):
-  * ``solve(model, mesh, settings)`` writes a VTK series into
-    ``settings.output.directory`` and returns the ``.pvd`` path.
-  * ``settings`` is STRUCTURED — ``settings.output.{directory, filename, snapshots}``
-    is always honored; ``settings.time_end`` / ``settings.mesh.n_cells`` carry the
+  * `solve(model, mesh, settings)` writes a VTK series into
+    `settings.output.directory` and returns the `.pvd` path.
+  * `settings` is STRUCTURED — `settings.output.{directory, filename, snapshots}`
+    is always honored; `settings.time_end` / `settings.mesh.n_cells` carry the
     run/grid properties.  Model-/scheme-specific things (reconstruction,
     eigenvalues, sources, IC, BC) come from the MODEL symbolically.
-  * ``mesh`` is a path (``.msh`` — the structured domain is the mesh bbox) OR a
-    descriptor ``{"domain": [...], "n_cells": [...]}``.  RESOLUTION always comes
+  * `mesh` is a path (`.msh` — the structured domain is the mesh bbox) OR a
+    descriptor `{"domain": [...], "n_cells": [...]}`.  RESOLUTION always comes
     from the mesh/settings, never a solver param.
   * NO case knowledge lives here.  Case physics (e.g. a closed-basin wall) is a
     Wall BC on the MODEL, not a raster hack — the driver dispatches the model's
@@ -40,8 +42,8 @@ from .run_case import run_case
 
 # ── structured-settings access (dict- or attribute-shaped) ──────────────────
 def _get(obj, dotted, default=None):
-    """Look up ``a.b.c`` through a structured ``settings`` that may mix dicts and
-    attribute objects (param.Parameterized groups).  Returns ``default`` if any
+    """Look up `a.b.c` through a structured `settings` that may mix dicts and
+    attribute objects (param.Parameterized groups).  Returns `default` if any
     hop is missing/None."""
     cur = obj
     for key in dotted.split("."):
@@ -52,12 +54,12 @@ def _get(obj, dotted, default=None):
 
 
 def _mesh_domain_ncells(mesh, settings):
-    """Resolve ``mesh`` → (domain, n_cells, mesh_msh_path_or_None).
+    """Resolve `mesh` → (domain, n_cells, mesh_msh_path_or_None).
 
-    ``mesh`` is either a descriptor ``{"domain", "n_cells"}`` (analytic-IC box:
-    dambreak / radial) or a path to a ``.msh`` whose node bbox is the structured
-    domain.  For a ``.msh`` the resolution is NOT in the file — it comes from
-    ``settings.mesh.n_cells`` (or ``settings.n_cells``)."""
+    `mesh` is either a descriptor `{"domain", "n_cells"}` (analytic-IC box:
+    dambreak / radial) or a path to a `.msh` whose node bbox is the structured
+    domain.  For a `.msh` the resolution is NOT in the file — it comes from
+    `settings.mesh.n_cells` (or `settings.n_cells`)."""
     if isinstance(mesh, dict):
         return mesh["domain"], mesh["n_cells"], None
 
@@ -76,7 +78,7 @@ def _mesh_domain_ncells(mesh, settings):
 
 
 class _BaseSolver(param.Parameterized):
-    """Shared ``settings`` → legacy ``run_case`` dict translation."""
+    """Shared `settings` → legacy `run_case` dict translation."""
 
     def _legacy_settings(self, mesh, settings):
         domain, n_cells, mesh_msh = _mesh_domain_ncells(mesh, settings)
@@ -128,7 +130,7 @@ class SplitSolver(_BaseSolver):
     """Sequential system models + pressure projection (Chorin pressure-corrector).
 
     The split structure — predictor / pressure / corrector sub-models — comes
-    from the MODEL (``model.chorin_split``); this wrapper only exposes the march
+    from the MODEL (`model.chorin_split`); this wrapper only exposes the march
     and pressure-solve knobs."""
 
     cfl = param.Number(0.30, bounds=(0.0, 1.0), doc="Courant number")
