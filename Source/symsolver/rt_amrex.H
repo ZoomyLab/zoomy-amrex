@@ -1,11 +1,13 @@
 #pragma once
 /// \file
 /// The AMReX runtime of the symbolic solvers: what every name in the printed C++ (zoomy_core.symsolver.CxxPrinter) means on a single-level Cartesian AMReX grid of dimension AMREX_SPACEDIM.
-/// Loops are amrex::ParallelFor, reductions ParReduce, the linear solve amrex::GMRES; what all C++ runtimes share is zoomy_core's rt_common.H.
+/// Loops are amrex::ParallelFor, reductions ParReduce, the linear solve hypre (ZS_HYPRE builds: BoomerAMG-preconditioned FlexGMRES on the assembled operator) or amrex::GMRES; what all C++ runtimes share is zoomy_core's rt_common.H.
 /// Ref: Zhang et al. 2019, https://doi.org/10.21105/joss.01370
 #include <AMReX.H>
 #include <AMReX_Geometry.H>
 #include <AMReX_GMRES.H>
+#include <AMReX_iMultiFab.H>
+#include <AMReX_ParmParse.H>
 #include <AMReX_MultiFab.H>
 #include <AMReX_ParReduce.H>
 #include <AMReX_ParallelDescriptor.H>
@@ -24,6 +26,13 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#ifdef ZS_HYPRE
+#include <HYPRE.h>
+#include <HYPRE_IJ_mv.h>
+#include <HYPRE_krylov.h>
+#include <HYPRE_parcsr_ls.h>
+#endif
 
 #define ZS_HD AMREX_GPU_HOST_DEVICE
 #include "rt_common.H"
@@ -1508,6 +1517,32 @@ int colour(const Geo& g, const IV& c, int S)
     return cl;
 }
 
+/// v = a^-1 for the n x n row-major block a (overwritten), by Gauss-Jordan with partial pivoting; a zero pivot gives a zero row.
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+void invert_block(Real* a, Real* v, int n)
+{
+    for (int e = 0; e < n*n; ++e) v[e] = 0.0;
+    for (int d = 0; d < n; ++d) v[d*n + d] = 1.0;
+    for (int cc = 0; cc < n; ++cc)
+    {
+        int piv = cc;
+        for (int p = cc + 1; p < n; ++p) if (std::abs(a[p*n + cc]) > std::abs(a[piv*n + cc])) piv = p;
+        for (int q = 0; q < n; ++q)
+        {
+            Real t = a[cc*n + q]; a[cc*n + q] = a[piv*n + q]; a[piv*n + q] = t;
+            t = v[cc*n + q]; v[cc*n + q] = v[piv*n + q]; v[piv*n + q] = t;
+        }
+        const Real ip = a[cc*n + cc] != 0.0 ? 1.0/a[cc*n + cc] : 0.0;
+        for (int q = 0; q < n; ++q) { a[cc*n + q] *= ip; v[cc*n + q] *= ip; }
+        for (int p = 0; p < n; ++p)
+        {
+            if (p == cc) continue;
+            const Real f = a[p*n + cc];
+            for (int q = 0; q < n; ++q) { a[p*n + q] -= f*a[cc*n + q]; v[p*n + q] -= f*v[cc*n + q]; }
+        }
+    }
+}
+
 /// Probe op with one unit vector per colour and row, and invert the n x n cell blocks by Gauss-Jordan with partial pivoting into Binv.
 inline void LinOp::blocks()
 {
@@ -1549,26 +1584,8 @@ inline void LinOp::blocks()
     {
         ZS_CELL;
         Real a[MAXR*MAXR], v[MAXR*MAXR];
-        for (int e = 0; e < n*n; ++e) { a[e] = aa[bx](c, e); v[e] = 0.0; }
-        for (int d = 0; d < n; ++d) v[d*n + d] = 1.0;
-        for (int cc = 0; cc < n; ++cc)              // Gauss-Jordan, partial pivoting
-        {
-            int piv = cc;
-            for (int p = cc + 1; p < n; ++p) if (std::abs(a[p*n + cc]) > std::abs(a[piv*n + cc])) piv = p;
-            for (int q = 0; q < n; ++q)
-            {
-                Real t = a[cc*n + q]; a[cc*n + q] = a[piv*n + q]; a[piv*n + q] = t;
-                t = v[cc*n + q]; v[cc*n + q] = v[piv*n + q]; v[piv*n + q] = t;
-            }
-            const Real ip = a[cc*n + cc] != 0.0 ? 1.0/a[cc*n + cc] : 0.0;
-            for (int q = 0; q < n; ++q) { a[cc*n + q] *= ip; v[cc*n + q] *= ip; }
-            for (int p = 0; p < n; ++p)
-            {
-                if (p == cc) continue;
-                const Real f = a[p*n + cc];
-                for (int q = 0; q < n; ++q) { a[p*n + q] -= f*a[cc*n + q]; v[p*n + q] -= f*v[cc*n + q]; }
-            }
-        }
+        for (int e = 0; e < n*n; ++e) a[e] = aa[bx](c, e);
+        invert_block(a, v, n);
         for (int e = 0; e < n*n; ++e) bi[bx](c, e) = v[e];
     });
 }
@@ -1595,38 +1612,425 @@ inline void LinOp::precond(amrex::MultiFab& l, const amrex::MultiFab& r)
     });
 }
 
-/// Solve op(x) = b with amrex::GMRES (restart, iterations and tolerance from implicit()); aborts above the accept gate.
+/// Counters of the run's linear solves (printed at amrex::Finalize): solves, Krylov iterations, seconds in the matrix assembly, the preconditioner setup and the Krylov solve.
+struct SolveStats { long n = 0, its = 0; double t_asm = 0, t_setup = 0, t_solve = 0; std::string kind; };
+/// The run's SolveStats; the first call registers the summary line.
+inline SolveStats& solve_stats()
+{
+    static SolveStats* s = nullptr;
+    if (!s)
+    {
+        s = new SolveStats();
+        amrex::ExecOnFinalize([] {
+            const SolveStats& t = *s;
+            if (t.n > 0)
+                amrex::Print() << "linsolve summary: " << t.kind << ", " << t.n << " solves, "
+                               << double(t.its)/double(t.n) << " iterations/solve, ms/solve: assembly "
+                               << 1e3*t.t_asm/double(t.n) << ", setup " << 1e3*t.t_setup/double(t.n)
+                               << ", solve " << 1e3*t.t_solve/double(t.n) << "\n";
+            delete s;
+            s = nullptr;
+        });
+    }
+    return *s;
+}
+
+/// Wall seconds after the device has finished its queued work.
+inline double synced_second()
+{
+    amrex::Gpu::streamSynchronize();
+    return amrex::second();
+}
+
+/// The linear solver of linsolve: ParmParse zs.linsolve = hypre (the default of a ZS_HYPRE build) or gmres.
+inline bool use_hypre()
+{
+#ifdef ZS_HYPRE
+    static const bool h = []{
+        std::string s = "hypre";
+        amrex::ParmParse("zs").query("linsolve", s);
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(s == "hypre" || s == "gmres", "zs.linsolve: hypre or gmres");
+        return s == "hypre";
+    }();
+    return h;
+#else
+    return false;
+#endif
+}
+
+/// amrex::GMRES on op, right-preconditioned by its exact cell blocks (LinOp); returns the iterations.
+/// Ref: Saad, Schultz 1986, https://doi.org/10.1137/0907058
+inline int gmres_solve(std::function<Field(Field)> op, const Field& b, Field& x, const Mesh& M)
+{
+    const auto& o = implicit();
+    auto& st = solve_stats();
+    const double t0 = synced_second();
+    LinOp L;
+    L.op = std::move(op); L.M = &M; L.nq = b.nq;
+    L.blocks();
+    const double t1 = synced_second();
+    amrex::GMRES<amrex::MultiFab, LinOp> gm;
+    gm.define(L);
+    gm.setRestartLength(o.ls_restart);
+    gm.setMaxIters(o.ls_restart*o.ls_maxiter);
+    amrex::MultiFab rhs(M.ba, M.dm, b.nq, 0);
+    amrex::MultiFab::Copy(rhs, b[0], 0, 0, b.nq, 0);
+    gm.solve(x[0], rhs, o.ls_tol, 0.0);
+    st.kind = "amrex::GMRES + cell-block Jacobi";
+    st.t_setup += t1 - t0;
+    st.t_solve += synced_second() - t1;
+    return gm.getNumIters();
+}
+
+#ifdef ZS_HYPRE
+/// hypre's global numbering of the cells: rank-major over the boxes, x fastest within a box. gid: each cell's number with R ghost layers (the periodic partners; -1 outside the domain); this rank owns cells [lo, hi).
+struct HypreNumbering
+{
+    amrex::iMultiFab gid;
+    long lo = 0, hi = 0;
+};
+
+/// The HypreNumbering of the mesh M.
+inline void number_cells(HypreNumbering& N, const Mesh& M)
+{
+    const int me = amrex::ParallelDescriptor::MyProc();
+    const int nb = int(M.ba.size());
+    std::vector<long> start(nb, 0);
+    long off = 0;
+    for (int r = 0; r < amrex::ParallelDescriptor::NProcs(); ++r)
+    {
+        if (r == me) N.lo = off;
+        for (int b = 0; b < nb; ++b)
+            if (M.dm[b] == r) { start[b] = off; off += M.ba[b].numPts(); }
+        if (r == me) N.hi = off;
+    }
+    N.gid.define(M.ba, M.dm, 1, M.R);
+    N.gid.setVal(-1);
+    for (amrex::MFIter mfi(N.gid); mfi.isValid(); ++mfi)
+    {
+        const amrex::Box bx = mfi.validbox();
+        const IV blo = bx.smallEnd(), len = bx.length();
+        const int base = int(start[mfi.index()]);
+        const auto a = N.gid.array(mfi);
+        amrex::ParallelFor(bx, [=] AMREX_GPU_DEVICE (int i, int j, int k) noexcept
+        {
+            ZS_CELL;
+            int l = 0;
+            for (int d = D - 1; d >= 0; --d) l = l*len[d] + (c[d] - blo[d]);
+            a(c) = base + l;
+        });
+    }
+    N.gid.FillBoundary(M.geom.periodicity());
+}
+
+/// hypre initialized once (device memory and execution on a GPU build), finalized with AMReX.
+inline void hypre_init()
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+#if HYPRE_RELEASE_NUMBER >= 22900
+    HYPRE_Initialize();
+#else
+    HYPRE_Init();
+#endif
+#ifdef AMREX_USE_GPU
+    HYPRE_SetMemoryLocation(HYPRE_MEMORY_DEVICE);
+    HYPRE_SetExecutionPolicy(HYPRE_EXEC_DEVICE);
+    HYPRE_SetSpGemmUseVendor(0);
+    HYPRE_SetUseGpuRand(1);
+#endif
+    amrex::ExecOnFinalize([] { HYPRE_Finalize(); });
+}
+
+/// The numbering of the mesh M (built once per mesh).
+inline const HypreNumbering& numbering(const Mesh& M)
+{
+    static std::map<const Mesh*, std::unique_ptr<HypreNumbering>> cache;
+    auto& n = cache[&M];
+    if (!n)
+    {
+        n = std::make_unique<HypreNumbering>();
+        number_cells(*n, M);
+    }
+    return *n;
+}
+
+/// Colours along an axis of n cells for stencils of S = 2 r + 1 cells: i mod S; on a periodic axis the cells past the last full period get colours of their own, so equal colours stay S apart across the seam.
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+int axis_colours(int n, int per, int S)
+{
+    if (!per) return n < S ? n : S;
+    const int m = n/S;
+    return m == 0 ? n : S + (n - m*S);
+}
+/// The colour of index i (0 .. n - 1) along such an axis.
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+int axis_colour(int i, int n, int per, int S)
+{
+    if (!per) return i % S;
+    const int m = n/S;
+    return m == 0 ? i : (i < m*S ? i % S : S + (i - m*S));
+}
+/// Colour of cell c (periodic sides wrapped): two cells of one colour are never in one stencil of reach (S - 1) / 2, so one probe per colour and row recovers every matrix entry.
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+int stencil_colour(const Geo& g, const IV& c, int S)
+{
+    int cl = 0;
+    for (int d = D - 1; d >= 0; --d)
+    {
+        const int n = g.hi[d] - g.lo[d] + 1;
+        int i = c[d] - g.lo[d];
+        if (g.per[d]) i = ((i % n) + n) % n;
+        cl = cl*axis_colours(n, g.per[d], S) + axis_colour(i, n, g.per[d], S);
+    }
+    return cl;
+}
+/// Offset of stencil slot s of reach R (slots x fastest; slot (S^D - 1) / 2 is the cell itself).
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
+IV slot_offset(int s, int R)
+{
+    IV o(0);
+    for (int d = 0; d < D; ++d) { o[d] = s % (2*R + 1) - R; s /= 2*R + 1; }
+    return o;
+}
+
+/// hypre solve of op(x) = b: the matrix of op on the cell stencil of reach R (one op application per colour and row), left-scaled by the inverse 2 x 2 (n x n) cell blocks D, S = D^-1 A; FlexGMRES with one BoomerAMG V-cycle as preconditioner on S x = D^-1 b to 0.1 ls_tol (CPU: HMIS, ext+i, hybrid symmetric Gauss-Seidel; GPU: PMIS, ext+i, l1-Jacobi), re-entered with a tighter tolerance until the true residual |op(x) - b| <= ls_tol |b|. Krylov space min(ls_restart, 50). Returns the iterations; rel = the true relative residual.
+/// Ref: Henson, Yang 2002, https://doi.org/10.1016/S0168-9274(01)00115-5
+/// Ref: Saad 1993, https://doi.org/10.1137/0914028
+inline int hypre_solve(const std::function<Field(Field)>& op, const Field& b, Field& x,
+                       const Mesh& M, double nb, double& rel)
+{
+    BL_PROFILE("zs::hypre_solve");
+    const auto& o = implicit();
+    auto& st = solve_stats();
+    st.kind = "hypre FlexGMRES + BoomerAMG";
+    hypre_init();
+    const double t0 = synced_second();
+    const int nq = b.nq, R = M.R, S = 2*R + 1;
+    AMREX_ALWAYS_ASSERT(nq <= MAXR);
+    const Geo g = M.g;
+    int W = 1, ncol = 1;
+    for (int d = 0; d < D; ++d) { W *= S; ncol *= axis_colours(g.hi[d] - g.lo[d] + 1, g.per[d], S); }
+    const int Wq = W*nq, s0 = W/2;
+    const HypreNumbering& num = numbering(M);
+    const long lo = num.lo, nloc = (num.hi - num.lo)*nq;
+    const auto gid = num.gid.const_arrays();
+    // the unscaled rows, entry (slot, column row q) at Wq row + s nq + q
+    amrex::Gpu::DeviceVector<Real> Af(size_t(nloc)*Wq);
+    Real* af = Af.data();
+    amrex::ParallelFor(amrex::Long(nloc)*Wq, [=] AMREX_GPU_DEVICE (amrex::Long n) noexcept { af[n] = 0.0; });
+    amrex::MultiFab e(M.ba, M.dm, nq, M.NG);
+    for (int cl = 0; cl < ncol; ++cl)
+        for (int q = 0; q < nq; ++q)
+        {
+            e.setVal(0.0);
+            auto ea = e.arrays();
+            amrex::ParallelFor(e, IV(0), [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+            {
+                ZS_CELL;
+                if (stencil_colour(g, c, S) == cl) ea[bx](c, q) = 1.0;
+            });
+            Field E;
+            E.nq = nq;
+            E.mf = std::make_shared<std::vector<amrex::MultiFab>>();
+            E.mf->emplace_back(e, amrex::make_alias, 0, nq);
+            const Field y = op(E);
+            auto ya = y[0].const_arrays();
+            amrex::ParallelFor(e, IV(0), [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+            {
+                ZS_CELL;
+                const long row = (long(gid[bx](c)) - lo)*nq;
+                for (int s = 0; s < W; ++s)
+                {
+                    const IV cc = c + slot_offset(s, R);
+                    if (gid[bx](cc) < 0 || stencil_colour(g, cc, S) != cl) continue;
+                    for (int p = 0; p < nq; ++p) af[(row + p)*Wq + s*nq + q] = ya[bx](c, p);
+                }
+            });
+        }
+    // S = D^-1 A row by row, packed (exact zeros dropped, a stencil cell met twice across a
+    // periodic seam kept once: its probe already sums both), and D^-1 b
+    amrex::Gpu::DeviceVector<HYPRE_BigInt> Rows(nloc), Cols(size_t(nloc)*Wq);
+    amrex::Gpu::DeviceVector<HYPRE_Int> Ncols(nloc), Ridx(nloc);
+    amrex::Gpu::DeviceVector<Real> Vals(size_t(nloc)*Wq), Bs(nloc), Xs(nloc);
+    HYPRE_BigInt* rows = Rows.data(); HYPRE_BigInt* cols = Cols.data();
+    HYPRE_Int* ncols = Ncols.data(); HYPRE_Int* ridx = Ridx.data();
+    Real* vals = Vals.data(); Real* bs = Bs.data(); Real* xs = Xs.data();
+    auto bb = b[0].const_arrays();
+    amrex::ParallelFor(e, IV(0), [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        const long row0 = (long(gid[bx](c)) - lo)*nq;
+        Real a[MAXR*MAXR], di[MAXR*MAXR];
+        for (int p = 0; p < nq; ++p)
+            for (int r = 0; r < nq; ++r) a[p*nq + r] = af[(row0 + p)*Wq + s0*nq + r];
+        invert_block(a, di, nq);
+        for (int p = 0; p < nq; ++p)
+        {
+            const long rw = row0 + p;
+            rows[rw] = HYPRE_BigInt(gid[bx](c))*nq + p;
+            ridx[rw] = HYPRE_Int(rw*Wq);
+            Real v = 0.0;
+            for (int r = 0; r < nq; ++r) v += di[p*nq + r]*bb[bx](c, r);
+            bs[rw] = v;
+            xs[rw] = 0.0;
+            int m = 0;
+            for (int s = 0; s < W; ++s)
+            {
+                const int gc = gid[bx](c + slot_offset(s, R));
+                bool seen = gc < 0;
+                for (int t = 0; t < s && !seen; ++t) seen = gid[bx](c + slot_offset(t, R)) == gc;
+                if (seen) continue;
+                for (int q = 0; q < nq; ++q)
+                {
+                    Real w = 0.0;
+                    for (int r = 0; r < nq; ++r) w += di[p*nq + r]*af[(row0 + r)*Wq + s*nq + q];
+                    if (w == 0.0 && !(s == s0 && q == p)) continue;
+                    cols[rw*Wq + m] = HYPRE_BigInt(gc)*nq + q;
+                    vals[rw*Wq + m] = w;
+                    ++m;
+                }
+            }
+            ncols[rw] = m;
+        }
+    });
+    Af.clear();
+    Af.shrink_to_fit();
+    const double t1 = synced_second();
+    MPI_Comm comm = amrex::ParallelDescriptor::Communicator();
+    const HYPRE_BigInt ilo = HYPRE_BigInt(lo)*nq, ihi = HYPRE_BigInt(num.hi)*nq - 1;
+    HYPRE_IJMatrix A;
+    HYPRE_IJMatrixCreate(comm, ilo, ihi, ilo, ihi, &A);
+    HYPRE_IJMatrixSetObjectType(A, HYPRE_PARCSR);
+    HYPRE_IJMatrixInitialize(A);
+    HYPRE_IJMatrixSetValues2(A, HYPRE_Int(nloc), ncols, rows, ridx, cols, vals);
+    HYPRE_IJMatrixAssemble(A);
+    HYPRE_ParCSRMatrix PA;
+    HYPRE_IJMatrixGetObject(A, reinterpret_cast<void**>(&PA));
+    HYPRE_IJVector V[2];
+    HYPRE_ParVector PV[2];
+    for (int v = 0; v < 2; ++v)
+    {
+        HYPRE_IJVectorCreate(comm, ilo, ihi, &V[v]);
+        HYPRE_IJVectorSetObjectType(V[v], HYPRE_PARCSR);
+        HYPRE_IJVectorInitialize(V[v]);
+        HYPRE_IJVectorSetValues(V[v], HYPRE_Int(nloc), rows, v == 0 ? bs : xs);
+        HYPRE_IJVectorAssemble(V[v]);
+        HYPRE_IJVectorGetObject(V[v], reinterpret_cast<void**>(&PV[v]));
+    }
+    HYPRE_Solver solver, amg;
+    HYPRE_ParCSRFlexGMRESCreate(comm, &solver);
+    HYPRE_FlexGMRESSetKDim(solver, std::min(o.ls_restart, 50));
+    HYPRE_FlexGMRESSetMaxIter(solver, o.ls_restart*o.ls_maxiter);
+    HYPRE_FlexGMRESSetAbsoluteTol(solver, 0.0);
+    HYPRE_FlexGMRESSetLogging(solver, 0);
+    HYPRE_FlexGMRESSetPrintLevel(solver, 0);
+    HYPRE_BoomerAMGCreate(&amg);
+    HYPRE_BoomerAMGSetTol(amg, 0.0);
+    HYPRE_BoomerAMGSetMaxIter(amg, 1);
+    HYPRE_BoomerAMGSetPrintLevel(amg, 0);
+    HYPRE_BoomerAMGSetInterpType(amg, 6);               // ext+i
+    HYPRE_BoomerAMGSetPMaxElmts(amg, 4);
+    HYPRE_BoomerAMGSetStrongThreshold(amg, 0.25);
+    HYPRE_BoomerAMGSetNumSweeps(amg, 1);
+    HYPRE_BoomerAMGSetRelaxOrder(amg, 0);
+#ifdef AMREX_USE_GPU
+    HYPRE_BoomerAMGSetCoarsenType(amg, 8);              // PMIS
+    HYPRE_BoomerAMGSetRelaxType(amg, 18);               // l1-Jacobi
+    HYPRE_BoomerAMGSetKeepTranspose(amg, 1);
+#else
+    HYPRE_BoomerAMGSetCoarsenType(amg, 10);             // HMIS
+    HYPRE_BoomerAMGSetRelaxType(amg, 6);                // hybrid symmetric Gauss-Seidel
+#endif
+    HYPRE_FlexGMRESSetPrecond(solver, (HYPRE_PtrToSolverFcn) HYPRE_BoomerAMGSolve,
+                              (HYPRE_PtrToSolverFcn) HYPRE_BoomerAMGSetup, amg);
+    HYPRE_ParCSRFlexGMRESSetup(solver, PA, PV[0], PV[1]);
+    const double t2 = synced_second();
+    auto xa = x[0].arrays();
+    // a margin below ls_tol: a Newton loop around the solve tests max|R| absolutely, and a
+    // second iteration would meet its right-hand side at the op's round-off floor
+    double tol = 0.1*o.ls_tol, last = 0.0;
+    int its = 0;
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        HYPRE_FlexGMRESSetTol(solver, tol);
+        HYPRE_ParCSRFlexGMRESSolve(solver, PA, PV[0], PV[1]);
+        HYPRE_Int it = 0;
+        HYPRE_FlexGMRESGetNumIterations(solver, &it);
+        its += int(it);
+        HYPRE_IJVectorGetValues(V[1], HYPRE_Int(nloc), nullptr, xs);   // the local rows, in order
+        amrex::Gpu::Device::synchronize();
+        amrex::ParallelFor(x[0], IV(0), [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+        {
+            ZS_CELL;
+            const long row0 = (long(gid[bx](c)) - lo)*nq;
+            for (int p = 0; p < nq; ++p) xa[bx](c, p) = xs[row0 + p];
+        });
+        x.ngv = 0;
+        const Field y = op(x);
+        amrex::MultiFab r(M.ba, M.dm, nq, 0);
+        amrex::MultiFab::LinComb(r, 1.0, y[0], 0, -1.0, b[0], 0, 0, nq, 0);
+        rel = std::sqrt(amrex::MultiFab::Dot(r, 0, r, 0, nq, 0))/nb;
+        if (std::getenv("ZS_KRYLOV_LOG"))
+            amrex::Print() << "hypre pass " << pass << ": " << it << " iterations to " << tol
+                           << ", true residual " << rel << "\n";
+        // done, out of iterations, or stalled (a finite-difference op's noise floor)
+        if (!(rel > o.ls_tol) || it >= o.ls_restart*o.ls_maxiter || (pass > 0 && rel > 0.5*last))
+            break;
+        last = rel;
+        tol *= 0.5*o.ls_tol/rel;                    // the scaled residual understates the true one
+    }
+    static bool warned = false;
+    if (rel > o.ls_tol && !warned)
+    {
+        warned = true;
+        warn("hypre: true residual " + std::to_string(rel) + " > ls_tol (an op of a wider stencil "
+             "than the LSQ reach, or its round-off floor)");
+    }
+    HYPRE_BoomerAMGDestroy(amg);
+    HYPRE_ParCSRFlexGMRESDestroy(solver);
+    HYPRE_IJMatrixDestroy(A);
+    for (auto& v : V) HYPRE_IJVectorDestroy(v);
+    st.t_asm += t1 - t0;
+    st.t_setup += t2 - t1;
+    st.t_solve += synced_second() - t2;
+    return its;
+}
+#endif
+
+/// Solve op(x) = b (restart, iterations and tolerance from implicit()) with hypre (AMG-preconditioned FlexGMRES on the assembled, block-scaled matrix) or amrex::GMRES (cell-block Jacobi), as zs.linsolve says; aborts above the accept gate.
 /// Ref: Saad, Schultz 1986, https://doi.org/10.1137/0907058
 inline Field linsolve_impl(std::function<Field(Field)> op, const Field& b, const Mesh& M)
 {
     BL_PROFILE("zs::linsolve_impl");
     const auto& o = implicit();
-    LinOp L;
-    L.op = std::move(op); L.M = &M; L.nq = b.nq;
-    L.blocks();
-    amrex::GMRES<amrex::MultiFab, LinOp> gm;
-    gm.define(L);
-    gm.setRestartLength(o.ls_restart);
-    gm.setMaxIters(o.ls_restart*o.ls_maxiter);
     Field x = cells_of(M, b.nq);
     x[0].setVal(0.0);
-    amrex::MultiFab rhs(M.ba, M.dm, b.nq, 0);
-    amrex::MultiFab::Copy(rhs, b[0], 0, 0, b.nq, 0);
-    const double nb = L.norm2(rhs);
-    if (nb > 0.0) gm.solve(x[0], rhs, o.ls_tol, 0.0);
-    if (o.ls_accept > 0 && nb > 0.0)
+    const double nb = norm(b);
+    if (nb == 0.0) return x;
+    auto& st = solve_stats();
+    double rel = -1.0;
+    int its = 0;
+#ifdef ZS_HYPRE
+    if (use_hypre()) its = hypre_solve(op, b, x, M, nb, rel);
+    else
+#endif
+    its = gmres_solve(op, b, x, M);
+    ++st.n;
+    st.its += its;
+    if (rel < 0.0 && (o.ls_accept > 0 || std::getenv("ZS_KRYLOV_LOG")))
     {
-        amrex::MultiFab Ax = L.makeVecRHS();
-        L.apply(Ax, x[0]);
-        amrex::MultiFab::Subtract(Ax, rhs, 0, 0, b.nq, 0);
-        const double rel = L.norm2(Ax)/nb;
-        if (rel > o.ls_accept)
-            amrex::Abort("linsolve: relative residual " + std::to_string(rel)
-                         + " > accept gate " + std::to_string(o.ls_accept));
+        const Field y = op(x);
+        amrex::MultiFab r(M.ba, M.dm, b.nq, 0);
+        amrex::MultiFab::LinComb(r, 1.0, y[0], 0, -1.0, b[0], 0, 0, b.nq, 0);
+        rel = std::sqrt(amrex::MultiFab::Dot(r, 0, r, 0, b.nq, 0))/nb;
     }
+    if (o.ls_accept > 0 && !(rel <= o.ls_accept))
+        amrex::Abort("linsolve: relative residual " + std::to_string(rel)
+                     + " > accept gate " + std::to_string(o.ls_accept));
     if (std::getenv("ZS_KRYLOV_LOG"))
-        amrex::Print() << "linsolve: " << gm.getNumIters() << " iterations, residual "
-                       << gm.getResidualNorm()/(nb > 0 ? nb : 1.0) << "\n";
+        amrex::Print() << "linsolve: " << its << " iterations, residual " << rel << "\n";
     return x;
 }
 

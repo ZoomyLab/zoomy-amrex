@@ -32,6 +32,11 @@ CONTAINERS = Path(os.environ.get("ZOOMY_AMREX_CONTAINERS",
                                  _OWN if (_OWN / "zoomy_amrex.sif").exists()
                                  else Path.home() / "git/Zoomy/containers/zoomy_amrex"))
 SIF = {False: CONTAINERS / "zoomy_amrex.sif", True: CONTAINERS / "zoomy_amrex_gpu.sif"}
+# hypre for the linear solves (static libHYPRE.a, built once per variant by
+# containers/zoomy_amrex/build_hypre_cuda.sh into ~/.cache/zoomy)
+HYPRE_VERSION = "3.2.0"
+HYPRE_CACHE = Path(os.environ.get("ZOOMY_HYPRE_CACHE", Path.home() / ".cache" / "zoomy"))
+HYPRE_SCRIPT = ROOT.parent.parent / "containers" / "zoomy_amrex" / "build_hypre_cuda.sh"
 BUILD_CPUS = os.environ.get("ZOOMY_AMREX_BUILD_CPUS", "32-63")
 RUN_CPUS = os.environ.get("ZOOMY_AMREX_RUN_CPUS", "16-31")
 APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "symsolver/amr_amrex.H",
@@ -65,6 +70,10 @@ class AmrexDriver(param.Parameterized):
                                  doc="AMReX TinyProfiler build (a tree of its own).")
     build_only = param.Boolean(default=False,
                                doc="run() only builds (and caches) the binary.")
+    linear_solver = param.Selector(default="hypre", objects=["hypre", "gmres"], doc=(
+        "Linear solves (linsolve): 'hypre' = BoomerAMG-preconditioned FlexGMRES on the assembled, "
+        "cell-block-scaled operator; 'gmres' = amrex::GMRES with the cell-block Jacobi "
+        "preconditioner."))
     amr = param.Dict(default=None, allow_None=True, doc=(
         "AMR (one dt for all levels; amr_amrex.H): max_level, ratio (2), "
         "regrid_int (0: the initial grids only), tag = (state name, 'value' | "
@@ -97,18 +106,23 @@ class AmrexDriver(param.Parameterized):
             files[Path(f).name] = (SRC / f).read_text()
         files[RUNTIME_HEADER.name] = RUNTIME_HEADER.read_text()
         cpl = bool(self.couple)
-        h = hashlib.sha256(f"{self.gpu}{self.tiny_profile}{cpl}".encode())
+        hypre = hypre_prefix(self.gpu) if self.linear_solver == "hypre" else None
+        make = _gnumakefile(self.gpu, self.tiny_profile, dimension, cpl, hypre)
+        h = hashlib.sha256(make.encode())          # the build flags, then the sources
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
         binary = CACHE / "bin" / h.hexdigest()[:16] / "symAmrex.ex"
         if binary.exists():
             return binary
         tree = CACHE / (("gpu" if self.gpu else "cpu") + f"{dimension}d"
-                        + ("_tp" if self.tiny_profile else "") + ("_cpl" if cpl else ""))
+                        + ("_tp" if self.tiny_profile else "") + ("_cpl" if cpl else "")
+                        + ("_hypre" if hypre else ""))
         (tree / "Source").mkdir(parents=True, exist_ok=True)
         (tree / "Exec").mkdir(parents=True, exist_ok=True)
         with open(tree / ".lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            if binary.exists():                     # built while this one waited
+                return binary
             for k, v in files.items():
                 p = tree / "Source" / k
                 if not p.exists() or p.read_text() != v:
@@ -116,17 +130,18 @@ class AmrexDriver(param.Parameterized):
             (tree / "Source" / "Make.package").write_text(
                 "CEXE_sources += symAmrex.cpp\nCEXE_headers += rt_common.H rt_amrex.H amr_amrex.H "
                 "Kernels.H Solver.H UserFunctions.H ZoomyEig.H\n")
-            (tree / "Exec" / "GNUmakefile").write_text(
-                _gnumakefile(self.gpu, self.tiny_profile, dimension, cpl))
+            (tree / "Exec" / "GNUmakefile").write_text(make)
             r = _apptainer(self.gpu, f"cd {tree}/Exec && taskset -c {BUILD_CPUS} "
                            f"make -j32 > make.log 2>&1; rc=$?; tail -30 make.log; "
-                           f"exit $rc", capture_output=True, text=True)
+                           f"exit $rc", binds=[hypre] if hypre and hypre.exists() else (),
+                           capture_output=True, text=True)
             exe = sorted((tree / "Exec").glob(f"main{dimension}d*.ex"), key=os.path.getmtime)
             if r.returncode != 0 or not exe:
                 raise RuntimeError(f"symAmrex make failed ({tree}/Exec/make.log):\n"
                                    f"{r.stdout}\n{r.stderr}")
             binary.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(exe[-1], binary)
+            shutil.copy2(exe[-1], binary.with_suffix(".tmp"))
+            os.replace(binary.with_suffix(".tmp"), binary)     # never over a running binary
             (binary.parent / "Solver.H").write_text(files["Solver.H"])
             (binary.parent / "Kernels.H").write_text(files["Kernels.H"])
         return binary
@@ -183,6 +198,7 @@ class AmrexDriver(param.Parameterized):
             f"{1e30 if self.time_end is None else self.time_end!r}\n"
             f"zs.branch = {' '.join(map(str, branch))}\n"
             f"zs.lsq = lsq.txt\nzs.q0 = q0.bin\nzs.qaux0 = qaux0.bin\nzs.out = out\n"
+            f"zs.linsolve = {self.linear_solver}\n"
             "amrex.the_arena_init_size = 1073741824\namrex.verbose = 0\n"
             "tiny_profiler.device_synchronize_around_region = 1\n" + amr)
         launch = (f"mpirun --oversubscribe --bind-to none -n {self.ranks} "
@@ -258,7 +274,10 @@ class AmrexDriver(param.Parameterized):
 
 
 class SymbolicHyperbolicSolverAmrex(AmrexDriver, CxxBackend):
-    """The explicit hyperbolic solver template on AMReX."""
+    """The explicit hyperbolic solver template on AMReX; its linear solves (Newton-Krylov of the
+    implicit diffusion, finite-difference Jacobians) default to amrex::GMRES.
+    """
+    linear_solver = param.Selector(default="gmres", objects=["hypre", "gmres"])
 
 
 class SymbolicChorinSolverAmrex(AmrexDriver, CxxChorinBackend):
@@ -497,8 +516,38 @@ def _read(path, grid):
     return float(time), out
 
 
-def _gnumakefile(gpu, tiny_profile=False, dim=2, precice=False):
-    """Text of the AMReX GNUmakefile (CPU or GPU, dimension, optional preCICE)."""
+def hypre_prefix(gpu):
+    """The hypre install of the CPU or GPU build (``~/.cache/zoomy/hypre-{cpu,cuda}-3.2.0``),
+    built first by ``containers/zoomy_amrex/build_hypre_cuda.sh`` when missing.
+
+    References:
+        Falgout, Yang 2002, https://doi.org/10.1007/3-540-47789-6_66
+    """
+    if os.environ.get("ZOOMY_HYPRE_DIR"):       # e.g. /opt/hypre baked into the image
+        return Path(os.environ["ZOOMY_HYPRE_DIR"])
+    variant = "cuda" if gpu else "cpu"
+    prefix = HYPRE_CACHE / f"hypre-{variant}-{HYPRE_VERSION}"
+    if (prefix / "lib" / "libHYPRE.a").exists():
+        return prefix
+    if not HYPRE_SCRIPT.exists():
+        raise RuntimeError(f"no hypre in {prefix}: build it with build_hypre_cuda.sh {variant} "
+                           "(Zoomy containers/zoomy_amrex), or linear_solver='gmres'")
+    HYPRE_CACHE.mkdir(parents=True, exist_ok=True)
+    with open(HYPRE_CACHE / f".hypre-{variant}.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (prefix / "lib" / "libHYPRE.a").exists():
+            r = subprocess.run(["bash", str(HYPRE_SCRIPT), variant], capture_output=True, text=True,
+                               env=dict(os.environ, ZOOMY_AMREX_CONTAINERS=str(CONTAINERS),
+                                        ZOOMY_HYPRE_CACHE=str(HYPRE_CACHE),
+                                        ZOOMY_AMREX_BUILD_CPUS=BUILD_CPUS))
+            if r.returncode != 0:
+                raise RuntimeError(f"hypre build failed:\n{r.stdout[-3000:]}\n{r.stderr[-3000:]}")
+    return prefix
+
+
+def _gnumakefile(gpu, tiny_profile=False, dim=2, precice=False, hypre=None):
+    """Text of the AMReX GNUmakefile (CPU or GPU, dimension, optional preCICE, optional hypre
+    install ``hypre``)."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("_zoomy_amrex_build", ROOT / "build.py")
     mod = importlib.util.module_from_spec(spec)
@@ -506,6 +555,12 @@ def _gnumakefile(gpu, tiny_profile=False, dim=2, precice=False):
     mk = mod.GNUMAKEFILE.format(amrex_home="/opt/amrex", dim=dim, use_mpi="TRUE",
                                 use_cuda="TRUE" if gpu else "FALSE", cuda_arch="89",
                                 tiny_profile="TRUE" if tiny_profile else "FALSE")
+    if hypre is not None:   # static libHYPRE.a, our own init (AMReX 25.02's USE_HYPRE predates hypre 3)
+        libs = "-lHYPRE" + (" -lcusparse -lcurand -lcublas -lcusolver" if gpu else "")
+        mk = mk.replace("include ../Source/Make.package",
+                        f"DEFINES += -DZS_HYPRE\nSYSTEM_INCLUDE_LOCATIONS += {hypre}/include\n"
+                        f"LIBRARY_LOCATIONS += {hypre}/lib\nLIBRARIES += {libs}\n"
+                        "include ../Source/Make.package", 1)
     if precice:                         # the container's libprecice (pkg-config)
         mk = mk.replace("include ../Source/Make.package",
                         "DEFINES += -DZS_PRECICE\nLIBRARIES += -lprecice\n"
