@@ -67,6 +67,7 @@ class AmrexDriver(param.Parameterized):
         Berger, Oliger 1984, https://doi.org/10.1016/0021-9991(84)90073-1
         Berger, Colella 1989, https://doi.org/10.1016/0021-9991(89)90035-1
     """
+    _gpu_boxes = 1          # boxes per GPU of the default max_grid_size
     ranks = param.Integer(default=1, bounds=(1, None), doc="MPI ranks (GPUs with gpu=True).")
     gpu = param.Boolean(default=False, doc="CUDA build (one GPU per rank).")
     max_grid_size = param.Integer(default=None, allow_None=True,
@@ -192,8 +193,8 @@ class AmrexDriver(param.Parameterized):
                     f"zs.precice_read = {' '.join(c['read'])}\n"
                     f"zs.precice_side = {side_of(mesh, c['tag'], dim)}\n")
         # boxes per rank: CPU ~8 (load balance across wet / dry / wall cells),
-        # GPU ~1 (one launch covers all boxes; fewer, larger boxes)
-        per = 1 if self.gpu else 8
+        # GPU `_gpu_boxes` (hyperbolic 1: one launch covers all boxes)
+        per = self._gpu_boxes if self.gpu else 8
         mgs = self.max_grid_size or max(16, int(np.ceil(max(n) / np.ceil(
             (per * self.ranks) ** (1.0 / dim) - 1e-9))))
         f = lambda v: " ".join(repr(float(x)) for x in v)                  # noqa: E731
@@ -293,6 +294,7 @@ class SymbolicChorinSolverAmrex(AmrexDriver, CxxChorinBackend):
     References:
         Chorin 1968, https://doi.org/10.1090/S0025-5718-1968-0242392-2
     """
+    _gpu_boxes = 4          # hypre on 2 / 4 GPUs, L2P: 571 -> 445 / 392 ms per step
 
 
 # ── the grid ────────────────────────────────────────────────────────────────
