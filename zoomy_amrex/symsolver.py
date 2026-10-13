@@ -208,8 +208,9 @@ class AmrexDriver(param.Parameterized):
         # boxes per rank: CPU ~8 (load balance across wet / dry / wall cells),
         # GPU `_gpu_boxes` (hyperbolic 1: one launch covers all boxes)
         per = self._gpu_boxes if self.gpu else 8
-        mgs = self.max_grid_size or max(16, int(np.ceil(max(n) / np.ceil(
-            (per * self.ranks) ** (1.0 / dim) - 1e-9))))
+        # box side from the cell count, so an elongated domain still gets ~per boxes per rank
+        mgs = self.max_grid_size or max(16, int(np.ceil(
+            (np.prod(n) / (per * self.ranks)) ** (1.0 / dim) - 1e-9)))
         f = lambda v: " ".join(repr(float(x)) for x in v)                  # noqa: E731
         ckpt = None if self.checkpoint is None else Path(self.checkpoint).resolve()
         if ckpt is not None:
