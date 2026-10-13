@@ -40,8 +40,21 @@ SIF = {False: CONTAINERS / "zoomy_amrex.sif", True: CONTAINERS / "zoomy_amrex_gp
 HYPRE_VERSION = "3.2.0"
 HYPRE_CACHE = Path(os.environ.get("ZOOMY_HYPRE_CACHE", Path.home() / ".cache" / "zoomy"))
 HYPRE_SCRIPT = ROOT.parent.parent / "containers" / "zoomy_amrex" / "build_hypre_cuda.sh"
-BUILD_CPUS = os.environ.get("ZOOMY_AMREX_BUILD_CPUS", "32-63")
-RUN_CPUS = os.environ.get("ZOOMY_AMREX_RUN_CPUS", "16-31")
+
+
+def _cpus(var, default):
+    """The taskset CPU list: `$var`, else `default` when this process may run on one of its CPUs,
+    else all the CPUs it may run on (a machine with fewer cores: taskset fails on absent CPUs).
+    """
+    if var in os.environ:
+        return os.environ[var]
+    lo, hi = map(int, default.split("-"))
+    mine = sorted(os.sched_getaffinity(0))
+    return default if any(lo <= c <= hi for c in mine) else ",".join(map(str, mine))
+
+
+BUILD_CPUS = _cpus("ZOOMY_AMREX_BUILD_CPUS", "32-63")
+RUN_CPUS = _cpus("ZOOMY_AMREX_RUN_CPUS", "16-31")
 APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "symsolver/amr_amrex.H",
        "UserFunctions.H", "ZoomyEig.H")
 
