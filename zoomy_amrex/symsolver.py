@@ -9,6 +9,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 from pathlib import Path
 
@@ -167,6 +168,10 @@ class AmrexDriver(param.Parameterized):
                 ``build_only``.
         """
         nsm = self._prepare(mesh, model)
+        if (self.amr or self.couple) and (self.restart_from is not None
+                                          or self.dt_checkpoint is not None):
+            raise NotImplementedError("restart / checkpoints with AMR or preCICE coupling")
+        restart = None if self.restart_from is None else restart_dir(self.restart_from)
         grid = cartesian(mesh)
         dim = grid["dim"]
         branch, periodic = sides(mesh, nsm, dim)
@@ -175,9 +180,17 @@ class AmrexDriver(param.Parameterized):
         if self.build_only:
             return binary
         case = Path(workdir).resolve()
+        staged = None
+        if restart is not None and case in (restart, *restart.parents):
+            staged = Path(tempfile.mkdtemp(dir=case.parent))   # out of the case recreated here
+            restart = Path(shutil.copytree(restart, staged / "restart"))
         if case.exists():
             shutil.rmtree(case)
         case.mkdir(parents=True)
+        if restart is not None:
+            shutil.copytree(restart, case / "restart")
+        if staged is not None:
+            shutil.rmtree(staged)
         n = grid["n"]
         to_grid = lambda Q: np.asarray(Q, dtype=np.float64)[:, grid["order"]]  # noqa: E731
         to_grid(Q0).tofile(case / "q0.bin")
@@ -198,6 +211,9 @@ class AmrexDriver(param.Parameterized):
         mgs = self.max_grid_size or max(16, int(np.ceil(max(n) / np.ceil(
             (per * self.ranks) ** (1.0 / dim) - 1e-9))))
         f = lambda v: " ".join(repr(float(x)) for x in v)                  # noqa: E731
+        ckpt = None if self.checkpoint is None else Path(self.checkpoint).resolve()
+        if ckpt is not None:
+            ckpt.mkdir(parents=True, exist_ok=True)
         (case / "inputs").write_text(
             f"zs.n_cell = {' '.join(map(str, n))}\nzs.prob_lo = {f(grid['lo'])}\n"
             f"zs.prob_hi = {f(grid['hi'])}\nzs.periodic = {' '.join(map(str, periodic))}\n"
@@ -205,14 +221,18 @@ class AmrexDriver(param.Parameterized):
             f"{1e30 if self.time_end is None else self.time_end!r}\n"
             f"zs.branch = {' '.join(map(str, branch))}\n"
             f"zs.lsq = lsq.txt\nzs.q0 = q0.bin\nzs.qaux0 = qaux0.bin\nzs.out = out\n"
-            f"zs.linsolve = {self.linear_solver}\n"
+            f"zs.time_start = {float(self.time_start)!r}\n"
+            + ("" if restart is None else "zs.restart = restart\n")
+            + ("" if ckpt is None else f"zs.checkpoint = {ckpt}\n")
+            + f"zs.linsolve = {self.linear_solver}\n"
             "amrex.the_arena_init_size = 1073741824\namrex.verbose = 0\n"
             "tiny_profiler.device_synchronize_around_region = 1\n" + amr)
         launch = (f"mpirun --oversubscribe --bind-to none -n {self.ranks} "
                   if self.ranks > 1 or self.gpu else "")
         cpus = "" if self.gpu else f"taskset -c {RUN_CPUS} "
         r = _apptainer(self.gpu, f"cd {case} && {cpus}{launch}{binary} inputs > log.symAmrex 2>&1",
-                       binds=[case, binary.parent], capture_output=True, text=True)
+                       binds=[case, binary.parent] + ([] if ckpt is None else [ckpt]),
+                       capture_output=True, text=True)
         log = (case / "log.symAmrex").read_text()
         if r.returncode != 0:
             raise RuntimeError(f"symAmrex failed, see {case}/log.symAmrex:\n{log[-3000:]}\n{r.stderr}")
@@ -511,6 +531,31 @@ def lsq_table(fit, grid, periodic, owner):
             out += [f"{s[0]} {' '.join(str(int(o)) for o in s[1:1 + dim])} "
                     + " ".join(repr(float(x)) for x in s[-1]) for s in smp]
     return "\n".join(out) + "\n"
+
+
+def restart_dir(path):
+    """The checkpoint directory `chk<t>` (of `io.save_state`) at `path`: itself or its latest."""
+    from zoomy_core.symsolver.restart import missing
+    p = Path(path).resolve()
+
+    def time_of(d):
+        """The time in `d/Header`; None: no checkpoint."""
+        try:
+            fmt, t = (d / "Header").read_text().split()[:2]
+        except (OSError, ValueError):
+            return None
+        return float(t) if fmt == "zoomy-restart-1" else None
+    if not p.exists():
+        raise missing(p)
+    if time_of(p) is not None:
+        return p
+    found = [(time_of(d), d) for d in p.iterdir() if d.is_dir()] if p.is_dir() else []
+    found = [(t, d) for t, d in found if t is not None]
+    if not found:
+        raise FileNotFoundError(f"restart_from {str(path)!r}: no AMReX restart state (a chk<t> "
+                                "directory with a zoomy-restart-1 Header, or a directory holding "
+                                "one)")
+    return max(found)[1]
 
 
 def _read(path, grid):
