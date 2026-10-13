@@ -8,7 +8,7 @@ import time
 
 import pytest
 import zoomy_core.model.initial_conditions as IC
-from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.numerics import Limiter, NumericalSystemModel, ReconstructionSpec
 from zoomy_core.systemmodel.system_model import SystemModel
 
 from tests import models, refs
@@ -23,7 +23,7 @@ def test_stoker_wet(overwrite):
     sm = SystemModel.from_model(model)                       # SystemModel
     sm.initial_conditions = IC.UserFunction(function=stoker_ic)
     nsm = NumericalSystemModel.from_system_model(             # NumericalSystemModel
-        sm, reconstruction=ReconstructionSpec(order=1, limiter="minmod"))
+        sm, reconstruction=ReconstructionSpec(order=1, limiter=Limiter.minmod))
     print(describe(nsm))
 
     settings = {"dimension": 1, "domain": [0.0, 10.0], "n_cells": 100,

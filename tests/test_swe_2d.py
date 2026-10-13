@@ -9,7 +9,7 @@ import time
 import numpy as np
 import pytest
 import zoomy_core.model.initial_conditions as IC
-from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.numerics import Limiter, NumericalSystemModel, ReconstructionSpec
 from zoomy_core.systemmodel.system_model import SystemModel
 
 from tests import models, refs
@@ -26,7 +26,7 @@ def test_swe_2d_pulse(overwrite):
     sm = SystemModel.from_model(model)
     sm.initial_conditions = IC.UserFunction(function=gaussian_pulse_2d)
     nsm = NumericalSystemModel.from_system_model(
-        sm, reconstruction=ReconstructionSpec(order=1, limiter="minmod"))
+        sm, reconstruction=ReconstructionSpec(order=1, limiter=Limiter.minmod))
     print(describe(nsm))
 
     settings = {"dimension": 2, "domain": [-1.0, 1.0, -1.0, 1.0],

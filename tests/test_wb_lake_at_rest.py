@@ -13,7 +13,7 @@ import time
 import numpy as np
 import pytest
 import zoomy_core.model.initial_conditions as IC
-from zoomy_core.numerics import NumericalSystemModel, ReconstructionSpec
+from zoomy_core.numerics import Limiter, NumericalSystemModel, ReconstructionSpec
 from zoomy_core.systemmodel.system_model import SystemModel
 
 from tests import models, refs
@@ -28,7 +28,7 @@ def test_lake_at_rest_over_bump(overwrite):
     sm = SystemModel.from_model(model)
     sm.initial_conditions = IC.UserFunction(function=lake_at_rest_ic)
     nsm = NumericalSystemModel.from_system_model(
-        sm, reconstruction=ReconstructionSpec(order=1, limiter="minmod"))
+        sm, reconstruction=ReconstructionSpec(order=1, limiter=Limiter.minmod))
     print(describe(nsm))
 
     # well_balanced turns on the driver's Audusse hydrostatic reconstruction.
