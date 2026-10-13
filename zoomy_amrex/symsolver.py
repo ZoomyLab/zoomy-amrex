@@ -59,6 +59,12 @@ APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "symsolver/amr_amrex.H"
        "UserFunctions.H", "ZoomyEig.H")
 
 
+def _image_id(sif):
+    """Identity of the apptainer image that compiles a binary (a replaced image rebuilds)."""
+    st = Path(sif).stat()
+    return f"{Path(sif).name}:{st.st_size}:{st.st_mtime_ns}"
+
+
 def _apptainer(gpu, script, binds=(), **kw):
     """Run the shell `script` in the CPU or GPU AMReX apptainer with the cache and `binds`
     mounted.
@@ -130,6 +136,7 @@ class AmrexDriver(param.Parameterized):
         hypre = hypre_prefix(self.gpu) if self.linear_solver == "hypre" else None
         make = _gnumakefile(self.gpu, self.tiny_profile, dimension, cpl, hypre)
         h = hashlib.sha256(make.encode())          # the build flags, then the sources
+        h.update(_image_id(SIF[self.gpu]).encode())   # and the image that compiles them
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
         binary = CACHE / "bin" / h.hexdigest()[:16] / "symAmrex.ex"
