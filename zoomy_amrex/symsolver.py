@@ -1,6 +1,10 @@
 """Driver of the symbolic solvers on AMReX: prints the C++ solver, builds it in the AMReX apptainer,
 runs it on the mesh's uniform Cartesian grid and reads the result back.  Sits behind the C++ solver
 template (`zoomy_core.symsolver.backend_cxx`) and in front of `Source/symsolver`.
+
+Inside the AMReX image (zoomy-server's amrex backend) the driver builds and runs natively, see
+`in_image`.  Binaries are cached in `ZOOMY_AMREX_SYMCACHE`, default `<package>/../.symcache` when
+writable, else `~/.cache/zoomy/amrex_symcache` (else the temp directory).
 """
 from __future__ import annotations
 
@@ -27,7 +31,34 @@ from zoomy_amrex.symkernels import write_kernels
 
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "Source"
-CACHE = Path(os.environ.get("ZOOMY_AMREX_SYMCACHE", ROOT / ".symcache"))
+
+
+def _writable_dir(*candidates):
+    """The first candidate directory that exists writable or can be created."""
+    for c in candidates:
+        c = Path(c)
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        if os.access(c, os.W_OK | os.X_OK):
+            return c
+    raise RuntimeError(f"no writable AMReX build cache among {candidates}: set ZOOMY_AMREX_SYMCACHE")
+
+
+def _cache():
+    """`ZOOMY_AMREX_SYMCACHE`, else the first writable of `ROOT/.symcache` (a source checkout),
+    `~/.cache/zoomy/amrex_symcache`, `<tmp>/zoomy_amrex_symcache` (a read-only install, e.g. the
+    image's)."""
+    if os.environ.get("ZOOMY_AMREX_SYMCACHE"):
+        return Path(os.environ["ZOOMY_AMREX_SYMCACHE"])
+    return _writable_dir(ROOT / ".symcache",
+                         Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+                         / "zoomy" / "amrex_symcache",
+                         Path(tempfile.gettempdir()) / "zoomy_amrex_symcache")
+
+
+CACHE = _cache()
 # the superrepo's own images (containers/zoomy_amrex, with preCICE), else the
 # Zoomy checkout's
 _OWN = ROOT.parent.parent / "containers" / "zoomy_amrex"
@@ -59,16 +90,43 @@ APP = ("symsolver/symAmrex.cpp", "symsolver/rt_amrex.H", "symsolver/amr_amrex.H"
        "UserFunctions.H", "ZoomyEig.H")
 
 
+def in_image():
+    """True when this process already runs where AMReX builds: `ZOOMY_AMREX_IN_IMAGE` (1 / 0)
+    when set, else AMReX sources at `$AMREX_HOME` and either an apptainer container around this
+    process (`APPTAINER_CONTAINER`) or no `apptainer` to call.  Then the build and the run are
+    plain subprocesses; otherwise they go through `apptainer exec` of `SIF`."""
+    flag = os.environ.get("ZOOMY_AMREX_IN_IMAGE")
+    if flag is not None:
+        return flag.strip().lower() not in ("", "0", "false", "no")
+    home = os.environ.get("AMREX_HOME")
+    if not home or not (Path(home) / "Src" / "Base").is_dir():
+        return False
+    return bool(os.environ.get("APPTAINER_CONTAINER")) or shutil.which("apptainer") is None
+
+
+def _amrex_home():
+    """AMReX sources the GNUmakefile includes: the image's /opt/amrex, natively `$AMREX_HOME`."""
+    return os.environ.get("AMREX_HOME", "/opt/amrex") if in_image() else "/opt/amrex"
+
+
 def _image_id(sif):
-    """Identity of the apptainer image that compiles a binary (a replaced image rebuilds)."""
+    """Identity of the image that compiles a binary (a replaced image rebuilds): the `.sif` file,
+    natively the AMReX tree and the container labels."""
+    if in_image():
+        home = Path(_amrex_home())
+        labels = Path("/.singularity.d/labels.json")
+        tag = hashlib.sha256(labels.read_bytes()).hexdigest()[:12] if labels.exists() else ""
+        return f"native:{home}:{home.stat().st_mtime_ns}:{tag}"
     st = Path(sif).stat()
     return f"{Path(sif).name}:{st.st_size}:{st.st_mtime_ns}"
 
 
 def _apptainer(gpu, script, binds=(), **kw):
     """Run the shell `script` in the CPU or GPU AMReX apptainer with the cache and `binds`
-    mounted.
+    mounted; inside the image (`in_image`) run it directly.
     """
+    if in_image():
+        return subprocess.run(["bash", "-c", script], **kw)
     cmd = ["apptainer", "exec", "--cleanenv", *(["--nv"] if gpu else [])]
     for b in sorted({str(CACHE), *map(str, binds)}):
         cmd += ["--bind", b]
@@ -626,7 +684,7 @@ def _gnumakefile(gpu, tiny_profile=False, dim=2, precice=False, hypre=None):
     spec = importlib.util.spec_from_file_location("_zoomy_amrex_build", ROOT / "build.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    mk = mod.GNUMAKEFILE.format(amrex_home="/opt/amrex", dim=dim, use_mpi="TRUE",
+    mk = mod.GNUMAKEFILE.format(amrex_home=_amrex_home(), dim=dim, use_mpi="TRUE",
                                 use_cuda="TRUE" if gpu else "FALSE", cuda_arch="89",
                                 tiny_profile="TRUE" if tiny_profile else "FALSE")
     if hypre is not None:   # static libHYPRE.a, our own init (AMReX 25.02's USE_HYPRE predates hypre 3)
