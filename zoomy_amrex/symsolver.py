@@ -17,7 +17,9 @@ import param
 
 from zoomy_core.mesh import LSQMesh, ensure_lsq_mesh
 from zoomy_core.mesh.geometry_xp import build_topology, compute_geometry
+from zoomy_core.misc.options import OptionParam
 from zoomy_core.model.boundary_conditions import boundary_face_branches
+from zoomy_core.symsolver.settings import LinearSolver
 from zoomy_core.numerics.boundary_closure import closure_kinds
 from zoomy_core.symsolver.backend_cxx import RUNTIME_HEADER, CxxBackend, CxxChorinBackend
 from zoomy_amrex.symkernels import write_kernels
@@ -53,6 +55,9 @@ def _apptainer(gpu, script, binds=(), **kw):
     return subprocess.run(cmd + [str(SIF[gpu]), "bash", "-c", script], **kw)
 
 
+_AMREX_SOLVERS = [LinearSolver.hypre, LinearSolver.gmres]
+
+
 class AmrexDriver(param.Parameterized):
     """Builds, launches and reads back the AMReX C++ solver of a ``backend_cxx`` template: build
     tree, Cartesian case with LSQ tables and inputs, optional AMR levels, ``mpirun``.
@@ -70,7 +75,8 @@ class AmrexDriver(param.Parameterized):
                                  doc="AMReX TinyProfiler build (a tree of its own).")
     build_only = param.Boolean(default=False,
                                doc="run() only builds (and caches) the binary.")
-    linear_solver = param.Selector(default="hypre", objects=["hypre", "gmres"], doc=(
+    linear_solver = OptionParam(
+        LinearSolver, default=LinearSolver.hypre, members=_AMREX_SOLVERS, doc=(
         "Linear solves (linsolve): 'hypre' = BoomerAMG-preconditioned FlexGMRES on the assembled, "
         "cell-block-scaled operator; 'gmres' = amrex::GMRES with the cell-block Jacobi "
         "preconditioner."))
@@ -277,7 +283,7 @@ class SymbolicHyperbolicSolverAmrex(AmrexDriver, CxxBackend):
     """The explicit hyperbolic solver template on AMReX; its linear solves (Newton-Krylov of the
     implicit diffusion, finite-difference Jacobians) default to amrex::GMRES.
     """
-    linear_solver = param.Selector(default="gmres", objects=["hypre", "gmres"])
+    linear_solver = OptionParam(LinearSolver, default=LinearSolver.gmres, members=_AMREX_SOLVERS)
 
 
 class SymbolicChorinSolverAmrex(AmrexDriver, CxxChorinBackend):
