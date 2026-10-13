@@ -70,7 +70,7 @@ class AmrexNumericsPrinter(AmrexNumerics):
                    "Heaviside": _heaviside_real,
                    "eigenvalues": _emit_user_call("eigenvalues"),
                    "eigensystem": _emit_user_call("eigensystem"),
-                   "spectral_radius": _emit_user_call("spectral_radius"),
+                   "gelfand_bound": _emit_user_call("gelfand_bound"),
                    "solve": _emit_user_call("solve")}
 
 

@@ -37,42 +37,60 @@ amrex::Real eigenvalues(I idx_, Ts... a_flat_args) noexcept
     return static_cast<amrex::Real>(out[idx]);
 }
 
-/// safety * sqrt(rho(A^2)) of the row-major n x n A_flat by k power steps on A^2, for the CFL wave speed (kernel_functions.spectral_radius).
-/// Ref: Golub, Van Loan 2013, https://doi.org/10.56021/9781421407944
-template <typename K, typename S, typename... Ts>
+/// Upper bound on rho(A) of the row-major n x n A_flat: j squarings, each after dividing by the max row sum s, then w = max_i (|C| x)_i / x_i, x the row sums of |C|; returns s_0 sqrt(s_1 sqrt(... sqrt(w))), +inf for a non-finite entry (kernel_functions.gelfand_bound).
+/// Ref: Horn, Johnson 2012, https://doi.org/10.1017/CBO9781139020411
+template <typename J, typename... Ts>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-amrex::Real spectral_radius(K k_, S safety, Ts... a_flat_args) noexcept
+amrex::Real gelfand_bound(J j_, Ts... a_flat_args) noexcept
 {
     constexpr int M = sizeof...(Ts);
     constexpr int N = zoomy_eig::isqrt_ct(M);
-    static_assert(N * N == M, "spectral_radius(): flat argument count is not a perfect square");
+    static_assert(N * N == M, "gelfand_bound(): flat argument count is not a perfect square");
 
-    const double A[M] = { static_cast<double>(a_flat_args)... };
-    double x[N], z[N];
-    for (int i = 0; i < N; ++i) x[i] = 1.0 / std::sqrt(double(N));
-    double lam = 0.0;
-    for (int s = 0; s < static_cast<int>(k_); ++s)
+    double C[M] = { static_cast<double>(a_flat_args)... };
+    double T[M], x[N];
+    for (int k = 0; k < M; ++k)
+        if (!zoomy_eig::dfinite(C[k])) return ZOOMY_EIG_INF;
+    const int j = static_cast<int>(j_) < 64 ? static_cast<int>(j_) : 64;
+    double sc[64];
+    for (int it = 0; it < j; ++it)
     {
+        double s = 0.0;
         for (int i = 0; i < N; ++i)
         {
             double t = 0.0;
-            for (int j = 0; j < N; ++j) t += A[i*N + j]*x[j];
-            z[i] = t;
+            for (int k = 0; k < N; ++k) t += zoomy_eig::dabs(C[i*N + k]);
+            s = t > s ? t : s;
         }
-        double ny = 0.0;
+        s = s > 0.0 ? s : 1.0;
+        for (int k = 0; k < M; ++k) C[k] /= s;
+        sc[it] = s;
         for (int i = 0; i < N; ++i)
-        {
-            double t = 0.0;
-            for (int j = 0; j < N; ++j) t += A[i*N + j]*z[j];
-            x[i] = t;
-            ny += t*t;
-        }
-        ny = std::sqrt(ny);
-        const double d = ny > 0.0 ? ny : 1.0;
-        for (int i = 0; i < N; ++i) x[i] /= d;
-        lam = ny;
+            for (int k = 0; k < N; ++k)
+            {
+                double t = 0.0;
+                for (int l = 0; l < N; ++l) t += C[i*N + l]*C[l*N + k];
+                T[i*N + k] = t;
+            }
+        for (int k = 0; k < M; ++k) C[k] = T[k];
     }
-    return static_cast<amrex::Real>(static_cast<double>(safety)*std::sqrt(lam));
+    for (int i = 0; i < N; ++i)
+    {
+        double t = 0.0;
+        for (int k = 0; k < N; ++k) t += zoomy_eig::dabs(C[i*N + k]);
+        x[i] = t;
+    }
+    double w = 0.0;
+    for (int i = 0; i < N; ++i)
+    {
+        double y = 0.0;
+        for (int k = 0; k < N; ++k) y += zoomy_eig::dabs(C[i*N + k])*x[k];
+        const double q = x[i] > 0.0 ? y/x[i] : 0.0;
+        w = q > w ? q : w;
+    }
+    double t = w;
+    for (int it = j - 1; it >= 0; --it) t = sc[it]*std::sqrt(t);
+    return static_cast<amrex::Real>(t);
 }
 
 /// idx-th entry of [lambda | R | L = R^-1] for the row-major n x n A_flat (R's columns the right eigenvectors), as |A| = R|Lambda|L for the Roe flux; +inf if no real eigenbasis exists.
