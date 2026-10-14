@@ -249,8 +249,14 @@ int main(int argc, char* argv[])
             pp.getarr("precice_write", wr);
             pp.getarr("precice_read", rd);
             pp.get("precice_side", side);
-            zs::couple_setup(M, pc[0], pc[1], pc[2], {wr.begin(), wr.end()},
-                             {rd.begin(), rd.end()}, side);
+            int layers = 0;           // zs.precice_overlap: an overlap participant's layers
+            pp.query("precice_overlap", layers);
+            if (layers > 0)
+                zs::couple_setup_overlap(M, pc[0], pc[1], pc[2], {wr.begin(), wr.end()},
+                                         {rd.begin(), rd.end()}, side, layers);
+            else
+                zs::couple_setup(M, pc[0], pc[1], pc[2], {wr.begin(), wr.end()},
+                                 {rd.begin(), rd.end()}, side);
         }
 #endif
         amrex::ParallelDescriptor::Barrier();
