@@ -61,6 +61,13 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE IV unit(int d)
 
 /// Print a warning (amrex::Print: I/O rank only).
 inline void warn(const std::string& message) { amrex::Print() << "warning: " << message << "\n"; }
+/// Stop the run with ``message`` (amrex::Abort: every rank).
+[[noreturn]] inline void fail(const std::string& message)
+{
+    amrex::Print() << message << "\n";
+    amrex::Abort(message);
+    std::abort();
+}
 
 // ── mesh ────────────────────────────────────────────────────────────────────
 /// Geo: what a device loop needs (trivially copyable): domain box, periodicity, spacing, BC branch per side, and the LSQ tables (per-class sample lists, weights per monomial, closure classes).
@@ -2256,12 +2263,23 @@ auto while_loop(C c, B b, S0 s0)
     return s;
 }
 
-/// The printed conditional on a host bool; an expression and a Field branch are unified as Fields.
+/// Whether T is a std::tuple.
+template<class T> struct is_tuple : std::false_type {};
+template<class... T> struct is_tuple<std::tuple<T...>> : std::true_type {};
+
+/// The printed conditional on a host bool; an expression and a Field branch are unified as Fields
+/// (entry by entry for tuples).
 template<class A, class B>
 auto cond(bool p, A a, B b)
 {
     using RA = decltype(a());
     if constexpr (std::is_same_v<RA, decltype(b())>) return p ? a() : b();
+    else if constexpr (is_tuple<RA>::value)
+    {
+        auto carry = [](const auto& t)
+        { return std::apply([](const auto&... v) { return std::make_tuple(carried(v)...); }, t); };
+        return p ? carry(a()) : carry(b());
+    }
     else return p ? Field(a()) : Field(b());      // an expression and a Field
 }
 

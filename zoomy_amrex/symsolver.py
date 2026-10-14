@@ -314,6 +314,9 @@ class AmrexDriver(param.Parameterized):
                        capture_output=True, text=True)
         log = (case / "log.symAmrex").read_text()
         if r.returncode != 0:
+            march = [ln.strip() for ln in log.splitlines() if "zoomy march" in ln]
+            if march:                   # check.march: the march stopped or ended non-finite
+                raise FloatingPointError(march[0])
             raise RuntimeError(f"symAmrex failed, see {case}/log.symAmrex:\n{log[-3000:]}\n{r.stderr}")
         self.log = log
         self.wall = next((float(ln.split()[-2]) for ln in log.splitlines()
