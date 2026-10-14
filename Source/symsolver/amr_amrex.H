@@ -304,6 +304,8 @@ struct Amr : public amrex::AmrCore
             if (dt_write > 0) dt = minimum(dt, nw*dt_write - t);
             for (int l = 0; l <= finest_level; ++l)
                 dt = minimum(dt, std::get<0>(dt_of(Q[l], A[l], p, std::cref(*mesh[l]), 0L)));
+            if (!(t + dt > t))          // NaN, <= 0 or below the resolution of t: check.march
+                check_march(0L, t, time_end, dt, n + 1, q_max());
             for (int l = 0; l <= finest_level; ++l)
             {
                 mesh[l]->log->clear();
@@ -316,7 +318,16 @@ struct Amr : public amrex::AmrCore
             t += dt; ++n; ++loop_iterations();
             if (dt_write > 0 && t >= (nw - 1e-9)*dt_write) { const Synced scope; write(t); ++nw; }
         }
+        check_march(0L, t, time_end, 0.0, n, q_max());     // a non-finite final state fails
         return t;
+    }
+
+    /// max |Q| over all levels (NaN if any entry is NaN).
+    double q_max()
+    {
+        double m = 0.0;
+        for (int l = 0; l <= finest_level; ++l) m = maximum(m, reduce_max(abs(Q[l])));
+        return m;
     }
 };
 
