@@ -37,11 +37,11 @@ amrex::Real eigenvalues(I idx_, Ts... a_flat_args) noexcept
     return static_cast<amrex::Real>(out[idx]);
 }
 
-/// Upper bound on rho(A) of the row-major n x n A_flat: j squarings, each after dividing by the max row sum s, then w = max_i (|C| x)_i / x_i, x the row sums of |C| plus 2^-30 their max; returns s_0 sqrt(s_1 sqrt(... sqrt(w))), +inf for a non-finite entry (kernel_functions.gelfand_bound).
+/// Upper bound on rho(A) of the row-major n x n A_flat: j squarings, each after dividing by the max row sum s, then w = max_i (|C| x)_i / x_i, x the row sums of |C| plus delta their max; returns s_0 sqrt(s_1 sqrt(... sqrt(w))), +inf for a non-finite entry (kernel_functions.gelfand_bound).
 /// Ref: Horn, Johnson 2012, https://doi.org/10.1017/CBO9781139020411
-template <typename J, typename... Ts>
+template <typename J, typename D, typename... Ts>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-amrex::Real gelfand_bound(J j_, Ts... a_flat_args) noexcept
+amrex::Real gelfand_bound(J j_, D delta_, Ts... a_flat_args) noexcept
 {
     constexpr int M = sizeof...(Ts);
     constexpr int N = zoomy_eig::isqrt_ct(M);
@@ -82,7 +82,7 @@ amrex::Real gelfand_bound(J j_, Ts... a_flat_args) noexcept
         x[i] = t;
         xmax = t > xmax ? t : xmax;
     }
-    for (int i = 0; i < N; ++i) x[i] += 9.31322574615478515625e-10*xmax;   // + 2^-30 max: w continuous in A
+    for (int i = 0; i < N; ++i) x[i] += static_cast<double>(delta_)*xmax;   // > 0: w continuous in A
     double w = 0.0;
     for (int i = 0; i < N; ++i)
     {
