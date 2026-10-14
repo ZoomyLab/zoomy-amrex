@@ -65,7 +65,8 @@ _OWN = ROOT.parent.parent / "containers" / "zoomy_amrex"
 CONTAINERS = Path(os.environ.get("ZOOMY_AMREX_CONTAINERS",
                                  _OWN if (_OWN / "zoomy_amrex.sif").exists()
                                  else Path.home() / "git/Zoomy/containers/zoomy_amrex"))
-SIF = {False: CONTAINERS / "zoomy_amrex.sif", True: CONTAINERS / "zoomy_amrex_gpu.sif"}
+# one image for both builds: the CPU build, and the CUDA build (nvcc in the image) under --nv
+SIF = CONTAINERS / "zoomy_amrex.sif"
 # hypre for the linear solves (static libHYPRE.a, built once per variant by
 # containers/zoomy_amrex/build_hypre_cuda.sh into ~/.cache/zoomy)
 HYPRE_VERSION = "3.2.0"
@@ -122,15 +123,15 @@ def _image_id(sif):
 
 
 def _apptainer(gpu, script, binds=(), **kw):
-    """Run the shell `script` in the CPU or GPU AMReX apptainer with the cache and `binds`
-    mounted; inside the image (`in_image`) run it directly.
+    """Run the shell `script` in the AMReX apptainer (`--nv` for the CUDA build) with the cache
+    and `binds` mounted; inside the image (`in_image`) run it directly.
     """
     if in_image():
         return subprocess.run(["bash", "-c", script], **kw)
     cmd = ["apptainer", "exec", "--cleanenv", *(["--nv"] if gpu else [])]
     for b in sorted({str(CACHE), *map(str, binds)}):
         cmd += ["--bind", b]
-    return subprocess.run(cmd + [str(SIF[gpu]), "bash", "-c", script], **kw)
+    return subprocess.run(cmd + [str(SIF), "bash", "-c", script], **kw)
 
 
 _AMREX_SOLVERS = [LinearSolver.hypre, LinearSolver.gmres]
@@ -194,7 +195,7 @@ class AmrexDriver(param.Parameterized):
         hypre = hypre_prefix(self.gpu) if self.linear_solver == "hypre" else None
         make = _gnumakefile(self.gpu, self.tiny_profile, dimension, cpl, hypre)
         h = hashlib.sha256(make.encode())          # the build flags, then the sources
-        h.update(_image_id(SIF[self.gpu]).encode())   # and the image that compiles them
+        h.update(_image_id(SIF).encode())   # and the image that compiles them
         for k in sorted(files):
             h.update(k.encode() + files[k].encode())
         binary = CACHE / "bin" / h.hexdigest()[:16] / "symAmrex.ex"
