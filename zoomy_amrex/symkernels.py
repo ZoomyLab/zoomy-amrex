@@ -10,6 +10,7 @@ import sympy as sp
 
 from zoomy_core.transformation.generic_c import GenericCppBase, get_nested_shape
 from zoomy_core.transformation.to_amrex import AmrexCore
+from zoomy_core.symsolver.discretization.residual import check_derivative_aux
 from zoomy_amrex.transformation.to_amrex import AmrexNumericsPrinter
 
 FAMILY = {"face": 0, "bc": 1, "normal": 2, "recon": 3, "cell": 4}
@@ -126,6 +127,8 @@ def write_kernels(systems, source, path, dimension, classes=None):
     Returns:
         `path`.
     """
+    # the derivative aux of a state row only: anything else would read 0
+    check_derivative_aux([nsm for _, nsm in systems], ("state",), "amrex")
     pr = AmrexKernelPrinter()
     first = systems[0][1]
     n_par = len(first.parameters.keys())
