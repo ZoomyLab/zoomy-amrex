@@ -2139,8 +2139,8 @@ Field diffusion_tpfa(K kn, G ghost, const Field& X_, const Field& A_, const P& p
 /// The rest of the face flux n.A.grad_f beyond diffusion_tpfa (2-D, 3-D): grad_f = the mean of the two cells' LSQ gradients (the derivative-aux fit, ghosts sampled), whose normal part the two-point difference replaces, so on a Cartesian face only its tangential part enters.
 /// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 template<class K, class G, class P, class T>
-Field diffusion_correction(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
-                           const Mesh& M)
+Field diffusion_correction_nd(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                              const Mesh& M)
 {
     BL_PROFILE("zs::diffusion_correction");
     constexpr int N = K::n_in;
@@ -2206,6 +2206,19 @@ Field diffusion_correction(K kn, G ghost, const Field& X_, const Field& A_, cons
     });
     return out;
 }
+
+/// The rest of the face flux beyond diffusion_tpfa (zoomy_core's diffusion_correction block): zero in 1-D.
+template<class K, class G, class P, class T>
+Field diffusion_correction(K kn, G ghost, const Field& X, const Field& A, const P& p, T time,
+                           const Mesh& M)
+{
+    if constexpr (D == 1) return zeros(X.nq, M);
+    else return diffusion_correction_nd(kn, ghost, X, A, p, time, M);
+}
+
+/// Newton on a residual coupling face neighbours (zoomy_core's implicit_solve block): Jacobian-free Newton-Krylov.
+/// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
+template<class F> Field implicit_solve(F f, Field x) { return newton_krylov(f, std::move(x)); }
 
 /// div(A : grad X) per cell (zoomy_core's diffusion block): diffusion_tpfa plus diffusion_correction.
 template<class K, class G, class P, class T>
