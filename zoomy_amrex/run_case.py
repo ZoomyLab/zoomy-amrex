@@ -186,11 +186,11 @@ def _amrex_home():
 def _cuda_opts():
     """GPU build knobs from the environment (default CPU, backward-compatible).
 
-    Set `ZOOMY_AMREX_CUDA=1` (baked into the GPU container's %environment) to
-    compile the AMReX driver with `USE_CUDA=TRUE` — the whole SWE/SME device
-    path (make_rhs, MOOD, update_variables) is already `AMREX_GPU_*`-annotated.
+    Set `ZOOMY_AMREX_CUDA=1` (the image carries nvcc) to compile the AMReX driver
+    with `USE_CUDA=TRUE` — the whole SWE/SME device path (make_rhs, MOOD,
+    update_variables) is already `AMREX_GPU_*`-annotated.
     `ZOOMY_AMREX_CUDA_ARCH` picks the SM arch (default 89 = Ada / L40S).  The
-    GPU container still needs `apptainer --nv` at run time to see the device."""
+    image needs `apptainer --nv` at run time to see the device."""
     on = os.environ.get("ZOOMY_AMREX_CUDA", "").strip().lower() in ("1", "true", "yes", "on")
     return ("TRUE" if on else "FALSE"), os.environ.get("ZOOMY_AMREX_CUDA_ARCH", "89")
 

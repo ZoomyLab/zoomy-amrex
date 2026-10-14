@@ -12,7 +12,7 @@ MUST RUN IN-CONTAINER. zoomy_core/zoomy_amrex are not importable on the host;
 the containers have them (verified). Typical invocation:
 
     apptainer exec --nv --bind <ZOOMY>:/work \
-        containers/zoomy_amrex/zoomy_amrex_gpu.sif \
+        containers/zoomy_amrex/zoomy_amrex.sif \
         bash -lc 'cd /work/library/zoomy_amrex && pytest'
 """
 import os
