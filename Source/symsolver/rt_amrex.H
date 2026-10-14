@@ -1083,11 +1083,12 @@ inline std::tuple<Field, Field> cell_traces(const Field& Q, const Mesh& M)
     return cell_traces_of(DLeafless{need(Q, 1, M)}, M);
 }
 
-/// LSQ fit of row n at cell c, monomial m: sum_s w_s,m delta_s; a boundary sample carries ug(n) - u_c (ghost ug) or no change, k = the row's boundary-closure class (-1: none).
+/// LSQ fit of row n at cell c, monomial m: sum_s w_s,m delta_s; a boundary sample carries ug(n) - u_c (ghost ug) or no change, k = the row's boundary-closure class (-1: none); dr >= 0: a neighbour with u(dr) <= eps enters as min(u, u_c) (the hydrostatic extension of the free surface, reconstruction.shore_extension).
 /// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
 template<class A, class B>
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE
-Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, int m, int k = -1)
+Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, int m, int k = -1,
+         int dr = -1, Real eps = 0.0)
 {
     if (m < 0) return 0.0;
     IV cw = c;                          // c in the domain (a periodic image wrapped)
@@ -1106,7 +1107,8 @@ Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, 
         const int kind = g.smp[4*t];
         IV cc = c;
         for (int a = 0; a < D; ++a) cc[a] += g.smp[4*t + 1 + a];
-        const Real delta = kind == 0 ? u(cc, n) - uc : (ghost ? ug(cc, n) - uc : 0.0);
+        Real delta = kind == 0 ? u(cc, n) - uc : (ghost ? ug(cc, n) - uc : 0.0);
+        if (dr >= 0 && kind == 0 && u(cc, dr) <= eps && delta > 0.0) delta = 0.0;
         s += g.w[t*g.nmon + m]*delta;
     }
     return s;
@@ -1114,7 +1116,21 @@ Real lsq(const Geo& g, const A& u, const B& ug, bool ghost, const IV& c, int n, 
 
 /// LSQ gradient of every row of the cells (row D q + a: d/dx_a of row q); the boundary samples are the ghosts Wg.
 /// Ref: Mavriplis 2003, https://doi.org/10.2514/6.2003-3986
+inline Field gradient_shore(const Field& W_, const Field& Wg, int er, int dr, Real eps,
+                           const Mesh& M);
 inline Field gradient(const Field& W_, const Field& Wg, const Mesh& M)
+{ return gradient_shore(W_, Wg, -1, -1, 0.0, M); }
+/// The LSQ gradient with the hydrostatic extension of the free surface: in row `eta` a neighbour with W(h) <= eps enters as min(W, W_c) (reconstruction.shore_extension).
+template<class... I>
+Field gradient(const Field& W_, const Field& Wg, const std::tuple<I...>& rows, Real eps,
+               const Mesh& M)
+{
+    const Rows R = rows_of(rows);
+    return gradient_shore(W_, Wg, R.r[0], R.r[1], eps, M);
+}
+/// LSQ gradient; row er (er >= 0) with the shore extension on the depth row dr.
+inline Field gradient_shore(const Field& W_, const Field& Wg, int er, int dr, Real eps,
+                           const Mesh& M)
 {
     BL_PROFILE("zs::gradient");
     const Field W = need(W_, M.R, M);
@@ -1131,7 +1147,9 @@ inline Field gradient(const Field& W_, const Field& Wg, const Mesh& M)
         ZS_CELL;
         if (!inside(g, c)) return;
         const int kc = n < g.nrcl ? g.rcl[n] : -1;      // the closure class of W row n
-        for (int a = 0; a < D; ++a) o[bx](c, D*n + a) = lsq(g, w[bx], wg[bx], true, c, n, g.gmon[a], kc);
+        const int sd = n == er ? dr : -1;
+        for (int a = 0; a < D; ++a)
+            o[bx](c, D*n + a) = lsq(g, w[bx], wg[bx], true, c, n, g.gmon[a], kc, sd, eps);
     });
     return G;
 }
@@ -1160,7 +1178,8 @@ Real limit(Limiter L, Real delta, Real dmin, Real dmax, Real ev2)
 /// Limiter factors of `rows` (1 elsewhere), the bounds from the face neighbours and the boundary ghosts Wg (at the ghost position, as in gradient).
 /// Ref: Barth, Jespersen 1989, https://doi.org/10.2514/6.1989-366
 inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Field& Wg,
-                             const Field& G, const Mesh& M)
+                             const Field& G, const Mesh& M, int er = -1, int dr = -1,
+                             Real eps = 0.0)
 {
     BL_PROFILE("zs::limiter_factors");
     const Field W = need(W_, 1, M);
@@ -1189,7 +1208,9 @@ inline Field limiter_factors(Limiter L, const Rows R, const Field& W_, const Fie
             IV cc = c;
             cc[f/2] += (f & 1) ? 1 : -1;
             // a boundary ghost holds Wg; a periodic one the partner cell
-            const Real v = inside(g, cc) ? w[bx](cc, n) : wg[bx](cc, n);
+            Real v = inside(g, cc) ? w[bx](cc, n) : wg[bx](cc, n);
+            // the shore extension: a dry neighbour bounds as min(v, u) (gradient)
+            if (n == er && inside(g, cc) && w[bx](cc, dr) <= eps && v > u) v = u;
             lo = v < lo ? v : lo;
             hi = v > hi ? v : hi;
         }
@@ -1220,6 +1241,30 @@ template<class... I>
 Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
                       const Field& G, const Mesh& M)
 { return limiter_factors(Limiter::barth_jespersen, rows_of(rows), W, Wg, G, M); }
+/// The limiters with the shore extension of the bounds of row eta (gradient's shore form).
+template<class... I, class... J>
+Field minmod(const std::tuple<I...>& rows, const Field& W, const Field& Wg, const Field& G,
+             const std::tuple<J...>& shore, Real eps, const Mesh& M)
+{
+    const Rows S = rows_of(shore);
+    return limiter_factors(Limiter::minmod, rows_of(rows), W, Wg, G, M, S.r[0], S.r[1], eps);
+}
+template<class... I, class... J>
+Field venkatakrishnan(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, Real eps, const Mesh& M)
+{
+    const Rows S = rows_of(shore);
+    return limiter_factors(Limiter::venkatakrishnan, rows_of(rows), W, Wg, G, M, S.r[0], S.r[1],
+                           eps);
+}
+template<class... I, class... J>
+Field barth_jespersen(const std::tuple<I...>& rows, const Field& W, const Field& Wg,
+                      const Field& G, const std::tuple<J...>& shore, Real eps, const Mesh& M)
+{
+    const Rows S = rows_of(shore);
+    return limiter_factors(Limiter::barth_jespersen, rows_of(rows), W, Wg, G, M, S.r[0], S.r[1],
+                           eps);
+}
 
 /// Each cell's W moved to the face centre by phi G; a boundary face's outer slot holds the inner trace until boundary_traces sets the BC's face state.
 /// Ref: van Leer 1979, https://doi.org/10.1016/0021-9991(79)90145-1
