@@ -149,7 +149,15 @@ std::string time_name(double t)
 /// Entry point: read the zs.* inputs, build the mesh, run the printed march (single level, or run_amr), write the snapshots and the final state.
 int main(int argc, char* argv[])
 {
-    amrex::Initialize(argc, argv);
+    // one GPU stream: the march runs without MFIter's end-of-loop synchronisation (a no-sync
+    // region), so AMReX's per-box loops (MultiFab setVal / Copy / ... on ranks with 2 to 8
+    // boxes above 65^3 cells, which it does not fuse) must stay ordered with the fused kernels
+    // that follow them (ANALYSIS 55: 3 boxes on 2 GPUs assembled garbage pressure rows)
+    amrex::Initialize(argc, argv, true, MPI_COMM_WORLD, []
+    {
+        amrex::ParmParse pp("amrex");
+        if (!pp.contains("max_gpu_streams")) pp.add("max_gpu_streams", 1);
+    });
     amrex::ExecOnFinalize(zs::close_pool);
     int amr = 0;
     amrex::ParmParse("zs").query("amr", amr);

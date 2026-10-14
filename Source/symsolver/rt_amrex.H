@@ -1886,7 +1886,7 @@ IV slot_offset(int s, int R)
     return o;
 }
 
-/// hypre solve of op(x) = b: the matrix of op on the cell stencil of reach R (one op application per colour and row), left-scaled by the inverse 2 x 2 (n x n) cell blocks D, S = D^-1 A; FlexGMRES with one BoomerAMG V-cycle as preconditioner on S x = D^-1 b to 0.1 ls_tol (CPU: HMIS, ext+i, hybrid symmetric Gauss-Seidel; GPU: PMIS, ext+i, l1-Jacobi), re-entered with a tighter tolerance until the true residual |op(x) - b| <= ls_tol |b|. Krylov space min(ls_restart, 50). Returns the iterations; rel = the true relative residual.
+/// hypre solve of op(x) = b: the matrix of op on the cell stencil of reach R (one op application per colour and row), left-scaled by the inverse 2 x 2 (n x n) cell blocks D, S = D^-1 A; FlexGMRES with one BoomerAMG V-cycle as preconditioner on S x = D^-1 b to 0.1 ls_tol (ext+i, hybrid symmetric Gauss-Seidel; HMIS on the CPU, PMIS on the GPU), re-entered with a tighter tolerance until the true residual |op(x) - b| <= ls_tol |b|. Krylov space min(ls_restart, 50). Returns the iterations; rel = the true relative residual.
 /// Ref: Henson, Yang 2002, https://doi.org/10.1016/S0168-9274(01)00115-5
 /// Ref: Saad 1993, https://doi.org/10.1137/0914028
 inline int hypre_solve(const std::function<Field(Field)>& op, const Field& b, Field& x,
@@ -2026,13 +2026,15 @@ inline int hypre_solve(const std::function<Field(Field)>& op, const Field& b, Fi
     HYPRE_BoomerAMGSetStrongThreshold(amg, 0.25);
     HYPRE_BoomerAMGSetNumSweeps(amg, 1);
     HYPRE_BoomerAMGSetRelaxOrder(amg, 0);
+    HYPRE_BoomerAMGSetRelaxType(amg, 6);                // hybrid symmetric Gauss-Seidel
 #ifdef AMREX_USE_GPU
+    // HMIS has no device path in hypre (PMIS is its device coarsening); the smoother is the
+    // CPU's (on the device: triangular solves of the local block), as l1-Jacobi took twice
+    // the iterations (ANALYSIS 55)
     HYPRE_BoomerAMGSetCoarsenType(amg, 8);              // PMIS
-    HYPRE_BoomerAMGSetRelaxType(amg, 18);               // l1-Jacobi
     HYPRE_BoomerAMGSetKeepTranspose(amg, 1);
 #else
     HYPRE_BoomerAMGSetCoarsenType(amg, 10);             // HMIS
-    HYPRE_BoomerAMGSetRelaxType(amg, 6);                // hybrid symmetric Gauss-Seidel
 #endif
     HYPRE_FlexGMRESSetPrecond(solver, (HYPRE_PtrToSolverFcn) HYPRE_BoomerAMGSolve,
                               (HYPRE_PtrToSolverFcn) HYPRE_BoomerAMGSetup, amg);
