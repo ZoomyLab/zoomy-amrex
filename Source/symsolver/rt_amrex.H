@@ -84,9 +84,12 @@ struct Mesh
     amrex::DistributionMapping dm;
     int NG = 2, R = 1;
     // an AMR level: ``fill`` = its halo (ghosts from its own boxes and from the
-    // coarser level), ``log`` = the face terms of each divergence (refluxing)
+    // coarser level), ``log`` = the face terms of each divergence (refluxing; the diffusive
+    // fluxes of the same stage added)
     std::function<Field(const Field&)> fill;
     std::shared_ptr<std::vector<std::array<Field, 2>>> log;
+    // ``dlog`` = the face fluxes of implicit diffusion steps with their share of dt (refluxing)
+    std::shared_ptr<std::vector<std::pair<Real, Field>>> dlog;
     std::vector<std::array<int, 3>> mon;
     amrex::Gpu::DeviceVector<int> cls[3], off, smp, rcl;
     amrex::Gpu::DeviceVector<Real> w;
@@ -2081,16 +2084,48 @@ Field linsolve(F op, const Field& b)
 }
 
 // ── diffusion ───────────────────────────────────────────────────────────────
-/// The two-point part of div(A : grad X) per cell (zoomy_core's diffusion block): per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells' tensors, X_out the ghost across a boundary face and the partner cell across a periodic side; not refluxed (no AMR).
+// On an AMR level every block that adds diffusive fluxes logs them for refluxing (amr_amrex.H):
+// the explicit ones into the current stage's entry of M.log (weighted by the stage's RK weight),
+// the Crank-Nicolson step's with their share of dt into M.dlog; none inside an implicit solve.
+
+/// Depth of the implicit solves running (their residual evaluations log no fluxes).
+inline int& log_off() { static int n = 0; return n; }
+/// Scope of an implicit solve: no flux logging inside.
+struct NoLog
+{
+    NoLog() { ++log_off(); }
+    ~NoLog() { --log_off(); }
+};
+
+/// Whether a diffusion block logs its face fluxes (an AMR level, outside implicit solves).
+inline bool logging(const Mesh& M) { return M.log && log_off() == 0; }
+
+/// Add the diffusive face flux F (dQ = -div F) to the current stage's log entry: (Wm, Wp) += (F, -F).
+inline void log_stage(const Mesh& M, const Field& F)
+{
+    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(!M.log->empty(),
+        "AMR reflux: a diffusive flux before its stage's divergence");
+    auto& e = M.log->back();
+    Field m = like(e[0], e[0].nq), w = like(e[1], e[1].nq);   // the logged fields may be shared
+    for (int d = 0; d < D; ++d)
+    {
+        amrex::MultiFab::Copy(m[d], e[0][d], 0, 0, e[0].nq, 0);
+        amrex::MultiFab::Saxpy(m[d], 1.0, F[d], 0, 0, F.nq, 0);
+        amrex::MultiFab::Copy(w[d], e[1][d], 0, 0, e[1].nq, 0);
+        amrex::MultiFab::Saxpy(w[d], -1.0, F[d], 0, 0, F.nq, 0);
+    }
+    e = {m, w};
+}
+
+/// The two-point part of div(A : grad X) per cell (no logging): per face n.A.n (X_out - X_in) / d |f| / |V|, A the mean of the two cells' tensors, X_out the ghost across a boundary face and the partner cell across a periodic side.
 /// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 template<class K, class G, class P, class T>
-Field diffusion_tpfa(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
-                     const Mesh& M)
+Field tpfa_cells(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                 const Mesh& M)
 {
     BL_PROFILE("zs::diffusion_tpfa");
     constexpr int N = K::n_in;
     static_assert(K::n_out == N*N*D*D, "diffusion: a tensor (n, n, D, D)");
-    AMREX_ALWAYS_ASSERT_WITH_MESSAGE(!M.log, "diffusion: AMR does not reflux diffusive fluxes");
     const Field X = need(X_, 1, M), A = need(A_, 1, M);
     const Field Xg = bc_cells(ghost, X, A, p, time_, M);
     Field out = cells_of(M, X.nq);
@@ -2136,35 +2171,92 @@ Field diffusion_tpfa(K kn, G ghost, const Field& X_, const Field& A_, const P& p
     return out;
 }
 
-/// The rest of the face flux n.A.grad_f beyond diffusion_tpfa (2-D, 3-D): grad_f = the mean of the two cells' LSQ gradients (the derivative-aux fit, ghosts sampled), whose normal part the two-point difference replaces, so on a Cartesian face only its tangential part enters.
+/// The two-point face flux F = -n.A.n (X_hi - X_lo) / dx_d of every face (n = e_d, dQ = -div F; tpfa_cells is -div F), A the mean of the two cells' tensors, the BC ghost across a boundary face.
+template<class K, class G, class P, class T>
+Field tpfa_faces(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                 const Mesh& M)
+{
+    BL_PROFILE("zs::diffusion_tpfa_faces");
+    constexpr int N = K::n_in;
+    const Field X = need(X_, 1, M), A = need(A_, 1, M);
+    const Field Xg = bc_cells(ghost, X, A, p, time_, M);
+    Field F = faces_of(M, X.nq);
+    const Geo g = M.g;
+    const Real time = time_;
+    const int nq = X.nq, na = A.nq;
+    auto x = X[0].const_arrays();
+    auto xg = Xg[0].const_arrays();
+    auto a = A[0].const_arrays();
+    for (int d = 0; d < D; ++d)
+    {
+        auto f = F[d].arrays();
+        amrex::ParallelFor(F[d], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+        {
+            ZS_CELL;                                    // the face's upper cell
+            const IV lo = c - unit(d);
+            const bool ilo = inside(g, lo), ihi = inside(g, c);
+            auto tensor = [&](const IV& cc)
+            {
+                return kn(col<N>(x[bx], cc, nq), col<K::n_aux>(a[bx], cc, na), p, time, 0.0,
+                          cell_centre(g, cc));
+            };
+            const auto Al = tensor(ilo ? lo : c), Ah = tensor(ihi ? c : lo);
+            for (int r = 0; r < N && r < nq; ++r)
+            {
+                Real s = 0.0;
+                for (int q = 0; q < N; ++q)
+                {
+                    const int e = ((r*N + q)*D + d)*D + d;
+                    const Real t = 0.5*(Al(e, 0) + Ah(e, 0));
+                    s += t*((ihi ? x[bx](c, q) : xg[bx](c, q)) - (ilo ? x[bx](lo, q) : xg[bx](lo, q)));
+                }
+                f[bx](c, r) = -s/g.dx[d];
+            }
+        });
+    }
+    return F;
+}
+
+/// The cells' LSQ gradients of X (row D q + a: d/dx_a of row q; the derivative-aux fit, BC ghosts sampled), also in the ghost layers X's halo reaches (as `gradient`: an AMR level's halo cells by the level's own fit, no fill of D x nq rows).
+template<class G, class P, class T>
+Field cell_gradients(G ghost, const Field& X_, const Field& A, const P& p, T time, const Mesh& M)
+{
+    const Field X = need(X_, M.NG, M);
+    const Field Xg = bc_cells(ghost, X, A, p, time, M);
+    const Geo g = M.g;
+    const int nq = X.nq;
+    const int gr = std::max(0, std::min(X.ngv, Xg.ngv) - M.R);
+    auto x = X[0].const_arrays();
+    Field Gc = cells_of(M, D*nq);
+    Gc.ngv = gr;
+    auto o = Gc[0].arrays();
+    auto xg = Xg[0].const_arrays();
+    amrex::ParallelFor(Gc[0], IV(gr), nq,
+        [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
+    {
+        ZS_CELL;
+        if (!inside(g, c)) return;
+        for (int e = 0; e < D; ++e) o[bx](c, D*n + e) = lsq(g, x[bx], xg[bx], true, c, n, g.gmon[e], -1);
+    });
+    return need(Gc, 1, M);
+}
+
+/// The rest of the face flux n.A.grad_f beyond tpfa_cells (2-D, 3-D; no logging): grad_f = the mean of the two cells' LSQ gradients (the derivative-aux fit, ghosts sampled), whose normal part the two-point difference replaces, so on a Cartesian face only its tangential part enters.
 /// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
 template<class K, class G, class P, class T>
-Field diffusion_correction_nd(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
-                              const Mesh& M)
+Field correction_cells(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                       const Mesh& M)
 {
     BL_PROFILE("zs::diffusion_correction");
     constexpr int N = K::n_in;
     const int r1 = std::max(1, M.R);
     const Field X = need(X_, r1, M), A = need(A_, r1, M);
-    const Field Xg = bc_cells(ghost, X, A, p, time_, M);
+    const Field Gr = cell_gradients(ghost, X, A, p, time_, M);
     const Geo g = M.g;
     const Real time = time_;
     const int nq = X.nq, na = A.nq;
     auto x = X[0].const_arrays();
     auto a = A[0].const_arrays();
-    Field Gc = cells_of(M, D*nq);              // row D q + a: d/dx_a of row q
-    {
-        auto o = Gc[0].arrays();
-        auto xg = Xg[0].const_arrays();
-        amrex::ParallelFor(Gc[0], IV(0), nq,
-            [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k, int n) noexcept
-        {
-            ZS_CELL;
-            if (!inside(g, c)) return;
-            for (int e = 0; e < D; ++e) o[bx](c, D*n + e) = lsq(g, x[bx], xg[bx], true, c, n, g.gmon[e], -1);
-        });
-    }
-    const Field Gr = need(Gc, 1, M);
     Field out = cells_of(M, nq);
     auto o = out[0].arrays();
     auto gr = Gr[0].const_arrays();
@@ -2207,30 +2299,108 @@ Field diffusion_correction_nd(K kn, G ghost, const Field& X_, const Field& A_, c
     return out;
 }
 
-/// The rest of the face flux beyond diffusion_tpfa (zoomy_core's diffusion_correction block): zero in 1-D.
+/// The face flux of correction_cells (2-D, 3-D): F = -sum_q sum_{e != d} A_{r q d e} (grad_e X_q), A and the gradient the means of the two cells' (the inner cell's across a boundary face); correction_cells is -div F.
+template<class K, class G, class P, class T>
+Field correction_faces(K kn, G ghost, const Field& X_, const Field& A_, const P& p, T time_,
+                       const Mesh& M)
+{
+    BL_PROFILE("zs::diffusion_correction_faces");
+    constexpr int N = K::n_in;
+    const int r1 = std::max(1, M.R);
+    const Field X = need(X_, r1, M), A = need(A_, r1, M);
+    const Field Gr = cell_gradients(ghost, X, A, p, time_, M);
+    const Geo g = M.g;
+    const Real time = time_;
+    const int nq = X.nq, na = A.nq;
+    auto x = X[0].const_arrays();
+    auto a = A[0].const_arrays();
+    auto gr = Gr[0].const_arrays();
+    Field F = faces_of(M, nq);
+    for (int d = 0; d < D; ++d)
+    {
+        auto f = F[d].arrays();
+        amrex::ParallelFor(F[d], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+        {
+            ZS_CELL;                                    // the face's upper cell
+            const IV lo = c - unit(d);
+            const bool ilo = inside(g, lo), ihi = inside(g, c);
+            const IV cl = ilo ? lo : c, ch = ihi ? c : lo;
+            auto tensor = [&](const IV& cc)
+            {
+                return kn(col<N>(x[bx], cc, nq), col<K::n_aux>(a[bx], cc, na), p, time, 0.0,
+                          cell_centre(g, cc));
+            };
+            const auto Al = tensor(cl), Ah = tensor(ch);
+            for (int r = 0; r < N && r < nq; ++r)
+            {
+                Real s = 0.0;
+                for (int q = 0; q < N; ++q)
+                    for (int e = 0; e < D; ++e)
+                    {
+                        if (e == d) continue;
+                        const int m = ((r*N + q)*D + d)*D + e;
+                        s += 0.5*(Al(m, 0) + Ah(m, 0))
+                             *0.5*(gr[bx](cl, D*q + e) + gr[bx](ch, D*q + e));
+                    }
+                f[bx](c, r) = -s;
+            }
+        });
+    }
+    return F;
+}
+
+/// The two-point part of div(A : grad X) per cell (zoomy_core's diffusion_tpfa block, tpfa_cells); on an AMR level its face fluxes join the current stage's refluxing log.
+/// Ref: Eymard, Gallouet, Herbin 2000, https://doi.org/10.1016/s1570-8659(00)07005-8
+template<class K, class G, class P, class T>
+Field diffusion_tpfa(K kn, G ghost, const Field& X, const Field& A, const P& p, T time,
+                     const Mesh& M)
+{
+    if (logging(M)) log_stage(M, tpfa_faces(kn, ghost, X, A, p, time, M));
+    return tpfa_cells(kn, ghost, X, A, p, time, M);
+}
+
+/// The rest of the face flux beyond diffusion_tpfa (zoomy_core's diffusion_correction block, correction_cells): zero in 1-D; on an AMR level its face fluxes join the current stage's refluxing log.
 template<class K, class G, class P, class T>
 Field diffusion_correction(K kn, G ghost, const Field& X, const Field& A, const P& p, T time,
                            const Mesh& M)
 {
     if constexpr (D == 1) return zeros(X.nq, M);
-    else return diffusion_correction_nd(kn, ghost, X, A, p, time, M);
+    else
+    {
+        if (logging(M)) log_stage(M, correction_faces(kn, ghost, X, A, p, time, M));
+        return correction_cells(kn, ghost, X, A, p, time, M);
+    }
 }
 
-/// Newton on a residual coupling face neighbours (zoomy_core's implicit_solve block): Jacobian-free Newton-Krylov.
+/// Newton on a residual coupling face neighbours (zoomy_core's implicit_solve block): Jacobian-free Newton-Krylov; its residual evaluations log no fluxes.
 /// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
-template<class F> Field implicit_solve(F f, Field x) { return newton_krylov(f, std::move(x)); }
+template<class F> Field implicit_solve(F f, Field x)
+{
+    const NoLog scope;
+    return newton_krylov(f, std::move(x));
+}
 
-/// div(A : grad X) per cell (zoomy_core's diffusion block): diffusion_tpfa plus diffusion_correction.
+/// div(A : grad X) per cell (zoomy_core's diffusion block): tpfa_cells plus correction_cells; on an AMR level its face fluxes join the current stage's refluxing log.
 template<class K, class G, class P, class T>
 Field diffusion(K kn, G ghost, const Field& X, const Field& A, const P& p, T time,
                 const Mesh& M)
 {
-    if constexpr (D == 1) return diffusion_tpfa(kn, ghost, X, A, p, time, M);
-    else return Field(diffusion_tpfa(kn, ghost, X, A, p, time, M)
-                      + diffusion_correction(kn, ghost, X, A, p, time, M));
+    if constexpr (D == 1)
+    {
+        if (logging(M)) log_stage(M, tpfa_faces(kn, ghost, X, A, p, time, M));
+        return tpfa_cells(kn, ghost, X, A, p, time, M);
+    }
+    else
+    {
+        if (logging(M))
+            log_stage(M, Field(tpfa_faces(kn, ghost, X, A, p, time, M)
+                               + correction_faces(kn, ghost, X, A, p, time, M)));
+        return Field(tpfa_cells(kn, ghost, X, A, p, time, M)
+                     + correction_cells(kn, ghost, X, A, p, time, M));
+    }
 }
 
-/// One Crank-Nicolson step of diffusion_tpfa from time to time + dt plus the correction explicit at Q (deferred): R(X) = X - Q - dt/2 (D(X) + D(Q) + 2 C(Q)) = 0, A at X (Qaux frozen), by Newton-Krylov.
+/// One Crank-Nicolson step of tpfa_cells from time to time + dt plus the correction explicit at Q (deferred): R(X) = X - Q - dt/2 (D(X) + D(Q) + 2 C(Q)) = 0, A at X (Qaux frozen), by Newton-Krylov.  On an AMR level its face fluxes go to M.dlog with their share of dt: 1/2 two-point at Q and at X, 1 correction at Q.
 /// Ref: Knoll, Keyes 2004, https://doi.org/10.1016/j.jcp.2003.08.010
 template<class K, class G, class P, class T, class S>
 Field implicit_diffusion(K kn, G ghost, const Field& Q, const Field& A, const P& p,
@@ -2238,15 +2408,23 @@ Field implicit_diffusion(K kn, G ghost, const Field& Q, const Field& A, const P&
 {
     BL_PROFILE("zs::implicit_diffusion");
     const Real time = time_, dt = dt_;
-    const Field D0 = diffusion_tpfa(kn, ghost, Q, A, p, time, M);
+    const bool log = logging(M) && M.dlog;
+    const Field D0 = tpfa_cells(kn, ghost, Q, A, p, time, M);
     const Field b = [&]() -> Field
     {
         if constexpr (D == 1) return Q + 0.5*dt*D0;
-        else return Q + 0.5*dt*(D0 + 2.0*diffusion_correction(kn, ghost, Q, A, p, time, M));
+        else
+        {
+            if (log) M.dlog->push_back({1.0, correction_faces(kn, ghost, Q, A, p, time, M)});
+            return Q + 0.5*dt*(D0 + 2.0*correction_cells(kn, ghost, Q, A, p, time, M));
+        }
     }();
+    if (log) M.dlog->push_back({0.5, tpfa_faces(kn, ghost, Q, A, p, time, M)});
     auto R = [&](const Field& X) -> Field
-    { return X - b - 0.5*dt*diffusion_tpfa(kn, ghost, X, A, p, time + dt, M); };
-    return halo(newton_krylov(R, Q), M);
+    { return X - b - 0.5*dt*tpfa_cells(kn, ghost, X, A, p, time + dt, M); };
+    const Field X = [&] { const NoLog scope; return halo(newton_krylov(R, Q), M); }();
+    if (log) M.dlog->push_back({0.5, tpfa_faces(kn, ghost, X, A, p, time + dt, M)});
+    return X;
 }
 
 // ── control ─────────────────────────────────────────────────────────────────

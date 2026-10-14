@@ -78,6 +78,7 @@ struct Amr : public amrex::AmrCore
         Mesh& M = *mesh[lev];
         M.ba = ba; M.dm = dm;
         M.log = std::make_shared<std::vector<std::array<Field, 2>>>();
+        M.dlog = std::make_shared<std::vector<std::pair<Real, Field>>>();
         if (lev == 0) return;
         M.fill = [this, lev](const Field& X) { return fill_halo(lev, X); };
         fr[lev] = std::make_unique<amrex::FluxRegister>(ba, dm, refRatio(lev - 1), lev,
@@ -210,10 +211,11 @@ struct Amr : public amrex::AmrCore
         });
     }
 
-    /// Integral over the step's RK stages of the face terms logged by divergence on the cell below (Wm) or above (-Wp) each face, times mult.
+    /// Integral over the step's RK stages of the face terms logged by divergence (with the stage's diffusive fluxes) on the cell below (Wm) or above (-Wp) each face, plus the implicit diffusion's face fluxes by their share of dt (dlog), times mult.
     amrex::MultiFab face_integral(int lev, int d, bool below, Real mult)
     {
         const auto& log = *mesh[lev]->log;
+        const auto& dlog = *mesh[lev]->dlog;
         const auto b = rk_weights();
         const int ns = int(b.size()), n = int(log.size());
         AMREX_ALWAYS_ASSERT_WITH_MESSAGE(n >= ns, "AMR reflux: fewer face terms than RK stages");
@@ -223,6 +225,8 @@ struct Amr : public amrex::AmrCore
         for (int s = 0; s < ns; ++s)
             amrex::MultiFab::Saxpy(F, (below ? 1.0 : -1.0)*b[s]*mult,
                                    log[n - ns + s][below ? 0 : 1][d], 0, 0, System::n_state, 0);
+        for (const auto& [w, Fd] : dlog)         // a flux: the same on both sides
+            amrex::MultiFab::Saxpy(F, w*mult, Fd[d], 0, 0, System::n_state, 0);
         return F;
     }
 
@@ -307,12 +311,15 @@ struct Amr : public amrex::AmrCore
             for (int l = 0; l <= finest_level; ++l)
             {
                 mesh[l]->log->clear();
+                mesh[l]->dlog->clear();
+                the_mesh() = mesh[l].get();            // the level's linear solves
                 const auto r = step(Q[l], A[l], p, t, dt, std::cref(*mesh[l]), 0L);
                 Q[l] = std::get<0>(r);
                 A[l] = std::get<1>(r);
             }
+            the_mesh() = nullptr;
             for (int l = finest_level; l > 0; --l) sync(l, dt);
-            for (int l = 0; l <= finest_level; ++l) mesh[l]->log->clear();
+            for (int l = 0; l <= finest_level; ++l) { mesh[l]->log->clear(); mesh[l]->dlog->clear(); }
             t += dt; ++n; ++loop_iterations();
             if (dt_write > 0 && t >= (nw - 1e-9)*dt_write) { const Synced scope; write(t); ++nw; }
         }
