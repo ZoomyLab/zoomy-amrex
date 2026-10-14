@@ -246,7 +246,7 @@ struct Amr : public amrex::AmrCore
         return F;
     }
 
-    /// Level lev - 1 of X from level lev: reflux the coarse cells next to level lev with the fine faces' terms of `part` integrated over dt, then average down and clean round-off.
+    /// Level lev - 1 of X from level lev: reflux the coarse cells next to level lev with the fine faces' terms of `part` integrated over dt (a refluxed cell keeps the reconstruction variables of the rows not refluxed: amr_keep), then average down and clean round-off.
     /// Ref: Berger, Colella 1989, https://doi.org/10.1016/0021-9991(89)90035-1
     void sync(int lev, Real dt, std::vector<Field>& X, Part part)
     {
@@ -287,11 +287,40 @@ struct Amr : public amrex::AmrCore
                 R.FineAdd(lo, d, 0, 0, nq, af);
             }
             for (const int r : reflux_rows()) R.Reflux(Qc[0], 1.0, r, r, 1, Geom(lev - 1));
+            Qc = keep(lev - 1, X[lev - 1], Qc);
         }
         amrex::average_down(X[lev][0], Qc[0], 0, nq, refRatio(lev - 1));
         Qc.ngv = 0;
         X[lev - 1] = std::get<0>(amr_clean(Qc, std::cref(*mesh[lev - 1]), 0L));
         X[lev - 1].ngv = 0;
+    }
+
+    /// Qn (Qo refluxed on level lev) with amr_keep(Qo, Qn) in the cells whose refluxed rows changed: the refluxed mass carries the cell's velocity.
+    Field keep(int lev, const Field& Qo, const Field& Qn)
+    {
+        Field Qo0 = Qo, Qn0 = Qn;
+        Qo0.ngv = Qn0.ngv = 0;
+        const Field K = std::get<0>(amr_keep(Qo0, Qn0, A[lev], p, std::cref(*mesh[lev]), 0L));
+        Field out = like(Qn, Qn.nq);
+        out.ngv = 0;
+        const auto rr = reflux_rows();
+        amrex::Gpu::DeviceVector<int> rows(rr.size());
+        amrex::Gpu::copy(amrex::Gpu::hostToDevice, rr.begin(), rr.end(), rows.begin());
+        const int nr = int(rr.size()), nq = Qn.nq;
+        const int* r = rows.data();
+        const auto o = out[0].arrays();
+        const auto qo = Qo[0].const_arrays();
+        const auto qn = Qn[0].const_arrays();
+        const auto k = K[0].const_arrays();
+        amrex::ParallelFor(out[0], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int kk) noexcept
+        {
+            const IV c(AMREX_D_DECL(i, j, kk));
+            bool changed = false;
+            for (int m = 0; m < nr; ++m) changed = changed || qn[bx](c, r[m]) != qo[bx](c, r[m]);
+            for (int n = 0; n < nq; ++n) o[bx](c, n) = changed ? k[bx](c, n) : qn[bx](c, n);
+        });
+        amrex::Gpu::streamSynchronize();
+        return out;
     }
 
     /// Every level's halo and aux at the current state.
