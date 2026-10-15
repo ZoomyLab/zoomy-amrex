@@ -124,11 +124,14 @@ def _image_id(sif):
 
 def _apptainer(gpu, script, binds=(), **kw):
     """Run the shell `script` in the AMReX apptainer (`--nv` for the CUDA build) with the cache
-    and `binds` mounted; inside the image (`in_image`) run it directly.
+    and `binds` mounted; inside the image (`in_image`) run it directly.  The CUDA build sees the
+    GPUs of the caller's `CUDA_VISIBLE_DEVICES` (`--cleanenv` would drop it: every run on GPU 0).
     """
     if in_image():
         return subprocess.run(["bash", "-c", script], **kw)
     cmd = ["apptainer", "exec", "--cleanenv", *(["--nv"] if gpu else [])]
+    if gpu and os.environ.get("CUDA_VISIBLE_DEVICES"):
+        cmd += ["--env", f"CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']}"]
     for b in sorted({str(CACHE), *map(str, binds)}):
         cmd += ["--bind", b]
     return subprocess.run(cmd + [str(SIF), "bash", "-c", script], **kw)
