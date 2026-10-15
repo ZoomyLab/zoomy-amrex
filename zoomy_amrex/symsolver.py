@@ -288,8 +288,6 @@ class AmrexDriver(param.Parameterized):
                 if self.ranks > 1:
                     raise NotImplementedError("an overlap (Schwarz-coupled) participant on "
                                               "several ranks")
-                if int(c["overlap"]) < 2:
-                    raise ValueError("overlap: at least 2 cell rings")
                 amr += f"zs.precice_overlap = {int(c['overlap'])}\n"
         # boxes per rank: CPU ~8 (load balance across wet / dry / wall cells),
         # GPU `_gpu_boxes` (hyperbolic 1: one launch covers all boxes)
