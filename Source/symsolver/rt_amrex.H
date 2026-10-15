@@ -2622,6 +2622,127 @@ inline Vertices interface_states(const Field& Q, const Mesh& M)
     return out;
 }
 
+/// The overlap of a Schwarz-coupled participant (`ChorinTemplate.precice_march`): the W cell
+/// layers at the coupled side (2 d + upper) hold the peer's values (read), the next W layers
+/// inward are the mirror (written); each slab's vertices in index order, x fastest.
+struct Overlap
+{
+    int d = -1, W = 0, o0 = 0, m0 = 0;              // axis, layers, first layer of each slab
+    int lo[3] = {0, 0, 0}, n[3] = {1, 1, 1};        // the domain's cells
+    AMREX_GPU_HOST_DEVICE bool in(const IV& c, int s0) const
+    {
+        if (c[d] < s0 || c[d] >= s0 + W) return false;
+        for (int e = 0; e < D; ++e)
+            if (e != d && (c[e] < lo[e] || c[e] >= lo[e] + n[e])) return false;
+        return true;
+    }
+    AMREX_GPU_HOST_DEVICE int index(const IV& c, int s0) const
+    {
+        int idx = 0;
+        for (int e = D - 1; e >= 0; --e)
+            idx = idx*(e == d ? W : n[e]) + (c[e] - (e == d ? s0 : lo[e]));
+        return idx;
+    }
+    int count() const { int k = W; for (int e = 0; e < D; ++e) if (e != d) k *= n[e]; return k; }
+};
+/// The overlap of this participant.
+inline Overlap& overlap() { static Overlap o; return o; }
+
+/// Set up an overlap participant: W layers at `side`; its vertices the mirror cells' centres, then
+/// the overlap cells'; fills coupling() (rt_common.H: written / read vertex ids) and overlap().
+inline void couple_setup_overlap(const Mesh& M, const std::string& name,
+                                 const std::string& config, const std::string& mesh,
+                                 const std::vector<std::string>& write,
+                                 const std::vector<std::string>& read, int side, int W)
+{
+    if (amrex::ParallelDescriptor::NProcs() > 1)
+        fail("an overlap (Schwarz-coupled) participant on several ranks");
+    auto& cpl = coupling();
+    auto& o = overlap();
+    cpl.mesh = mesh; cpl.write = write; cpl.read = read;
+    const amrex::Box dom = M.geom.Domain();
+    o.d = side/2; o.W = W;
+    for (int e = 0; e < D; ++e) { o.lo[e] = dom.smallEnd(e); o.n[e] = dom.length(e); }
+    if (2*W > o.n[o.d]) fail("overlap: the domain has fewer than 2 W cell layers");
+    o.o0 = (side & 1) ? dom.bigEnd(o.d) - W + 1 : dom.smallEnd(o.d);
+    o.m0 = (side & 1) ? o.o0 - W : o.o0 + W;
+    const int dims = std::max(D, 2), nv = o.count();
+    std::vector<double> xyz(size_t(2*nv)*dims, 0.0);
+    for (const int s0 : {o.m0, o.o0})
+    {
+        amrex::Box b = dom;
+        b.setSmall(o.d, s0); b.setBig(o.d, s0 + W - 1);
+        const size_t base = s0 == o.m0 ? 0 : size_t(nv);
+        amrex::LoopOnCpu(b, [&](int i, int j, int k)
+        {
+            const IV c(AMREX_D_DECL(i, j, k));
+            const Col<3> X = cell_centre(M.g, c);
+            for (int a = 0; a < D; ++a) xyz[(base + o.index(c, s0))*dims + a] = X(a, 0);
+        });
+    }
+    cpl.ids.resize(size_t(2*nv));
+    cpl.participant = std::make_unique<precice::Participant>(name, config, 0, 1);
+    cpl.participant->setMeshVertices(cpl.mesh, xyz, cpl.ids);
+    cpl.wids.assign(cpl.ids.begin(), cpl.ids.begin() + nv);
+    cpl.rids.assign(cpl.ids.begin() + nv, cpl.ids.end());
+}
+
+/// Cell mask of the overlap (ghosts included).
+inline Field overlap_cells(const Mesh& M)
+{
+    const Overlap o = overlap();
+    Field out = cells_of(M, 1);
+    auto x = out[0].arrays();
+    amrex::ParallelFor(out[0], IV(out.ng()), [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    { ZS_CELL; x[bx](c, 0) = o.in(c, o.o0) ? 1.0 : 0.0; });
+    out.ngv = out.ng();
+    return out;
+}
+
+/// The mirror cells' states (vertex order), on the host.
+inline Vertices overlap_states(const Field& Q, const Mesh&)
+{
+    const Overlap o = overlap();
+    const int nq = Q.nq, nv = o.count();
+    amrex::Gpu::DeviceVector<double> v(size_t(nq)*nv);
+    double* vp = v.data();
+    auto q = Q[0].const_arrays();
+    amrex::ParallelFor(Q[0], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        if (!o.in(c, o.m0)) return;
+        const int jv = o.index(c, o.m0);
+        for (int r = 0; r < nq; ++r) vp[r*nv + jv] = q[bx](c, r);
+    });
+    Vertices out{nq, nv, std::vector<double>(size_t(nq)*nv)};
+    amrex::Gpu::copy(amrex::Gpu::deviceToHost, v.begin(), v.end(), out.v.begin());
+    amrex::Gpu::streamSynchronize();
+    return out;
+}
+
+/// Q with the overlap cells from `peer` (vertex order); the ghosts are refilled where read.
+inline Field overlap_fill(const Field& Q, const Vertices& peer, const Mesh&)
+{
+    const Overlap o = overlap();
+    const int nq = Q.nq, nv = peer.n;
+    Field out = like(Q, nq);
+    amrex::MultiFab::Copy(out[0], Q[0], 0, 0, nq, Q[0].nGrow());
+    amrex::Gpu::DeviceVector<double> pv(std::max<size_t>(peer.v.size(), 1));
+    amrex::Gpu::copy(amrex::Gpu::hostToDevice, peer.v.begin(), peer.v.end(), pv.begin());
+    const double* pp = pv.data();
+    auto x = out[0].arrays();
+    amrex::ParallelFor(out[0], [=] AMREX_GPU_DEVICE (int bx, int i, int j, int k) noexcept
+    {
+        ZS_CELL;
+        if (!o.in(c, o.o0)) return;
+        const int jv = o.index(c, o.o0);
+        for (int r = 0; r < nq; ++r) x[bx](c, r) = pp[r*nv + jv];
+    });
+    amrex::Gpu::streamSynchronize();                // pv dies here
+    out.ngv = 0;
+    return out;
+}
+
 /// One Riemann problem per coupled face, posed low to high (kn = numerical_face_sides): row 0 for the low side, row 1 for the high side; each state's aux from the pointwise kernel on a zero template (false: zero).
 template<class K, class KA, class P>
 Field interface_flux(K kn, KA kaux, int side, const Field& Q, const Field& Qaux,

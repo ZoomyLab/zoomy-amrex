@@ -287,6 +287,11 @@ class AmrexDriver(param.Parameterized):
                     f"zs.precice_write = {' '.join(c['write'])}\n"
                     f"zs.precice_read = {' '.join(c['read'])}\n"
                     f"zs.precice_side = {side_of(mesh, c['tag'], dim)}\n")
+            if c.get("overlap") is not None:     # the Chorin march's overlap (Schwarz)
+                if self.ranks > 1:
+                    raise NotImplementedError("an overlap (Schwarz-coupled) participant on "
+                                              "several ranks")
+                amr += f"zs.precice_overlap = {int(c['overlap'])}\n"
         # boxes per rank: CPU ~8 (load balance across wet / dry / wall cells),
         # GPU `_gpu_boxes` (hyperbolic 1: one launch covers all boxes)
         per = self._gpu_boxes if self.gpu else 8
@@ -313,8 +318,10 @@ class AmrexDriver(param.Parameterized):
         launch = (f"mpirun --oversubscribe --bind-to none -n {self.ranks} "
                   if self.ranks > 1 or self.gpu else "")
         cpus = "" if self.gpu else f"taskset -c {RUN_CPUS} "
+        # coupled: the preCICE configuration's directory (and the exchange directory it names)
+        cfg = [] if not self.couple else [Path(self.couple["config"]).resolve().parent]
         r = _apptainer(self.gpu, f"cd {case} && {cpus}{launch}{binary} inputs > log.symAmrex 2>&1",
-                       binds=[case, binary.parent] + ([] if ckpt is None else [ckpt]),
+                       binds=[case, binary.parent] + ([] if ckpt is None else [ckpt]) + cfg,
                        capture_output=True, text=True)
         log = (case / "log.symAmrex").read_text()
         if r.returncode != 0:
